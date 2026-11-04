@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 libc = "0.2"
 config = { path = "crates/config" }
+jpeg = { path = "crates/jpeg" }
 render = { path = "crates/render" }
 sys = { path = "crates/sys" }
 wire = { path = "crates/wire" }
@@ -20,3 +21,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The wallpaper is decoded at startup; keep that fast in debug builds too.
+[profile.dev.package.jpeg]
+opt-level = 3

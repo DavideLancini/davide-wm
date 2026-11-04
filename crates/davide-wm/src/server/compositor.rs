@@ -1,6 +1,7 @@
 //! Core protocol: display, registry, compositor, surfaces, subsurfaces, shm.
 
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use wire::*;
 
@@ -52,6 +53,12 @@ pub fn registry(s: &mut State, c: ClientId, op: u16, args: Args) {
         "xdg_wm_base" => Kind::XdgWmBase,
         "zxdg_decoration_manager_v1" => Kind::DecorationManager,
         "wl_data_device_manager" => Kind::DataDeviceManager,
+        "zwp_primary_selection_device_manager_v1" => Kind::PrimaryManager,
+        "ext_data_control_manager_v1" => Kind::ControlManager,
+        "xdg_activation_v1" => Kind::Activation,
+        "xdg_system_bell_v1" => Kind::Bell,
+        "zwp_idle_inhibit_manager_v1" => Kind::IdleInhibitManager,
+        "zwp_linux_dmabuf_v1" => Kind::Dmabuf,
         _ => unreachable!("global without kind"),
     };
     if !s.new_object(c, id, gi, version, kind) {
@@ -65,6 +72,7 @@ pub fn registry(s: &mut State, c: ClientId, op: u16, args: Args) {
         }
         Kind::Seat => seat::send_seat_info(s, c, id, version),
         Kind::Output => seat::send_output_info(s, c, id, version),
+        Kind::Dmabuf => dmabuf::send_formats(s, c, id),
         _ => {}
     }
 }
@@ -78,11 +86,10 @@ pub fn compositor(s: &mut State, c: ClientId, version: u32, op: u16, args: Args)
                     SKey { client: c, id },
                     Surface {
                         pending: Pending::default(),
-                        buffer: None,
-                        upload: false,
+                        upload: None,
+                        content: Content::None,
                         size: (0, 0),
                         opaque: false,
-                        tex: None,
                         frames: Vec::new(),
                         role: Role::None,
                         above: Vec::new(),
@@ -130,21 +137,22 @@ fn commit(s: &mut State, key: SKey) {
     if let Some(b) = sf.pending.buffer.take() {
         match b.and_then(|id| s.buffers.get(&SKey { client: key.client, id }).map(|buf| (id, buf))) {
             Some((id, buf)) => {
-                sf.buffer = Some(id);
-                sf.upload = true;
-                sf.size = (buf.width, buf.height);
-                sf.opaque = buf.opaque;
+                sf.upload = Some(id);
+                sf.size = buf.size();
+                sf.opaque = buf.opaque();
             }
             None => {
-                sf.buffer = None;
-                sf.upload = false;
+                sf.upload = None;
                 sf.size = (0, 0);
-                if let Some(t) = sf.tex.take() {
-                    s.dead_textures.push(t);
+                match std::mem::replace(&mut sf.content, Content::None) {
+                    Content::Shm(t) => s.dead_textures.push(t),
+                    Content::Dmabuf(old) => s.send(key.client, Msg::new(old, wl_buffer::evt::RELEASE)),
+                    Content::None => {}
                 }
             }
         }
     }
+    let sf = s.surfaces.get_mut(&key).unwrap();
     sf.frames.append(&mut sf.pending.frames);
     if let Some(x) = sf.xdg.as_mut() {
         if let Some(g) = sf.pending.geometry.take() {
@@ -267,7 +275,7 @@ pub fn shm_pool(s: &mut State, c: ClientId, id: u32, op: u16, args: Args) {
             if s.new_object(c, bid, &wl_buffer::INTERFACE, 1, Kind::Buffer) {
                 s.pools.get_mut(&key).unwrap().buffers += 1;
                 let opaque = format == wl_shm::format::XRGB8888;
-                s.buffers.insert(SKey { client: c, id: bid }, ShmBuffer { pool: id, offset, width, height, stride, opaque });
+                s.buffers.insert(SKey { client: c, id: bid }, Buffer::Shm { pool: id, offset, width, height, stride, opaque });
             }
         }
         wl_shm_pool::req::DESTROY => {
@@ -302,32 +310,75 @@ pub fn buffer(s: &mut State, c: ClientId, id: u32, op: u16) {
     if op != wl_buffer::req::DESTROY {
         return;
     }
-    let Some(b) = s.buffers.remove(&SKey { client: c, id }) else { return };
-    let pkey = SKey { client: c, id: b.pool };
-    if let Some(p) = s.pools.get_mut(&pkey) {
-        p.buffers -= 1;
-        if p.destroyed && p.buffers == 0 {
-            let p = s.pools.remove(&pkey).unwrap();
-            unmap_pool(&p);
+    let key = SKey { client: c, id };
+    if let Some(Buffer::Shm { pool, .. }) = s.buffers.get(&key) {
+        let pkey = SKey { client: c, id: *pool };
+        if let Some(p) = s.pools.get_mut(&pkey) {
+            p.buffers -= 1;
+            if p.destroyed && p.buffers == 0 {
+                let p = s.pools.remove(&pkey).unwrap();
+                unmap_pool(&p);
+            }
         }
     }
+    s.drop_buffer(key);
     for sf in s.surfaces.iter_mut().filter(|(k, _)| k.client == c).map(|(_, sf)| sf) {
-        if sf.buffer == Some(id) {
-            sf.buffer = None;
-            sf.upload = false;
+        if sf.upload == Some(id) {
+            sf.upload = None;
+        }
+        if matches!(sf.content, Content::Dmabuf(b) if b == id) {
+            sf.content = Content::None;
         }
     }
 }
 
-pub fn data_device_manager(s: &mut State, c: ClientId, version: u32, op: u16, args: Args) {
-    let id = args.obj(0);
-    match op {
-        wl_data_device_manager::req::CREATE_DATA_SOURCE => {
-            s.new_object(c, id, &wl_data_source::INTERFACE, version, Kind::DataSource);
-        }
-        wl_data_device_manager::req::GET_DATA_DEVICE => {
-            s.new_object(c, id, &wl_data_device::INTERFACE, version, Kind::DataDevice);
-        }
-        _ => {}
+// A client may shrink the file behind a pool while we read it, which raises
+// SIGBUS. Reads go through `guarded_read`; the handler maps zero pages over
+// the guarded range so the read completes, and the client is disconnected.
+static GUARD_START: AtomicUsize = AtomicUsize::new(0);
+static GUARD_LEN: AtomicUsize = AtomicUsize::new(0);
+static FAULTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigbus(_sig: i32, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    let addr = unsafe { (*info).si_addr() } as usize;
+    let (start, len) = (GUARD_START.load(Ordering::SeqCst), GUARD_LEN.load(Ordering::SeqCst));
+    if len > 0 && addr >= start && addr < start + len {
+        let page = 4096;
+        let base = start & !(page - 1);
+        let end = (start + len).div_ceil(page) * page;
+        unsafe {
+            libc::mmap(
+                base as *mut _,
+                end - base,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        FAULTED.store(true, Ordering::SeqCst);
+    } else {
+        // Not ours: let the default action crash the process.
+        unsafe { libc::signal(libc::SIGBUS, libc::SIG_DFL) };
     }
+}
+
+pub fn install_sigbus_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigbus as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Runs `f` on client shared memory; returns its result and whether the
+/// memory went away while reading (the data is then partly zeroes).
+pub fn guarded_read<T>(ptr: *const u8, len: usize, f: impl FnOnce(&[u8]) -> T) -> (T, bool) {
+    GUARD_START.store(ptr as usize, Ordering::SeqCst);
+    GUARD_LEN.store(len, Ordering::SeqCst);
+    FAULTED.store(false, Ordering::SeqCst);
+    let out = f(unsafe { std::slice::from_raw_parts(ptr, len) });
+    GUARD_LEN.store(0, Ordering::SeqCst);
+    (out, FAULTED.load(Ordering::SeqCst))
 }

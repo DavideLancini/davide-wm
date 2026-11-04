@@ -1,5 +1,7 @@
 //! All settings of davide-wm. Changing anything here means rebuilding.
 
+pub use wm::{Direction, WsId};
+
 /// Modifier bits used by key bindings.
 pub mod mods {
     pub const SHIFT: u32 = 1 << 0;
@@ -13,22 +15,50 @@ pub mod mods {
 
 /// The keysyms used below (values from `xkbcommon-keysyms.h`).
 pub mod keys {
+    pub const BACKSPACE: u32 = 0xff08;
+    pub const APOSTROPHE: u32 = 0x0027;
+    pub const BACKSLASH: u32 = 0x005c;
+    pub const IGRAVE: u32 = 0x00ec;
+    pub const DIGITS: [u32; 10] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30];
+    pub const B: u32 = 0x0062;
+    pub const C: u32 = 0x0063;
     pub const E: u32 = 0x0065;
+    pub const F: u32 = 0x0066;
+    pub const M: u32 = 0x006d;
+    pub const N: u32 = 0x006e;
+    pub const P: u32 = 0x0070;
     pub const Q: u32 = 0x0071;
+    pub const R: u32 = 0x0072;
+    pub const S: u32 = 0x0073;
     pub const T: u32 = 0x0074;
+    pub const W: u32 = 0x0077;
     pub const LEFT: u32 = 0xff51;
     pub const UP: u32 = 0xff52;
     pub const RIGHT: u32 = 0xff53;
     pub const DOWN: u32 = 0xff54;
+    pub const PRINT: u32 = 0xff61;
+    pub const F12: u32 = 0xffc9;
+    pub const AUDIO_LOWER_VOLUME: u32 = 0x1008ff11;
+    pub const AUDIO_MUTE: u32 = 0x1008ff12;
+    pub const AUDIO_RAISE_VOLUME: u32 = 0x1008ff13;
+    pub const AUDIO_MIC_MUTE: u32 = 0x1008ffb2;
+    pub const MON_BRIGHTNESS_UP: u32 = 0x1008ff02;
+    pub const MON_BRIGHTNESS_DOWN: u32 = 0x1008ff03;
+    /// `XF86Switch_VT_1`; VT n is this plus n - 1.
+    pub const SWITCH_VT_1: u32 = 0x1008fe01;
 }
 
-pub use wm::Direction;
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Action {
     Spawn(&'static str),
     CloseWindow,
     Focus(Direction),
+    MoveWindow(Direction),
+    Workspace(WsId),
+    MoveToWorkspace(WsId),
+    ToggleSpecial,
+    ToggleMaximize,
+    SwitchVt(u32),
     Exit,
 }
 
@@ -39,26 +69,96 @@ pub struct Bind {
     pub action: Action,
 }
 
-use mods::{MAIN, SHIFT};
+pub const TERMINAL: &str = "footclient";
+const BROWSER: &str = "chromium --disable-sync";
 
-pub const BINDS: &[Bind] = &[
-    Bind { mods: MAIN, key: keys::T, action: Action::Spawn(TERMINAL) },
-    Bind { mods: MAIN, key: keys::Q, action: Action::CloseWindow },
-    Bind { mods: MAIN, key: keys::LEFT, action: Action::Focus(Direction::Left) },
-    Bind { mods: MAIN, key: keys::RIGHT, action: Action::Focus(Direction::Right) },
-    Bind { mods: MAIN, key: keys::UP, action: Action::Focus(Direction::Up) },
-    Bind { mods: MAIN, key: keys::DOWN, action: Action::Focus(Direction::Down) },
-    Bind { mods: MAIN | SHIFT, key: keys::E, action: Action::Exit },
+/// Every key binding. Built at startup from the tables below.
+pub fn binds() -> Vec<Bind> {
+    use mods::{ALT, CTRL, MAIN, SHIFT};
+    let b = |mods, key, action| Bind { mods, key, action };
+    let mut v = vec![
+        b(MAIN, keys::T, Action::Spawn(TERMINAL)),
+        b(MAIN, keys::B, Action::Spawn(BROWSER)),
+        b(MAIN, keys::C, Action::Spawn("code")),
+        b(MAIN, keys::F, Action::Spawn("thunar")),
+        b(MAIN, keys::W, Action::Spawn("nmgui")),
+        b(MAIN, keys::N, Action::Spawn("systemctl --user kill -s RTMIN+4 nwg-notifications.service")),
+        b(MAIN, keys::S, Action::Spawn("~/7Scripts/tts --clipboard")),
+        b(MAIN, keys::M, Action::Spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle")),
+        b(0, keys::AUDIO_MIC_MUTE, Action::Spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle")),
+        b(0, keys::AUDIO_MUTE, Action::Spawn("pactl set-sink-mute @DEFAULT_SINK@ toggle")),
+        b(0, keys::AUDIO_LOWER_VOLUME, Action::Spawn("pactl set-sink-volume @DEFAULT_SINK@ -5%")),
+        b(0, keys::AUDIO_RAISE_VOLUME, Action::Spawn("pactl set-sink-volume @DEFAULT_SINK@ +5%")),
+        b(0, keys::MON_BRIGHTNESS_DOWN, Action::Spawn("brightness down")),
+        b(0, keys::MON_BRIGHTNESS_UP, Action::Spawn("brightness up")),
+        b(0, keys::PRINT, Action::Spawn(r#"grim -g "$(slurp)" - | swappy -f -"#)),
+        b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::Spawn("killall -SIGUSR1 topbar")),
+        b(MAIN | SHIFT, keys::P, Action::Spawn("poweroff")),
+        b(MAIN | SHIFT, keys::R, Action::Spawn("reboot")),
+        b(MAIN, keys::Q, Action::CloseWindow),
+        b(MAIN, keys::R, Action::ToggleSpecial),
+        b(MAIN | SHIFT, keys::F, Action::ToggleMaximize),
+        b(MAIN | SHIFT, keys::E, Action::Exit),
+    ];
+    for (key, dir) in [(keys::LEFT, Direction::Left), (keys::RIGHT, Direction::Right), (keys::UP, Direction::Up), (keys::DOWN, Direction::Down)] {
+        v.push(b(MAIN, key, Action::Focus(dir)));
+        v.push(b(MAIN | SHIFT, key, Action::MoveWindow(dir)));
+    }
+    // Three banks of 14 workspaces: MAIN -> 1-10 + chat/31/32/33,
+    // MAIN+CTRL -> 11-20 + 34-37, MAIN+ALT -> 21-30 + 38-41.
+    let extra_keys = [keys::BACKSLASH, keys::APOSTROPHE, keys::IGRAVE, keys::BACKSPACE];
+    let banks = [
+        (0, 0, [WsId::Chat, WsId::Num(31), WsId::Num(32), WsId::Num(33)]),
+        (CTRL, 10, [WsId::Num(34), WsId::Num(35), WsId::Num(36), WsId::Num(37)]),
+        (ALT, 20, [WsId::Num(38), WsId::Num(39), WsId::Num(40), WsId::Num(41)]),
+    ];
+    for (prefix, base, extra) in banks {
+        let targets = (1..=10).map(|i| WsId::Num(base + i)).zip(keys::DIGITS).chain(extra.into_iter().zip(extra_keys));
+        for (ws, key) in targets {
+            v.push(b(MAIN | prefix, key, Action::Workspace(ws)));
+            v.push(b(MAIN | prefix | SHIFT, key, Action::MoveToWorkspace(ws)));
+        }
+    }
+    for n in 1..=12 {
+        v.push(b(CTRL | ALT, keys::SWITCH_VT_1 + n - 1, Action::SwitchVt(n)));
+    }
+    v
+}
+
+/// Window rules, matched on the exact app id.
+pub struct Rule {
+    pub app_id: &'static str,
+    /// Ignore the client's own fullscreen/maximize requests.
+    pub suppress_fullscreen: bool,
+    /// Start fullscreen.
+    pub fullscreen: bool,
+    /// Keep the keyboard focus while mapped.
+    pub stay_focused: bool,
+}
+
+pub const RULES: &[Rule] = &[
+    Rule { app_id: "libreoffice-startcenter", suppress_fullscreen: true, fullscreen: false, stay_focused: false },
+    // Black overlay of blk on panels that must not be switched off via DPMS.
+    Rule { app_id: "blk-overlay", suppress_fullscreen: false, fullscreen: true, stay_focused: true },
 ];
 
-pub const TERMINAL: &str = "foot";
+/// Started once, in every mode.
+pub const AUTOSTART: &[&str] = &["foot --server"];
 
 pub const KEYBOARD_LAYOUT: &str = "it";
 pub const REPEAT_RATE: i32 = 25;
 pub const REPEAT_DELAY: i32 = 600;
 
-/// Background behind the windows, as premultiplied RGBA.
+/// Compiled into the binary by `crates/davide-wm/build.rs`; when the file is
+/// missing at build time the background stays `BACKGROUND`.
+pub const WALLPAPER: &str = "/wallpapers/1.jpg";
+/// The wallpaper is halved at startup while it still covers this size.
+pub const WALLPAPER_MIN_SIZE: (usize, usize) = (2560, 1600);
+
+/// Background behind the windows when no wallpaper is compiled in, premultiplied RGBA.
 pub const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// Dims the workspace below the special one.
+pub const SPECIAL_DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.4];
 
 /// DRM render node used by the nested backend.
 pub const RENDER_NODE: &str = "/dev/dri/renderD128";

@@ -130,6 +130,13 @@ pub fn set_focus(s: &mut State, key: Option<SKey>) {
     if s.focus == key {
         return;
     }
+    if let Some(cur) = s.focus {
+        let pinned = s.rule(cur).is_some_and(|r| r.stay_focused) && s.surfaces.get(&cur).and_then(|sf| sf.xdg.as_ref()).is_some_and(|x| x.mapped);
+        if pinned && key.is_some() {
+            return;
+        }
+    }
+    let old_client = s.focus.map(|f| f.client);
     if let Some(old) = s.focus.take() {
         if s.surfaces.contains_key(&old) {
             let serial = s.next_serial();
@@ -140,7 +147,14 @@ pub fn set_focus(s: &mut State, key: Option<SKey>) {
     }
     s.focus = key;
     if let Some(k) = key {
+        s.urgent.remove(&k);
+        if let Some(ws) = s.window_ws.get(&k).and_then(|w| s.workspaces.get_mut(w)) {
+            ws.focus = Some(k);
+        }
         keyboard_enter(s, k, None);
+        if old_client != Some(k.client) {
+            selection::focus_changed(s, k.client);
+        }
     }
     s.relayout();
 }
@@ -172,7 +186,7 @@ fn surface_hit(s: &State, key: SKey, (x, y): (i32, i32), px: f64, py: f64) -> Op
     if let Some(hit) = sf.above.iter().rev().find_map(child) {
         return Some(hit);
     }
-    if sf.tex.is_some() && Rect::new(x, y, sf.size.0, sf.size.1).contains(px, py) {
+    if s.texture(key).is_some() && Rect::new(x, y, sf.size.0, sf.size.1).contains(px, py) {
         return Some((key, px - x as f64, py - y as f64));
     }
     sf.below.iter().rev().find_map(child)
@@ -187,7 +201,7 @@ pub fn surface_at(s: &State, px: f64, py: f64) -> Option<(SKey, f64, f64)> {
             }
         }
     }
-    for (key, rect) in &s.layout {
+    for (key, rect) in s.layout.iter().rev() {
         if rect.contains(px, py) {
             let mapped = s.surfaces.get(key).and_then(|sf| sf.xdg.as_ref()).is_some_and(|x| x.mapped);
             if mapped {

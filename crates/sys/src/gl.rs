@@ -18,6 +18,8 @@ pub const TEXTURE_2D: GLenum = 0x0DE1;
 pub const UNSIGNED_BYTE: GLenum = 0x1401;
 pub const FLOAT: GLenum = 0x1406;
 pub const LINEAR: GLint = 0x2601;
+pub const LINEAR_MIPMAP_LINEAR: GLint = 0x2703;
+pub const RGBA: GLenum = 0x1908;
 pub const TEXTURE_MAG_FILTER: GLenum = 0x2800;
 pub const TEXTURE_MIN_FILTER: GLenum = 0x2801;
 pub const TEXTURE_WRAP_S: GLenum = 0x2802;
@@ -84,6 +86,7 @@ extern "C" {
     pub fn glActiveTexture(unit: GLenum);
     pub fn glTexParameteri(target: GLenum, pname: GLenum, v: GLint);
     pub fn glPixelStorei(pname: GLenum, v: GLint);
+    pub fn glGenerateMipmap(target: GLenum);
     pub fn glTexImage2D(
         target: GLenum,
         level: GLint,

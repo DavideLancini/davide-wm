@@ -1,0 +1,104 @@
+//! Command socket for scripts: one line in, a reply out, then the
+//! connection closes. `davide-wm msg <command>` is the client.
+
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use wm::WsId;
+
+pub const ENV: &str = "DAVIDE_WM_SOCKET";
+
+/// Every wait is bounded (README sec. 8, timeout rule).
+const TIMEOUT: Duration = Duration::from_millis(200);
+
+pub struct Ipc {
+    pub listener: UnixListener,
+    pub path: PathBuf,
+}
+
+impl Ipc {
+    pub fn bind(wayland_name: &str) -> io::Result<Ipc> {
+        let dir = PathBuf::from(std::env::var("XDG_RUNTIME_DIR").map_err(|_| io::Error::other("XDG_RUNTIME_DIR not set"))?);
+        let path = dir.join(format!("davide-wm-{wayland_name}.sock"));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        Ok(Ipc { listener, path })
+    }
+}
+
+impl Drop for Ipc {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub enum Command {
+    Workspace(WsId),
+    Exec(String),
+    Close,
+    Windows,
+    FocusApp(String),
+    Exit,
+}
+
+pub fn parse_ws(s: &str) -> Option<WsId> {
+    match s {
+        "chat" => Some(WsId::Chat),
+        "special" | "resize" => Some(WsId::Special),
+        n => n.parse().ok().filter(|n| (1..=41).contains(n)).map(WsId::Num),
+    }
+}
+
+pub fn ws_name(ws: WsId) -> String {
+    match ws {
+        WsId::Num(n) => n.to_string(),
+        WsId::Chat => "chat".into(),
+        WsId::Special => "special".into(),
+    }
+}
+
+fn parse(line: &str) -> Result<Command, String> {
+    let (cmd, arg) = line.trim().split_once(' ').map_or((line.trim(), ""), |(c, a)| (c, a.trim()));
+    match cmd {
+        "workspace" => parse_ws(arg).map(Command::Workspace).ok_or_else(|| format!("bad workspace {arg:?}")),
+        "exec" if !arg.is_empty() => Ok(Command::Exec(arg.to_string())),
+        "close" => Ok(Command::Close),
+        "windows" => Ok(Command::Windows),
+        "focus-app" if !arg.is_empty() => Ok(Command::FocusApp(arg.to_string())),
+        "exit" => Ok(Command::Exit),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, exit".into()),
+    }
+}
+
+/// Reads one command from a new connection.
+pub fn read_command(stream: &UnixStream) -> Result<Command, String> {
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(stream.take(4096)).read_line(&mut line).map_err(|e| e.to_string())?;
+    parse(&line)
+}
+
+pub fn reply(mut stream: &UnixStream, text: &str) {
+    let _ = stream.write_all(text.as_bytes());
+}
+
+/// `davide-wm msg ...`
+pub fn client(args: &[String]) -> io::Result<()> {
+    let path = std::env::var(ENV).map_err(|_| io::Error::other(format!("{ENV} not set: not running inside davide-wm?")))?;
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(format!("{}\n", args.join(" ")).as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut out = String::new();
+    stream.read_to_string(&mut out)?;
+    print!("{out}");
+    if out.starts_with("error") {
+        std::process::exit(1);
+    }
+    Ok(())
+}

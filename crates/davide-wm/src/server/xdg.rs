@@ -1,7 +1,7 @@
 //! xdg-shell (toplevels, popups) and xdg-decoration.
 
 use wire::*;
-use wm::Rect;
+use wm::{FsMode, Rect};
 
 use super::*;
 
@@ -135,6 +135,23 @@ pub fn toplevel(s: &mut State, c: ClientId, surface: u32, op: u16, args: Args) {
                 x.role = XdgRole::None;
             }
         }
+        xdg_toplevel::req::SET_FULLSCREEN
+        | xdg_toplevel::req::UNSET_FULLSCREEN
+        | xdg_toplevel::req::SET_MAXIMIZED
+        | xdg_toplevel::req::UNSET_MAXIMIZED => {
+            if s.rule(key).is_some_and(|r| r.suppress_fullscreen) {
+                // The client still expects a configure in reply.
+                force_configure(s, key);
+                return;
+            }
+            let mode = match op {
+                xdg_toplevel::req::SET_FULLSCREEN => Some(FsMode::Fullscreen),
+                xdg_toplevel::req::SET_MAXIMIZED => Some(FsMode::Maximized),
+                _ => None,
+            };
+            workspaces::set_fullscreen(s, key, mode);
+            force_configure(s, key);
+        }
         xdg_toplevel::req::SET_TITLE | xdg_toplevel::req::SET_APP_ID => {
             let v = args.str(0).unwrap_or_default().to_string();
             if let Some(XdgRole::Toplevel { title, app_id, .. }) = s.surfaces.get_mut(&key).and_then(|sf| sf.xdg.as_mut()).map(|x| &mut x.role) {
@@ -203,15 +220,26 @@ pub fn decoration(s: &mut State, c: ClientId, id: u32, surface: u32, op: u16) {
     }
 }
 
-/// Sends a configure when the size or the activated state changed.
+/// Re-sends the last configure, for requests that must always be answered.
+fn force_configure(s: &mut State, key: SKey) {
+    let Some(XdgRole::Toplevel { sent, .. }) = s.surfaces.get_mut(&key).and_then(|sf| sf.xdg.as_mut()).map(|x| &mut x.role) else {
+        return;
+    };
+    if let Some((w, h, ..)) = sent.take() {
+        configure_toplevel(s, key, w, h);
+    }
+}
+
+/// Sends a configure when the size or the state changed.
 pub fn configure_toplevel(s: &mut State, key: SKey, w: i32, h: i32) {
     let focused = s.focus == Some(key);
+    let fs = s.fs_mode(key);
     let Some(x) = s.surfaces.get_mut(&key).and_then(|sf| sf.xdg.as_mut()) else { return };
     let XdgRole::Toplevel { obj, sent, .. } = &mut x.role else { return };
-    if *sent == Some((w, h, focused)) {
+    if *sent == Some((w, h, focused, fs)) {
         return;
     }
-    *sent = Some((w, h, focused));
+    *sent = Some((w, h, focused, fs));
     let (obj, xdg_obj) = (*obj, x.obj);
     x.configured = true;
     let version = s.version(key.client, obj);
@@ -219,7 +247,12 @@ pub fn configure_toplevel(s: &mut State, key: SKey, w: i32, h: i32) {
     if focused {
         states.push(xdg_toplevel::state::ACTIVATED);
     }
-    if version >= 2 {
+    match fs {
+        Some(FsMode::Fullscreen) => states.push(xdg_toplevel::state::FULLSCREEN),
+        Some(FsMode::Maximized) => states.push(xdg_toplevel::state::MAXIMIZED),
+        None => {}
+    }
+    if version >= 2 && fs.is_none() {
         states.extend([
             xdg_toplevel::state::TILED_LEFT,
             xdg_toplevel::state::TILED_RIGHT,
@@ -250,13 +283,15 @@ pub fn commit(s: &mut State, key: SKey) {
             if !x.configured {
                 // Initial commit: tile it now so the first configure has the final size.
                 x.configured = true;
-                let focus = s.focus;
-                s.tiling.insert(key, focus);
-                s.relayout();
+                workspaces::add_window(s, key);
             } else if has_buffer && !x.mapped {
                 x.mapped = true;
                 send_surface_enter(s, key);
-                seat::set_focus(s, Some(key));
+                if s.window_ws.get(&key) == Some(&workspaces::focused_ws(s)) {
+                    seat::set_focus(s, Some(key));
+                } else {
+                    workspaces::mark_urgent(s, key);
+                }
             } else if !has_buffer && x.mapped {
                 unmap(s, key);
             }
@@ -302,13 +337,6 @@ pub fn unmap(s: &mut State, key: SKey) {
         unmap(s, p);
     }
     s.popups.retain(|p| *p != key);
-    if s.tiling.contains(key) {
-        s.tiling.remove(key);
-        if s.focus == Some(key) {
-            let next = s.tiling.layout(s.work_area()).last().map(|(k, _)| *k);
-            seat::set_focus(s, next);
-        }
-        s.relayout();
-    }
+    workspaces::remove_window(s, key);
     s.needs_redraw = true;
 }

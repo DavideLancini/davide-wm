@@ -4,24 +4,29 @@
 //! for the live upgrade (README, ADR-014).
 
 mod compositor;
+mod dmabuf;
+mod misc;
 pub mod seat;
+mod selection;
+pub mod workspaces;
 mod xdg;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::time::Instant;
 
-use render::{Quad, Renderer, Target, Texture};
+use render::{Plane, Quad, Renderer, Target, Texture};
 use wire::{wl_callback, wl_display, Args, Connection, Interface, Msg};
-use wm::{Dwindle, Rect};
+use wm::{Rect, Workspace, WsId};
 
 use crate::keyboard::Keyboard;
 
+pub use compositor::install_sigbus_handler;
 pub use seat::CursorImage;
 
 pub type ClientId = u32;
 
-/// Identifies a `wl_surface` across clients.
+/// Identifies an object (usually a `wl_surface`) across clients.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SKey {
     pub client: ClientId,
@@ -56,6 +61,22 @@ pub enum Kind {
     DataDeviceManager,
     DataSource,
     DataDevice,
+    DataOffer { generation: u32 },
+    PrimaryManager,
+    PrimarySource,
+    PrimaryDevice,
+    PrimaryOffer { generation: u32 },
+    ControlManager,
+    ControlSource,
+    ControlDevice,
+    ControlOffer { generation: u32, primary: bool },
+    Activation,
+    ActivationToken,
+    Bell,
+    IdleInhibitManager,
+    IdleInhibitor { surface: u32 },
+    Dmabuf,
+    DmabufParams,
 }
 
 pub struct Object {
@@ -68,6 +89,7 @@ pub struct Client {
     pub conn: Connection,
     pub objects: HashMap<u32, Object>,
     pub dead: bool,
+    next_server_id: u32,
 }
 
 pub struct Global {
@@ -93,7 +115,7 @@ pub enum Role {
 
 pub enum XdgRole {
     None,
-    Toplevel { obj: u32, title: String, app_id: String, decoration: Option<u32>, sent: Option<(i32, i32, bool)> },
+    Toplevel { obj: u32, title: String, app_id: String, decoration: Option<u32>, sent: Option<(i32, i32, bool, Option<wm::FsMode>)> },
     Popup { obj: u32, parent: u32, geo: Rect },
 }
 
@@ -105,14 +127,22 @@ pub struct Xdg {
     pub mapped: bool,
 }
 
+/// What a surface shows.
+pub enum Content {
+    None,
+    /// Copied from shared memory; the buffer is already released.
+    Shm(Texture),
+    /// A dmabuf, held until another buffer replaces it.
+    Dmabuf(u32),
+}
+
 pub struct Surface {
     pub pending: Pending,
-    /// Committed buffer, kept until uploaded and released.
-    pub buffer: Option<u32>,
-    pub upload: bool,
+    /// Committed buffer not uploaded yet.
+    pub upload: Option<u32>,
+    pub content: Content,
     pub size: (i32, i32),
     pub opaque: bool,
-    pub tex: Option<Texture>,
     pub frames: Vec<u32>,
     pub role: Role,
     pub above: Vec<u32>,
@@ -128,13 +158,32 @@ pub struct Pool {
     pub destroyed: bool,
 }
 
-pub struct ShmBuffer {
-    pub pool: u32,
-    pub offset: i32,
-    pub width: i32,
-    pub height: i32,
-    pub stride: i32,
-    pub opaque: bool,
+pub enum Buffer {
+    Shm { pool: u32, offset: i32, width: i32, height: i32, stride: i32, opaque: bool },
+    Dmabuf { width: i32, height: i32, format: u32, modifier: u64, planes: Vec<Plane>, tex: Option<Texture>, failed: bool },
+}
+
+impl Buffer {
+    fn size(&self) -> (i32, i32) {
+        match self {
+            Buffer::Shm { width, height, .. } | Buffer::Dmabuf { width, height, .. } => (*width, *height),
+        }
+    }
+
+    fn opaque(&self) -> bool {
+        match self {
+            Buffer::Shm { opaque, .. } => *opaque,
+            // Formats without alpha start with 'X' (e.g. XR24, XB24).
+            Buffer::Dmabuf { format, .. } => format.to_le_bytes()[0] == b'X',
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct DmabufParams {
+    pub planes: Vec<(u32, Plane)>,
+    pub modifier: u64,
+    pub used: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -165,15 +214,26 @@ pub struct State {
     pub globals: Vec<Global>,
     pub surfaces: HashMap<SKey, Surface>,
     pub pools: HashMap<SKey, Pool>,
-    pub buffers: HashMap<SKey, ShmBuffer>,
+    pub buffers: HashMap<SKey, Buffer>,
+    pub dmabuf_params: HashMap<SKey, DmabufParams>,
+    pub dmabuf_formats: Vec<(u32, u64)>,
     pub positioners: HashMap<SKey, Positioner>,
     pub output: Output,
-    pub tiling: Dwindle<SKey>,
+    pub workspaces: HashMap<WsId, Workspace<SKey>>,
+    pub window_ws: HashMap<SKey, WsId>,
+    pub active: WsId,
+    pub special_shown: bool,
+    /// Visible tiles, bottom to top; entries from `special_start` belong to the special workspace.
     pub layout: Vec<(SKey, Rect)>,
+    pub special_start: usize,
     pub popups: Vec<SKey>,
     pub focus: Option<SKey>,
+    pub urgent: HashSet<SKey>,
     pub pointer: PointerState,
     pub keyboard: Keyboard,
+    pub selection: selection::Selections,
+    pub idle_inhibitors: HashMap<SKey, SKey>,
+    pub wallpaper: Option<Texture>,
     serial: u32,
     start: Instant,
     pub needs_redraw: bool,
@@ -181,7 +241,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(keyboard: Keyboard, output: Output) -> State {
+    pub fn new(keyboard: Keyboard, output: Output, dmabuf_formats: Vec<(u32, u64)>) -> State {
         let mut s = State {
             clients: HashMap::new(),
             next_client: 1,
@@ -189,14 +249,24 @@ impl State {
             surfaces: HashMap::new(),
             pools: HashMap::new(),
             buffers: HashMap::new(),
+            dmabuf_params: HashMap::new(),
+            dmabuf_formats,
             positioners: HashMap::new(),
             output,
-            tiling: Dwindle::default(),
+            workspaces: HashMap::new(),
+            window_ws: HashMap::new(),
+            active: WsId::Num(1),
+            special_shown: false,
             layout: Vec::new(),
+            special_start: 0,
             popups: Vec::new(),
             focus: None,
+            urgent: HashSet::new(),
             pointer: PointerState { x: 0.0, y: 0.0, focus: None, cursor: CursorImage::Default },
             keyboard,
+            selection: selection::Selections::default(),
+            idle_inhibitors: HashMap::new(),
+            wallpaper: None,
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
@@ -211,6 +281,12 @@ impl State {
             (&wire::xdg_wm_base::INTERFACE, 5),
             (&wire::zxdg_decoration_manager_v1::INTERFACE, 1),
             (&wire::wl_data_device_manager::INTERFACE, 3),
+            (&wire::zwp_primary_selection_device_manager_v1::INTERFACE, 1),
+            (&wire::ext_data_control_manager_v1::INTERFACE, 1),
+            (&wire::xdg_activation_v1::INTERFACE, 1),
+            (&wire::xdg_system_bell_v1::INTERFACE, 1),
+            (&wire::zwp_idle_inhibit_manager_v1::INTERFACE, 1),
+            (&wire::zwp_linux_dmabuf_v1::INTERFACE, 3),
         ] {
             let name = s.globals.len() as u32 + 1;
             s.globals.push(Global { name, iface, version: version.min(iface.version) });
@@ -223,7 +299,7 @@ impl State {
         self.next_client += 1;
         let mut objects = HashMap::new();
         objects.insert(1, Object { iface: &wl_display::INTERFACE, version: 1, kind: Kind::Display });
-        self.clients.insert(id, Client { conn: Connection::new(fd), objects, dead: false });
+        self.clients.insert(id, Client { conn: Connection::new(fd), objects, dead: false, next_server_id: 0xff00_0000 });
         id
     }
 
@@ -265,7 +341,7 @@ impl State {
 
     pub fn new_object(&mut self, client: ClientId, id: u32, iface: &'static Interface, version: u32, kind: Kind) -> bool {
         let Some(c) = self.clients.get_mut(&client) else { return false };
-        if id == 0 || c.objects.contains_key(&id) {
+        if id == 0 || id >= 0xff00_0000 || c.objects.contains_key(&id) {
             self.error(client, 1, wl_display::error::INVALID_OBJECT, &format!("id {id} already in use"));
             return false;
         }
@@ -273,10 +349,19 @@ impl State {
         true
     }
 
-    /// Removes a client-created object and acknowledges its id.
+    /// Creates an object on the server side (e.g. a data offer); returns its id.
+    pub fn new_server_object(&mut self, client: ClientId, iface: &'static Interface, version: u32, kind: Kind) -> Option<u32> {
+        let c = self.clients.get_mut(&client)?;
+        let id = c.next_server_id;
+        c.next_server_id += 1;
+        c.objects.insert(id, Object { iface, version, kind });
+        Some(id)
+    }
+
+    /// Removes an object and acknowledges client-created ids.
     pub fn remove_object(&mut self, client: ClientId, id: u32) {
         if let Some(c) = self.clients.get_mut(&client) {
-            if c.objects.remove(&id).is_some() {
+            if c.objects.remove(&id).is_some() && id < 0xff00_0000 {
                 c.conn.send(Msg::new(1, wl_display::evt::DELETE_ID).uint(id));
             }
         }
@@ -346,10 +431,8 @@ impl State {
         match kind {
             Kind::Display => compositor::display(self, c, op, args),
             Kind::Registry => compositor::registry(self, c, op, args),
-            Kind::Callback => {}
             Kind::Compositor => compositor::compositor(self, c, version, op, args),
             Kind::Surface => compositor::surface(self, c, id, op, args),
-            Kind::Region => {}
             Kind::Subcompositor => compositor::subcompositor(self, c, version, op, args),
             Kind::Subsurface { surface } => compositor::subsurface(self, c, surface, op, args),
             Kind::Shm => compositor::shm(self, c, version, op, args),
@@ -357,7 +440,6 @@ impl State {
             Kind::Buffer => compositor::buffer(self, c, id, op),
             Kind::Seat => seat::seat(self, c, version, op, args),
             Kind::Pointer => seat::pointer(self, c, op, args),
-            Kind::Keyboard | Kind::Touch | Kind::Output => {}
             Kind::XdgWmBase => xdg::wm_base(self, c, version, op, args),
             Kind::XdgPositioner => xdg::positioner(self, c, id, op, args),
             Kind::XdgSurface { surface } => xdg::xdg_surface(self, c, surface, version, op, args),
@@ -365,13 +447,28 @@ impl State {
             Kind::XdgPopup { surface } => xdg::popup(self, c, surface, op),
             Kind::DecorationManager => xdg::decoration_manager(self, c, version, op, args),
             Kind::Decoration { surface } => xdg::decoration(self, c, id, surface, op),
-            Kind::DataDeviceManager => compositor::data_device_manager(self, c, version, op, args),
-            // Clipboard and drag and drop arrive in M1.
-            Kind::DataSource | Kind::DataDevice => {}
+            Kind::DataDeviceManager
+            | Kind::DataSource
+            | Kind::DataDevice
+            | Kind::DataOffer { .. }
+            | Kind::PrimaryManager
+            | Kind::PrimarySource
+            | Kind::PrimaryDevice
+            | Kind::PrimaryOffer { .. }
+            | Kind::ControlManager
+            | Kind::ControlSource
+            | Kind::ControlDevice
+            | Kind::ControlOffer { .. } => selection::request(self, c, id, kind, version, op, args),
+            Kind::Activation | Kind::ActivationToken | Kind::Bell | Kind::IdleInhibitManager | Kind::IdleInhibitor { .. } => {
+                misc::request(self, c, id, kind, version, op, args)
+            }
+            Kind::Dmabuf | Kind::DmabufParams => dmabuf::request(self, c, id, kind, version, op, args),
+            Kind::Callback | Kind::Region | Kind::Keyboard | Kind::Touch | Kind::Output => {}
         }
     }
 
-    /// Writes pending output; returns the clients that still have data queued.
+    /// Writes pending output; returns the clients that had data queued and
+    /// whether some is still left.
     pub fn flush_clients(&mut self) -> Vec<(ClientId, bool)> {
         let mut out = Vec::new();
         for (id, c) in self.clients.iter_mut() {
@@ -411,15 +508,27 @@ impl State {
                 compositor::unmap_pool(&p);
             }
         }
-        self.buffers.retain(|k, _| k.client != client);
+        let buffers: Vec<SKey> = self.buffers.keys().filter(|k| k.client == client).copied().collect();
+        for k in buffers {
+            self.drop_buffer(k);
+        }
+        self.dmabuf_params.retain(|k, _| k.client != client);
         self.positioners.retain(|k, _| k.client != client);
+        self.idle_inhibitors.retain(|k, _| k.client != client);
+        selection::client_gone(self, client);
         self.needs_redraw = true;
+    }
+
+    fn drop_buffer(&mut self, key: SKey) {
+        if let Some(Buffer::Dmabuf { tex: Some(t), .. }) = self.buffers.remove(&key) {
+            self.dead_textures.push(t);
+        }
     }
 
     pub fn destroy_surface(&mut self, key: SKey) {
         xdg::unmap(self, key);
         let Some(s) = self.surfaces.remove(&key) else { return };
-        if let Some(t) = s.tex {
+        if let Content::Shm(t) = s.content {
             self.dead_textures.push(t);
         }
         if let Role::Subsurface { parent, .. } = s.role {
@@ -436,6 +545,7 @@ impl State {
                 self.pointer.cursor = CursorImage::Hidden;
             }
         }
+        self.idle_inhibitors.retain(|_, s| *s != key);
         self.needs_redraw = true;
     }
 
@@ -447,8 +557,24 @@ impl State {
         }
     }
 
+    pub fn app_id(&self, key: SKey) -> &str {
+        match self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
+            Some(XdgRole::Toplevel { app_id, .. }) => app_id,
+            _ => "",
+        }
+    }
+
+    pub fn rule(&self, key: SKey) -> Option<&'static config::Rule> {
+        let app_id = self.app_id(key);
+        config::RULES.iter().find(|r| r.app_id == app_id)
+    }
+
     /// Area available to tiled windows.
     pub fn work_area(&self) -> Rect {
+        self.output_rect()
+    }
+
+    pub fn output_rect(&self) -> Rect {
         Rect::new(0, 0, self.output.width, self.output.height)
     }
 
@@ -468,11 +594,22 @@ impl State {
     }
 
     pub fn relayout(&mut self) {
-        self.layout = self.tiling.layout(self.work_area());
+        let (work, out) = (self.work_area(), self.output_rect());
+        let mut layout = self.workspaces.get(&self.active).map(|w| w.layout(work, out)).unwrap_or_default();
+        self.special_start = layout.len();
+        if self.special_shown {
+            layout.extend(self.workspaces.get(&WsId::Special).map(|w| w.layout(work, out)).unwrap_or_default());
+        }
+        self.layout = layout;
         for (key, rect) in self.layout.clone() {
             xdg::configure_toplevel(self, key, rect.w, rect.h);
         }
         self.needs_redraw = true;
+    }
+
+    pub fn fs_mode(&self, key: SKey) -> Option<wm::FsMode> {
+        let ws = self.window_ws.get(&key)?;
+        self.workspaces.get(ws)?.fullscreen.filter(|(k, _)| *k == key).map(|(_, m)| m)
     }
 
     /// Top-left of the window geometry of a mapped xdg surface, in output coordinates.
@@ -494,13 +631,27 @@ impl State {
         (origin.0 - g.x, origin.1 - g.y)
     }
 
+    fn draw_background(&self, r: &mut Renderer) {
+        let Some(t) = &self.wallpaper else { return };
+        // Cover the output, cropping the image symmetrically.
+        let (ow, oh) = (self.output.width as f32, self.output.height as f32);
+        let scale = (ow / t.width as f32).max(oh / t.height as f32);
+        let (sw, sh) = (ow / scale, oh / scale);
+        let src = Quad { x: (t.width as f32 - sw) / 2.0, y: (t.height as f32 - sh) / 2.0, w: sw, h: sh };
+        r.draw_cropped(t, src, Quad { x: 0.0, y: 0.0, w: ow, h: oh });
+    }
+
     pub fn render(&mut self, r: &mut Renderer, target: &Target) {
         for t in self.dead_textures.drain(..) {
             r.destroy_texture(t);
         }
         self.upload_buffers(r);
         r.begin(target, config::BACKGROUND);
-        for (key, rect) in self.layout.clone() {
+        self.draw_background(r);
+        for (i, (key, rect)) in self.layout.clone().into_iter().enumerate() {
+            if i == self.special_start {
+                r.fill(Quad { x: 0.0, y: 0.0, w: self.output.width as f32, h: self.output.height as f32 }, config::SPECIAL_DIM);
+            }
             if !self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).is_some_and(|x| x.mapped) {
                 continue;
             }
@@ -528,6 +679,17 @@ impl State {
         self.needs_redraw = false;
     }
 
+    fn texture(&self, key: SKey) -> Option<&Texture> {
+        match &self.surfaces.get(&key)?.content {
+            Content::None => None,
+            Content::Shm(t) => Some(t),
+            Content::Dmabuf(id) => match self.buffers.get(&SKey { client: key.client, id: *id })? {
+                Buffer::Dmabuf { tex, .. } => tex.as_ref(),
+                Buffer::Shm { .. } => None,
+            },
+        }
+    }
+
     pub fn draw_tree(&self, r: &mut Renderer, key: SKey, (x, y): (i32, i32)) {
         let Some(s) = self.surfaces.get(&key) else { return };
         let child = |id: &u32| {
@@ -540,7 +702,7 @@ impl State {
         for (k, o) in s.below.iter().filter_map(child) {
             self.draw_tree(r, k, o);
         }
-        if let Some(t) = &s.tex {
+        if let Some(t) = self.texture(key) {
             r.draw(t, Quad { x: x as f32, y: y as f32, w: s.size.0 as f32, h: s.size.1 as f32 }, s.opaque);
         }
         for (k, o) in s.above.iter().filter_map(child) {
@@ -549,18 +711,47 @@ impl State {
     }
 
     fn upload_buffers(&mut self, r: &mut Renderer) {
-        let keys: Vec<SKey> = self.surfaces.iter().filter(|(_, s)| s.upload).map(|(k, _)| *k).collect();
+        let keys: Vec<SKey> = self.surfaces.iter().filter(|(_, s)| s.upload.is_some()).map(|(k, _)| *k).collect();
         for key in keys {
-            let s = self.surfaces.get_mut(&key).unwrap();
-            s.upload = false;
-            let Some(bid) = s.buffer.take() else { continue };
+            let bid = self.surfaces.get_mut(&key).unwrap().upload.take().unwrap();
             let bkey = SKey { client: key.client, id: bid };
-            let Some(b) = self.buffers.get(&bkey) else { continue };
-            let Some(p) = self.pools.get(&SKey { client: key.client, id: b.pool }) else { continue };
-            let len = (b.stride * (b.height - 1) + b.width * 4) as usize;
-            let pixels = unsafe { std::slice::from_raw_parts(p.ptr.add(b.offset as usize), len) };
-            s.tex = Some(r.upload(s.tex.take(), b.width, b.height, b.stride, pixels));
-            self.send(key.client, Msg::new(bid, wire::wl_buffer::evt::RELEASE));
+            let new_content = match self.buffers.get_mut(&bkey) {
+                None => continue,
+                Some(Buffer::Shm { pool, offset, width, height, stride, .. }) => {
+                    let (offset, width, height, stride) = (*offset, *width, *height, *stride);
+                    let Some(p) = self.pools.get(&SKey { client: key.client, id: *pool }) else { continue };
+                    let len = (stride * (height - 1) + width * 4) as usize;
+                    let old = match std::mem::replace(&mut self.surfaces.get_mut(&key).unwrap().content, Content::None) {
+                        Content::Shm(t) => Some(t),
+                        _ => None,
+                    };
+                    let ptr = unsafe { p.ptr.add(offset as usize) };
+                    let (tex, faulted) = compositor::guarded_read(ptr, len, |pixels| r.upload(old, width, height, stride, pixels));
+                    if faulted {
+                        self.error(key.client, bid, wire::wl_shm::error::INVALID_FD, "shm pool truncated by the client");
+                    }
+                    self.send(key.client, Msg::new(bid, wire::wl_buffer::evt::RELEASE));
+                    Content::Shm(tex)
+                }
+                Some(Buffer::Dmabuf { width, height, format, modifier, planes, tex, failed }) => {
+                    if tex.is_none() && !*failed {
+                        match r.import_dmabuf(*width, *height, *format, *modifier, planes) {
+                            Ok(t) => *tex = Some(t),
+                            Err(e) => {
+                                log!("client {}: {e}", key.client);
+                                *failed = true;
+                            }
+                        }
+                    }
+                    Content::Dmabuf(bid)
+                }
+            };
+            let s = self.surfaces.get_mut(&key).unwrap();
+            match std::mem::replace(&mut s.content, new_content) {
+                Content::Dmabuf(old) if old != bid => self.send(key.client, Msg::new(old, wire::wl_buffer::evt::RELEASE)),
+                Content::Shm(t) => self.dead_textures.push(t),
+                _ => {}
+            }
         }
     }
 }

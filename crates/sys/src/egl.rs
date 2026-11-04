@@ -26,6 +26,13 @@ pub const DMA_BUF_PLANE0_OFFSET_EXT: EGLint = 0x3273;
 pub const DMA_BUF_PLANE0_PITCH_EXT: EGLint = 0x3274;
 pub const DMA_BUF_PLANE0_MODIFIER_LO_EXT: EGLint = 0x3443;
 pub const DMA_BUF_PLANE0_MODIFIER_HI_EXT: EGLint = 0x3444;
+/// Per-plane attributes: (fd, offset, pitch, modifier lo, modifier hi).
+pub const DMA_BUF_PLANE_ATTRIBS: [[EGLint; 5]; 4] = [
+    [0x3272, 0x3273, 0x3274, 0x3443, 0x3444],
+    [0x3275, 0x3276, 0x3277, 0x3445, 0x3446],
+    [0x3278, 0x3279, 0x327A, 0x3447, 0x3448],
+    [0x3440, 0x3441, 0x3442, 0x3449, 0x344A],
+];
 
 #[link(name = "EGL")]
 extern "C" {
@@ -46,6 +53,16 @@ pub type PFNEGLCREATEIMAGEKHR =
 pub type PFNEGLDESTROYIMAGEKHR = unsafe extern "C" fn(dpy: EGLDisplay, image: EGLImage) -> EGLBoolean;
 pub type PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOES = unsafe extern "C" fn(target: u32, image: EGLImage);
 pub type PFNGLEGLIMAGETARGETTEXTURE2DOES = unsafe extern "C" fn(target: u32, image: EGLImage);
+pub type PFNEGLQUERYDMABUFFORMATSEXT =
+    unsafe extern "C" fn(dpy: EGLDisplay, max: EGLint, formats: *mut EGLint, num: *mut EGLint) -> EGLBoolean;
+pub type PFNEGLQUERYDMABUFMODIFIERSEXT = unsafe extern "C" fn(
+    dpy: EGLDisplay,
+    format: EGLint,
+    max: EGLint,
+    modifiers: *mut u64,
+    external_only: *mut EGLBoolean,
+    num: *mut EGLint,
+) -> EGLBoolean;
 
 /// Looks up an extension function. `name` must be NUL-terminated.
 pub unsafe fn proc_address<T: Copy>(name: &[u8]) -> Option<T> {

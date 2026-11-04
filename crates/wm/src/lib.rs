@@ -113,6 +113,30 @@ impl<T: Copy + PartialEq> Dwindle<T> {
         }
     }
 
+    /// Exchanges the positions of two windows.
+    pub fn swap(&mut self, x: T, y: T) {
+        fn walk<T: Copy + PartialEq>(n: &mut Node<T>, x: T, y: T) {
+            match n {
+                Node::Leaf(t) if *t == x => *t = y,
+                Node::Leaf(t) if *t == y => *t = x,
+                Node::Leaf(_) => {}
+                Node::Split { a, b, .. } => {
+                    walk(a, x, y);
+                    walk(b, x, y);
+                }
+            }
+        }
+        if x != y && self.contains(x) && self.contains(y) {
+            if let Some(r) = self.root.as_mut() {
+                walk(r, x, y);
+            }
+        }
+    }
+
+    pub fn windows(&self) -> Vec<T> {
+        self.layout(Rect::new(0, 0, 2, 2)).into_iter().map(|(t, _)| t).collect()
+    }
+
     pub fn layout(&self, area: Rect) -> Vec<(T, Rect)> {
         fn walk<T: Copy>(n: &Node<T>, r: Rect, out: &mut Vec<(T, Rect)>) {
             match n {
@@ -135,6 +159,60 @@ impl<T: Copy + PartialEq> Dwindle<T> {
             walk(r, area, &mut out);
         }
         out
+    }
+}
+
+/// Workspace identifiers, matching the Hyprland setup this replaces.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum WsId {
+    /// 1–41.
+    Num(u32),
+    /// The named workspace `chat`.
+    Chat,
+    /// The special workspace `resize`, shown on top of the active one.
+    Special,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FsMode {
+    /// Covers the work area.
+    Maximized,
+    /// Covers the whole output.
+    Fullscreen,
+}
+
+#[derive(Debug)]
+pub struct Workspace<T> {
+    pub tiling: Dwindle<T>,
+    /// Last focused window, restored when the workspace becomes active again.
+    pub focus: Option<T>,
+    pub fullscreen: Option<(T, FsMode)>,
+}
+
+impl<T: Copy + PartialEq> Default for Workspace<T> {
+    fn default() -> Self {
+        Workspace { tiling: Dwindle::default(), focus: None, fullscreen: None }
+    }
+}
+
+impl<T: Copy + PartialEq> Workspace<T> {
+    pub fn remove(&mut self, w: T) {
+        self.tiling.remove(w);
+        if self.focus == Some(w) {
+            self.focus = None;
+        }
+        if self.fullscreen.is_some_and(|(f, _)| f == w) {
+            self.fullscreen = None;
+        }
+    }
+
+    /// Visible windows and their rectangles, bottom to top.
+    pub fn layout(&self, work: Rect, output: Rect) -> Vec<(T, Rect)> {
+        match self.fullscreen {
+            Some((w, FsMode::Fullscreen)) => vec![(w, output)],
+            Some((w, FsMode::Maximized)) => vec![(w, work)],
+            None => self.tiling.layout(work),
+        }
     }
 }
 
@@ -187,6 +265,19 @@ mod tests {
         d.remove(1);
         d.remove(3);
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn swap_and_fullscreen() {
+        let mut ws = Workspace::default();
+        ws.tiling.insert(1, None);
+        ws.tiling.insert(2, Some(1));
+        ws.tiling.swap(1, 2);
+        assert_eq!(ws.tiling.windows(), vec![2, 1]);
+        ws.fullscreen = Some((1, FsMode::Maximized));
+        assert_eq!(ws.layout(AREA, AREA), vec![(1, AREA)]);
+        ws.remove(1);
+        assert_eq!(ws.layout(AREA, AREA), vec![(2, AREA)]);
     }
 
     #[test]

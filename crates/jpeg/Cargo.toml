@@ -1,0 +1,6 @@
+[package]
+name = "jpeg"
+description = "Baseline JPEG decoder (Huffman, 8-bit, any chroma subsampling)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

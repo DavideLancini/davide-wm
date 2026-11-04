@@ -49,6 +49,16 @@ impl Target {
     }
 }
 
+/// One plane of a client dmabuf.
+pub struct Plane {
+    pub fd: OwnedFd,
+    pub offset: u32,
+    pub stride: u32,
+}
+
+/// `DRM_FORMAT_MOD_INVALID`: the driver picks the layout implicitly.
+pub const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
 pub struct Texture {
     id: gl::GLuint,
     pub width: i32,
@@ -81,6 +91,9 @@ pub struct Renderer {
     create_image: egl::PFNEGLCREATEIMAGEKHR,
     destroy_image: egl::PFNEGLDESTROYIMAGEKHR,
     image_target_rb: egl::PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOES,
+    image_target_tex: egl::PFNGLEGLIMAGETARGETTEXTURE2DOES,
+    query_formats: Option<egl::PFNEGLQUERYDMABUFFORMATSEXT>,
+    query_modifiers: Option<egl::PFNEGLQUERYDMABUFMODIFIERSEXT>,
     solid: Program,
     textured: Program,
     viewport: (i32, i32),
@@ -194,6 +207,10 @@ impl Renderer {
             let destroy_image = egl::proc_address(b"eglDestroyImageKHR\0").ok_or(Error("no eglDestroyImageKHR".into()))?;
             let image_target_rb = egl::proc_address(b"glEGLImageTargetRenderbufferStorageOES\0")
                 .ok_or(Error("no glEGLImageTargetRenderbufferStorageOES".into()))?;
+            let image_target_tex = egl::proc_address(b"glEGLImageTargetTexture2DOES\0")
+                .ok_or(Error("no glEGLImageTargetTexture2DOES".into()))?;
+            let query_formats = egl::proc_address(b"eglQueryDmaBufFormatsEXT\0");
+            let query_modifiers = egl::proc_address(b"eglQueryDmaBufModifiersEXT\0");
             let solid = program(SOLID)?;
             let textured = program(TEXTURED)?;
             gl::glEnableVertexAttribArray(0);
@@ -208,6 +225,9 @@ impl Renderer {
                 create_image,
                 destroy_image,
                 image_target_rb,
+                image_target_tex,
+                query_formats,
+                query_modifiers,
                 solid,
                 textured,
                 viewport: (1, 1),
@@ -380,6 +400,96 @@ impl Renderer {
             );
             gl::glPixelStorei(gl::UNPACK_ROW_LENGTH, 0);
             Texture { id, width, height }
+        }
+    }
+
+    /// Uploads RGBA pixels with mipmaps, for images drawn scaled down.
+    pub fn upload_mipmapped(&mut self, width: i32, height: i32, rgba: &[u8]) -> Texture {
+        debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
+        unsafe {
+            let mut id = 0;
+            gl::glGenTextures(1, &mut id);
+            gl::glBindTexture(gl::TEXTURE_2D, id);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
+            gl::glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA as i32, width, height, 0, gl::RGBA, gl::UNSIGNED_BYTE, rgba.as_ptr().cast());
+            gl::glGenerateMipmap(gl::TEXTURE_2D);
+            Texture { id, width, height }
+        }
+    }
+
+    /// Draws `tex` cropped to `src` (texture pixels) into `dst`.
+    pub fn draw_cropped(&mut self, tex: &Texture, src: Quad, dst: Quad) {
+        // The unit square is mapped through `rect`; express the crop by
+        // drawing the whole texture larger and clipping to `dst`.
+        let sx = dst.w / src.w;
+        let sy = dst.h / src.h;
+        let full = Quad { x: dst.x - src.x * sx, y: dst.y - src.y * sy, w: tex.width as f32 * sx, h: tex.height as f32 * sy };
+        self.clip(Some(dst));
+        self.draw(tex, full, true);
+        self.clip(None);
+    }
+
+    /// Formats and modifiers that client dmabufs may use.
+    pub fn dmabuf_formats(&self) -> Vec<(u32, u64)> {
+        let (Some(qf), Some(qm)) = (self.query_formats, self.query_modifiers) else {
+            return vec![(gbm::FORMAT_XRGB8888, MOD_INVALID), (gbm::FORMAT_ARGB8888, MOD_INVALID)];
+        };
+        let mut out = Vec::new();
+        unsafe {
+            let mut n = 0;
+            qf(self.display, 0, null_mut(), &mut n);
+            let mut formats = vec![0; n as usize];
+            qf(self.display, n, formats.as_mut_ptr(), &mut n);
+            for f in formats {
+                let mut m = 0;
+                qm(self.display, f, 0, null_mut(), null_mut(), &mut m);
+                let mut mods = vec![0u64; m as usize];
+                let mut ext = vec![0u32; m as usize];
+                qm(self.display, f, m, mods.as_mut_ptr(), ext.as_mut_ptr(), &mut m);
+                for (md, e) in mods.iter().zip(&ext) {
+                    if *e == 0 {
+                        out.push((f as u32, *md));
+                    }
+                }
+                // Implicit modifier, for clients that do not pass one.
+                out.push((f as u32, MOD_INVALID));
+            }
+        }
+        out
+    }
+
+    pub fn import_dmabuf(&mut self, width: i32, height: i32, format: u32, modifier: u64, planes: &[Plane]) -> Result<Texture, Error> {
+        if planes.is_empty() || planes.len() > 4 {
+            return err("bad plane count");
+        }
+        let mut attribs = vec![egl::WIDTH, width, egl::HEIGHT, height, egl::LINUX_DRM_FOURCC_EXT, format as i32];
+        for (p, a) in planes.iter().zip(egl::DMA_BUF_PLANE_ATTRIBS) {
+            attribs.extend([a[0], p.fd.as_raw_fd(), a[1], p.offset as i32, a[2], p.stride as i32]);
+            if modifier != MOD_INVALID {
+                attribs.extend([a[3], modifier as u32 as i32, a[4], (modifier >> 32) as u32 as i32]);
+            }
+        }
+        attribs.push(egl::NONE);
+        unsafe {
+            let image = (self.create_image)(self.display, null_mut(), egl::LINUX_DMA_BUF_EXT, null_mut(), attribs.as_ptr());
+            if image.is_null() {
+                return err(format!("dmabuf import failed: {:#x}", egl::eglGetError()));
+            }
+            let mut id = 0;
+            gl::glGenTextures(1, &mut id);
+            gl::glBindTexture(gl::TEXTURE_2D, id);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+            (self.image_target_tex)(gl::TEXTURE_2D, image);
+            // The texture keeps the buffer alive on its own.
+            (self.destroy_image)(self.display, image);
+            Ok(Texture { id, width, height })
         }
     }
 
