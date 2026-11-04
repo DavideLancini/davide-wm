@@ -111,26 +111,16 @@ const TAG_SOURCES: u64 = 2;
 enum Source {
     Audio,
     Bluetooth,
-    Notifications,
-    Notify,
     Spotify,
 }
 
-const SOURCES: [Source; 5] = [
-    Source::Audio,
-    Source::Bluetooth,
-    Source::Notifications,
-    Source::Notify,
-    Source::Spotify,
-];
+const SOURCES: [Source; 3] = [Source::Audio, Source::Bluetooth, Source::Spotify];
 
 impl Source {
     fn name(self) -> &'static str {
         match self {
             Source::Audio => "audio server",
             Source::Bluetooth => "bluetooth bus",
-            Source::Notifications => "notifications bus",
-            Source::Notify => "notify bus",
             Source::Spotify => "spotify bus",
         }
     }
@@ -139,8 +129,6 @@ impl Source {
         match self {
             Source::Audio => m.audio.raw_fd(),
             Source::Bluetooth => m.bluetooth.raw_fd(),
-            Source::Notifications => m.notifications.raw_fd(),
-            Source::Notify => m.notify.raw_fd(),
             Source::Spotify => m.spotify.raw_fd(),
         }
     }
@@ -152,8 +140,6 @@ impl Source {
         match self {
             Source::Audio => m.audio.server_closed(),
             Source::Bluetooth => m.bluetooth.bus_closed(),
-            Source::Notifications => m.notifications.bus_closed(),
-            Source::Notify => m.notify.bus_closed(),
             Source::Spotify => m.spotify.bus_closed(),
         }
     }
@@ -228,9 +214,7 @@ impl<'a> Loop<'a> {
     }
 
     fn run(&mut self, snap: &mut Snapshot) -> io::Result<()> {
-        // Desktop notifications map to the workspace of the app that raised
-        // them; MPRIS pushes the whole metadata on every track change.
-        self.zones.modules.notify.connect();
+        // MPRIS pushes the whole metadata on every track change.
         self.zones.modules.spotify.connect();
         self.redraw(snap);
 
@@ -265,7 +249,7 @@ impl<'a> Loop<'a> {
                         let Some(&source) = SOURCES.get((tag - TAG_SOURCES) as usize) else {
                             continue;
                         };
-                        dirty |= self.drain(source, snap);
+                        dirty |= self.drain(source);
                     }
                 }
             }
@@ -306,23 +290,12 @@ impl<'a> Loop<'a> {
     }
 
     /// Consumes what a push source has pending; true when the bar may change.
-    fn drain(&mut self, source: Source, snap: &Snapshot) -> bool {
+    fn drain(&mut self, source: Source) -> bool {
         let m = &mut self.zones.modules;
         match source {
             Source::Audio => m.audio.drain_events(),
             Source::Bluetooth => m.bluetooth.drain_events(),
-            Source::Notifications => m.notifications.drain_events(),
             Source::Spotify => m.spotify.drain_events(),
-            Source::Notify => {
-                for app in m.notify.drain() {
-                    if let Some(workspace) =
-                        crate::modules::workspaces::workspace_of_app(&app, &snap.clients)
-                    {
-                        self.link.send(FromBar::Notified { workspace });
-                    }
-                }
-                false
-            }
         }
     }
 
@@ -392,6 +365,16 @@ impl<'a> Loop<'a> {
                 false
             }
             ToBar::Click { x } => self.click(x),
+            ToBar::Notification { app } => {
+                if let Some(workspace) = crate::modules::workspaces::workspace_of_app(&app, &snap.clients) {
+                    self.link.send(FromBar::Notified { workspace });
+                }
+                false
+            }
+            ToBar::NotificationCount(n) => {
+                self.zones.modules.notifications = n.to_string();
+                true
+            }
             ToBar::Display { screensaver, lid_inhibited } => {
                 let m = &mut self.zones.modules;
                 m.screensaver = screensaver;
@@ -430,6 +413,7 @@ impl<'a> Loop<'a> {
             Widget::Blk => self.link.send(FromBar::Blank),
             Widget::Screensaver => self.link.send(FromBar::CycleScreensaver),
             Widget::Lid => self.link.send(FromBar::ToggleLid),
+            Widget::Notifications => self.link.send(FromBar::ToggleNotifications),
             _ => {
                 if let Some(command) = widget.command() {
                     actions::run_detached(command);

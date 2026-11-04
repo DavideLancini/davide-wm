@@ -13,7 +13,6 @@ mod exec;
 mod icons;
 mod json;
 mod modules;
-mod notify;
 mod pulse;
 mod settings;
 mod zones;
@@ -53,6 +52,11 @@ pub enum ToBar {
     Clients(Vec<Client>),
     /// Left-button release at bar x coordinate.
     Click { x: i32 },
+    /// A notification arrived from this app: the bar answers with the
+    /// workspace to mark (`FromBar::Notified`).
+    Notification { app: String },
+    /// Notifications kept in the list.
+    NotificationCount(u32),
     /// Screensaver label ("OFF", "1m") and whether the lid switch is inhibited.
     Display { screensaver: String, lid_inhibited: bool },
 }
@@ -71,6 +75,7 @@ pub enum FromBar {
     Blank,
     CycleScreensaver,
     ToggleLid,
+    ToggleNotifications,
 }
 
 /// Handle owned by the compositor.

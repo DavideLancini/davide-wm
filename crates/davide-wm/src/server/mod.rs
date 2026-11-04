@@ -3,12 +3,13 @@
 //! All state is plain owned data keyed by ids so it can later be serialised
 //! for the live upgrade (README, ADR-014).
 
+pub mod clipboard;
 mod compositor;
 mod dmabuf;
 mod misc;
 mod persist;
 pub mod seat;
-mod selection;
+pub mod selection;
 pub mod workspaces;
 mod xdg;
 
@@ -222,8 +223,31 @@ pub struct BarSurface {
     pub sent: Option<(Vec<bar::WsEntry>, Vec<bar::Client>)>,
 }
 
+/// What the launcher box is showing.
+#[derive(Clone, PartialEq)]
+pub enum Purpose {
+    Apps,
+    /// The clipboard history, by hash of each entry's data.
+    Clipboard(Vec<u64>),
+    /// The notification list; item 0 clears it, then these ids.
+    Notifications(Vec<u32>),
+}
+
+/// A rendered card: height and ARGB pixels.
+pub type Card = (u32, Vec<u8>);
+
+/// A notification popup.
+pub struct NoticeView {
+    pub id: u32,
+    pub rect: Rect,
+    /// Rendered card waiting for upload.
+    pub pixels: Option<Vec<u8>>,
+    pub tex: Option<Texture>,
+}
+
 pub struct LauncherView {
     pub launcher: launcher::Launcher,
+    pub purpose: Purpose,
     pub tex: Option<Texture>,
     pub dirty: bool,
     /// Focus to give back when it closes.
@@ -268,6 +292,8 @@ pub struct State {
     pub bar: BarSurface,
     /// The launcher while it is open; it has the keyboard to itself.
     pub launcher: Option<LauncherView>,
+    /// Notification popups, top to bottom.
+    pub notices: Vec<NoticeView>,
     serial: u32,
     start: Instant,
     pub needs_redraw: bool,
@@ -306,6 +332,7 @@ impl State {
             urgent_ws: HashSet::new(),
             bar: BarSurface { visible: true, ..Default::default() },
             launcher: None,
+            notices: Vec::new(),
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
@@ -590,15 +617,54 @@ impl State {
     }
 
     pub fn open_launcher(&mut self) {
-        match launcher::Launcher::open() {
+        self.open_view(launcher::Launcher::open(), Purpose::Apps);
+    }
+
+    /// Opens the launcher box (closing whatever it showed before).
+    pub fn open_view(&mut self, l: Result<launcher::Launcher, String>, purpose: Purpose) {
+        self.close_launcher();
+        match l {
             Ok(l) => {
                 let prev_focus = self.focus;
                 seat::set_focus(self, None);
-                self.launcher = Some(LauncherView { launcher: l, tex: None, dirty: true, prev_focus });
+                self.launcher = Some(LauncherView { launcher: l, purpose, tex: None, dirty: true, prev_focus });
                 self.needs_redraw = true;
             }
             Err(e) => log!("launcher: {e}"),
         }
+    }
+
+    /// Replaces the popups: (id, height, pixels) top to bottom, or None
+    /// to keep the card already drawn for that id.
+    pub fn set_notices(&mut self, cards: Vec<(u32, Option<Card>)>) {
+        let mut old = std::mem::take(&mut self.notices);
+        let x = self.output.width - launcher::card::CARD_WIDTH as i32 - 12;
+        let mut y = if self.bar.visible { self.bar.height } else { 0 } + 12;
+        for (id, card) in cards {
+            let prev = old.iter().position(|n| n.id == id).map(|i| old.remove(i));
+            let view = match (card, prev) {
+                (Some((h, px)), prev) => {
+                    if let Some(t) = prev.and_then(|p| p.tex) {
+                        self.dead_textures.push(t);
+                    }
+                    NoticeView { id, rect: Rect::new(x, y, launcher::card::CARD_WIDTH as i32, h as i32), pixels: Some(px), tex: None }
+                }
+                (None, Some(mut p)) => {
+                    p.rect.x = x;
+                    p.rect.y = y;
+                    p
+                }
+                (None, None) => continue,
+            };
+            y += view.rect.h + 8;
+            self.notices.push(view);
+        }
+        self.dead_textures.extend(old.into_iter().filter_map(|n| n.tex));
+        self.needs_redraw = true;
+    }
+
+    pub fn notice_at(&self, x: f64, y: f64) -> Option<u32> {
+        self.notices.iter().find(|n| n.rect.contains(x, y)).map(|n| n.id)
     }
 
     pub fn close_launcher(&mut self) {
@@ -798,6 +864,14 @@ impl State {
             if let Some(origin) = self.window_origin(key) {
                 let o = self.surface_origin(key, origin);
                 self.draw_tree(r, key, o);
+            }
+        }
+        for n in &mut self.notices {
+            if let Some(px) = n.pixels.take() {
+                n.tex = Some(r.upload(n.tex.take(), n.rect.w, n.rect.h, n.rect.w * 4, &px));
+            }
+            if let Some(t) = &n.tex {
+                r.draw(t, Quad { x: n.rect.x as f32, y: n.rect.y as f32, w: n.rect.w as f32, h: n.rect.h as f32 }, true);
             }
         }
         if let Some(l) = &mut self.launcher {

@@ -63,6 +63,10 @@ pub enum Action {
     SwitchVt(u32),
     /// Live upgrade to the binary on disk (README, ADR-014).
     Upgrade,
+    /// The clipboard history picker.
+    ClipboardHistory,
+    /// The notification list.
+    Notifications,
     Exit,
 }
 
@@ -87,7 +91,8 @@ pub fn binds() -> Vec<Bind> {
         b(MAIN, keys::C, Action::Spawn("code")),
         b(MAIN, keys::F, Action::Spawn("thunar")),
         b(MAIN, keys::W, Action::Spawn("nmgui")),
-        b(MAIN, keys::N, Action::Spawn("systemctl --user kill -s RTMIN+4 nwg-notifications.service")),
+        b(MAIN, keys::N, Action::Notifications),
+        b(MAIN, keys::P, Action::ClipboardHistory),
         b(MAIN, keys::S, Action::Spawn("~/7Scripts/tts --clipboard")),
         b(MAIN, keys::M, Action::Spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle")),
         b(0, keys::AUDIO_MIC_MUTE, Action::Spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle")),
@@ -188,6 +193,16 @@ pub const OUTPUT_BLANK_BLACK: &[&str] = &["273Q"];
 /// for a failed DP link training (the monitor stays black while every API
 /// reports it on); on failure the laptop panel comes back.
 pub const LINK_CHECK_DELAY_MS: u64 = 3000;
+
+/// Clipboard history: entries kept (newest first) and the largest one stored.
+pub const CLIPBOARD_HISTORY: usize = 200;
+pub const CLIPBOARD_MAX_BYTES: usize = 16 << 20;
+
+/// Notifications: how long a popup stays when the app does not say, how many
+/// popups show at once, and how many notifications the list keeps.
+pub const NOTIFICATION_TIMEOUT_MS: u64 = 5000;
+pub const NOTIFICATION_POPUPS: usize = 4;
+pub const NOTIFICATION_HISTORY: usize = 50;
 
 /// Idle blanking: the timeout set automatically while an exclusive monitor is
 /// connected (unless chosen by hand), and the cycle of the bar's click.

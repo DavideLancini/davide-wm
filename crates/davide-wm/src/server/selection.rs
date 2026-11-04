@@ -6,6 +6,7 @@ use std::os::fd::OwnedFd;
 
 use wire::*;
 
+use super::clipboard::{self, Clip, History};
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -18,6 +19,12 @@ pub enum Which {
 pub struct Selection {
     /// Owner: client, source object and its kind.
     source: Option<(ClientId, u32, Kind)>,
+    /// Without a client owner: a clip the compositor serves itself (picked
+    /// from the history, or kept after its owner went away).
+    server: Option<Clip>,
+    /// The top of the history holds this selection's content, so it can be
+    /// kept when its owner goes away.
+    captured: bool,
     mimes: Vec<String>,
     /// Bumped on every change, so offers of an old selection stop working.
     generation: u32,
@@ -29,6 +36,10 @@ pub struct Selections {
     primary: Selection,
     /// Mime types offered by each source object.
     mimes: HashMap<SKey, Vec<String>>,
+    pub history: History,
+    /// Pipes the clipboard owner is writing into, with the generation they
+    /// belong to; the event loop hands them to the worker.
+    pub captures: Vec<(OwnedFd, u32, String)>,
 }
 
 impl Selections {
@@ -131,8 +142,11 @@ fn set(s: &mut State, which: Which, c: ClientId, source: u32, kind: Kind) {
         return;
     }
     sel.source = new;
+    sel.server = None;
+    sel.captured = false;
     sel.mimes = mimes;
     sel.generation += 1;
+    let generation = sel.generation;
     if let Some((oc, oid, okind)) = old {
         let op = match okind {
             Kind::DataSource => wl_data_source::evt::CANCELLED,
@@ -141,7 +155,55 @@ fn set(s: &mut State, which: Which, c: ClientId, source: u32, kind: Kind) {
         };
         s.send(oc, Msg::new(oid, op));
     }
+    if which == Which::Clipboard {
+        if let Some((mime, (c, id, kind))) = clipboard::pick_mime(&s.selection.clipboard.mimes).zip(new) {
+            match clipboard::pipe() {
+                Ok((read, write)) => {
+                    s.send(c, Msg::new(id, send_op(kind)).str(&mime).fd(write));
+                    s.selection.captures.push((read, generation, mime));
+                }
+                Err(e) => log!("clipboard pipe: {e}"),
+            }
+        }
+    }
     broadcast(s, which);
+}
+
+fn send_op(kind: Kind) -> u16 {
+    match kind {
+        Kind::DataSource => wl_data_source::evt::SEND,
+        Kind::PrimarySource => zwp_primary_selection_source_v1::evt::SEND,
+        _ => ext_data_control_source_v1::evt::SEND,
+    }
+}
+
+/// A capture finished: the clip joins the history.
+pub fn captured(s: &mut State, generation: u32, clip: Clip) {
+    s.selection.history.push(clip);
+    let sel = &mut s.selection.clipboard;
+    if sel.generation == generation && sel.source.is_some() {
+        sel.captured = true;
+    }
+}
+
+/// Makes the compositor the clipboard owner, serving `clip` (picked from
+/// the history, which moves it to the top).
+pub fn set_server(s: &mut State, clip: Clip) {
+    let sel = &mut s.selection.clipboard;
+    let old = sel.source.take();
+    sel.mimes = clipboard::offered(&clip);
+    sel.server = Some(clip.clone());
+    sel.captured = false;
+    sel.generation += 1;
+    if let Some((oc, oid, okind)) = old {
+        let op = match okind {
+            Kind::DataSource => wl_data_source::evt::CANCELLED,
+            _ => ext_data_control_source_v1::evt::CANCELLED,
+        };
+        s.send(oc, Msg::new(oid, op));
+    }
+    s.selection.history.push(clip);
+    broadcast(s, Which::Clipboard);
 }
 
 fn broadcast(s: &mut State, which: Which) {
@@ -176,7 +238,7 @@ pub fn offer_to_client(s: &mut State, c: ClientId, which: Which) {
         ),
     };
     let sel = s.selection.get(which);
-    let (has, mimes, generation) = (sel.source.is_some(), sel.mimes.clone(), sel.generation);
+    let (has, mimes, generation) = (sel.source.is_some() || sel.server.is_some(), sel.mimes.clone(), sel.generation);
     for (dev, version) in s.objects_of(c, device_kind) {
         let mut offer = 0;
         if has {
@@ -197,7 +259,7 @@ pub fn offer_to_client(s: &mut State, c: ClientId, which: Which) {
 
 fn offer_to_control(s: &mut State, c: ClientId, dev: u32, version: u32, which: Which) {
     let sel = s.selection.get(which);
-    let (has, mimes, generation) = (sel.source.is_some(), sel.mimes.clone(), sel.generation);
+    let (has, mimes, generation) = (sel.source.is_some() || sel.server.is_some(), sel.mimes.clone(), sel.generation);
     let mut offer = 0;
     if has {
         let kind = Kind::ControlOffer { generation, primary: which == Which::Primary };
@@ -220,13 +282,12 @@ fn receive(s: &mut State, which: Which, generation: u32, mime: String, fd: Owned
     if sel.generation != generation {
         return;
     }
+    if let Some(clip) = &sel.server {
+        clipboard::serve(fd, clip.data.clone());
+        return;
+    }
     let Some((c, id, kind)) = sel.source else { return };
-    let op = match kind {
-        Kind::DataSource => wl_data_source::evt::SEND,
-        Kind::PrimarySource => zwp_primary_selection_source_v1::evt::SEND,
-        _ => ext_data_control_source_v1::evt::SEND,
-    };
-    s.send(c, Msg::new(id, op).str(&mime).fd(fd));
+    s.send(c, Msg::new(id, send_op(kind)).str(&mime).fd(fd));
 }
 
 fn source_gone(s: &mut State, c: ClientId, id: u32) {
@@ -237,6 +298,14 @@ fn source_gone(s: &mut State, c: ClientId, id: u32) {
             sel.source = None;
             sel.mimes.clear();
             sel.generation += 1;
+            // The clipboard outlives the program it was copied from.
+            if std::mem::take(&mut sel.captured) {
+                if let Some(top) = s.selection.history.entries.first().cloned() {
+                    let sel = s.selection.get(which);
+                    sel.mimes = clipboard::offered(&top);
+                    sel.server = Some(top);
+                }
+            }
             broadcast(s, which);
         }
     }
@@ -255,5 +324,18 @@ pub fn focus_changed(s: &mut State, c: ClientId) {
     offer_to_client(s, c, Which::Primary);
 }
 
-state::persist_struct!(Selection { source, mimes, generation });
-state::persist_struct!(Selections { clipboard, primary, mimes });
+state::persist_struct!(Selection { source, server, captured, mimes, generation });
+
+/// Captures in flight are dropped: their owner still has the selection.
+impl state::Persist for Selections {
+    fn save(&self, e: &mut state::Enc) {
+        self.clipboard.save(e);
+        self.primary.save(e);
+        self.mimes.save(e);
+        self.history.save(e);
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        use state::Persist;
+        Ok(Selections { clipboard: Persist::load(d)?, primary: Persist::load(d)?, mimes: Persist::load(d)?, history: Persist::load(d)?, captures: Vec::new() })
+    }
+}

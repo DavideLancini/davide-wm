@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 pub enum Done {
     Wallpaper(jpeg::Image),
+    /// A clipboard selection read from its owner.
+    Clip { generation: u32, clip: crate::server::clipboard::Clip },
+    Saved,
     /// The kernel log check after lighting an exclusive monitor.
     LinkCheck { name: String, failed: bool },
 }

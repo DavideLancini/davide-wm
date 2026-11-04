@@ -401,41 +401,6 @@ impl DBus {
         .map(|_| ())
     }
 
-    /// Turns the connection into a monitor, receiving a copy of every message
-    /// matching `rules` even when addressed to someone else.
-    ///
-    /// This replaces the `eavesdrop=true` match flag, which dbus-daemon has
-    /// ignored since 1.10 — `AddMatch` still succeeds, it just never delivers
-    /// anything. A monitor connection is receive-only: the bus rejects any
-    /// further method call on it, so this must be the last thing asked of it.
-    pub fn become_monitor(&mut self, rules: &[&str]) -> Option<()> {
-        // Signature "asu": an array of match rules, then a flags word.
-        let mut body = Vec::new();
-        let mut array = Vec::new();
-        for rule in rules {
-            put_string(&mut array, rule);
-        }
-        put_u32(&mut body, array.len() as u32);
-        body.extend_from_slice(&array);
-        put_u32(&mut body, 0); // flags, reserved
-
-        self.call_raw(
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus.Monitoring",
-            "BecomeMonitor",
-            "asu",
-            body,
-        )
-        .map(|_| ())
-    }
-
-    /// Calls a method taking no arguments and returning a single u32.
-    pub fn call_u32(&mut self, destination: &str, path: &str, interface: &str, member: &str) -> Option<u32> {
-        let body = self.call(destination, path, interface, member, &[])?;
-        Reader::new(&body).u32()
-    }
-
     /// Reads a property via org.freedesktop.DBus.Properties.Get.
     pub fn get_property(
         &mut self,
@@ -473,61 +438,6 @@ impl DBus {
             "Get",
             &[interface, property],
         )
-    }
-
-    /// Drains pending messages, returning them. Unlike `drain_signals` this
-    /// keeps the bodies, which is what the notification watcher needs: the app
-    /// name lives in the first argument of each `Notify` call.
-    pub fn drain_messages(&mut self) -> Vec<Message> {
-        let mut out = Vec::new();
-        self.stream.set_nonblocking(true).ok();
-        loop {
-            let mut header = [0u8; 16];
-            match self.stream.read_exact(&mut header) {
-                Ok(()) => {
-                    // The header arrived, so the rest is on its way: finish it
-                    // blocking rather than losing sync with the stream.
-                    self.stream.set_nonblocking(false).ok();
-                    let msg = self.read_body(&header);
-                    self.stream.set_nonblocking(true).ok();
-                    match msg {
-                        Some(m) => out.push(m),
-                        None => break,
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    self.closed = true;
-                    break;
-                }
-            }
-        }
-        self.stream.set_nonblocking(false).ok();
-        out
-    }
-
-    /// Reads the fields and body of a message whose header was consumed.
-    fn read_body(&mut self, header: &[u8; 16]) -> Option<Message> {
-        let body_len = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
-        let fields_len = u32::from_le_bytes(header[12..16].try_into().ok()?) as usize;
-        if body_len > 1 << 24 || fields_len > 1 << 16 {
-            return None;
-        }
-        let mut fields = vec![0u8; fields_len];
-        self.stream.read_exact(&mut fields).ok()?;
-        let padding = (8 - (fields_len % 8)) % 8;
-        if padding > 0 {
-            let mut skip = vec![0u8; padding];
-            self.stream.read_exact(&mut skip).ok()?;
-        }
-        let mut body = vec![0u8; body_len];
-        self.stream.read_exact(&mut body).ok()?;
-        Some(Message {
-            msg_type: header[1],
-            member: parse_member(&fields),
-            body,
-        })
     }
 
     /// Drains pending signal messages; true if any arrived.

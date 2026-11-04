@@ -340,6 +340,7 @@ impl State {
             urgent_ws,
             bar,
             launcher: _,
+            notices: _,
             serial,
             start,
             needs_redraw: _,

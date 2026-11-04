@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the subsetted font embedded in the binary.
 #
-# The launcher only needs ASCII plus the Latin-1 accents Italian needs — no
+# The launcher, the clipboard picker and the notification cards need Latin
+# text and punctuation — no
 # icon set (unlike topbar, the launcher draws no widgets). Subsetting takes the file
 # down to a few tens of KB, which is what makes embedding it reasonable.
 #
@@ -19,9 +20,9 @@ OUT="$(dirname "$0")/../assets/launcher-font.ttf"
 [ -r "$SRC" ] || { echo "source font not found: $SRC" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 
-# Printable ASCII plus the accented letters and symbols that show up in
-# application names and search queries.
-TEXT='U+0020-007E,U+00A0,U+00B0,U+00B5,U+00C0-00FF,U+2013,U+2014,U+2018,U+2019,U+201C,U+201D,U+2026'
+# Latin-1 and Latin Extended-A, typographic punctuation, euro, arrows: what
+# shows up in application names, clipboard entries and notifications.
+TEXT='U+0020-007E,U+00A0-017F,U+2010-2027,U+2030-203A,U+20AC,U+2122,U+2190-2195,U+2212'
 
 pyftsubset "$SRC" \
   --unicodes="$TEXT" \

@@ -38,11 +38,11 @@
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
 > Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
-> Status: **M4 done** (tested nested; DRM paths untested) — monitor policy, mirrors, blanking, idle screensaver, lid; bar and launcher in-process. Next: M5 (clipboard history, notifications).
+> Status: **M5 done** (tested nested; M3–M5 still to be tested on the TTY) — clipboard history and notification server in-process, after monitors/blanking (M4), launcher (M3) and bar (M2). Next: M6 (Xwayland).
 
 | Field | Value |
 |---|---|
-| Doc version | 0.9 |
+| Doc version | 0.10 |
 | Last updated | 2026-11-04 |
 | Owner | Davide Lancini |
 | Project status | development |
@@ -174,7 +174,11 @@
     - *Inventory of `dawn`:* `monitor-manager` (2200 lines: hotplug via socket2, EDID classification, layouts MSI-only / Hisense mirror / other above eDP / laptop-only, eDP-1 disabled under the MSI, DP link-training check in the kernel log, watchdog, idle blanking from `/dev/input`, screensaver state 1m/5m/30m/OFF with auto/manual source, waybar JSON), `blackout-core` + `blk` (DPMS off, or a black `foot` window over the MSI, until the first input, 700 ms grace, guard loop against the MSI re-handshake), `lid-action` / `lid-inhibit-toggle` / `lid-status` (a `systemd-inhibit` process in a pidfile; eDP-1 off on close while inhibited). `cast` is left for M7; the other `dawn` crates are unrelated to the compositor.
     - *Ported:* several outputs at once (ADR-033): an exclusive monitor (`config::OUTPUT_EXCLUSIVE`, the MSI) alone at its highest refresh, else the laptop panel with other monitors mirroring it; the link check after lighting the MSI (ADR-036); DPMS per output; `blk` as an in-process black screen (black frames on the MSI, DPMS off elsewhere; ADR-034); the idle screensaver with its auto/manual policy, honouring idle inhibitors on screen; the lid inhibitor as a logind fd (ADR-035); with the lid closed the panel stays dark and an external monitor takes over. The bar's blk, screensaver and lid widgets now talk to the compositor. IPC: `blank`, `wake`, `screensaver [cycle|on|off|auto|<secs>]`, `lid-inhibit [toggle]`, `outputs`.
     - *Not ported:* HDR / 10-bit on the MSI (needs a colour pipeline), the watchdog (the compositor knows what it lit), the guard loop (the MSI is never powered down).
-  - **M5 — Clipboard history + notifications:** history picker, data-control, notification server with popups/panel.
+  - **M5 — Clipboard history + notifications (done 2026-11-04, tested nested with a private session bus):**
+    - *Clipboard (ADR-037):* every new clipboard selection is read from its owner on a worker thread (text preferred, else an image; entries marked `x-kde-passwordManagerHint` skipped), kept newest first without duplicates (`config::CLIPBOARD_HISTORY`, 16 MiB per entry) and saved to `$XDG_STATE_HOME/davide-wm/clipboard` (mode 0600). Main+P opens the picker in the launcher box: type to filter, Enter makes the entry the clipboard (the compositor serves it), Delete removes it. The clipboard survives the program it was copied from.
+    - *Notifications (ADR-038):* `org.freedesktop.Notifications` on the session bus (Notify, CloseNotification, GetCapabilities `actions body persistence`, GetServerInformation; NotificationClosed, ActionInvoked). Popups at the top right below the bar, newest on top, at most `NOTIFICATION_POPUPS`; 5 s unless the app says otherwise, critical ones stay. Left click runs the default action and focuses the app's window, other buttons dismiss. Main+N or the bar's bell opens the list in the launcher box: Enter focuses and removes, Delete removes, the first row clears all. The workspace of the app that notified is marked urgent, as before.
+    - *Bar:* the nwg-notifications count and the bus monitor are gone; the compositor sends the count and each new notification.
+    - *Not done:* icons and images, body markup, inline replies, do-not-disturb. IPC for tests: `clipboard`, `notifications`, `key` with several codes (a chord).
   - **M6 — Xwayland:** XWM in-process.
   - **M7 — Screen sharing:** portal backend, PipeWire stream (outputs and windows), headless outputs for `cast`, screenshot taker.
   - **Switch-over:** remove Hyprland, xdg-desktop-portal-hyprland/-wlr, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
@@ -209,7 +213,7 @@ Cargo workspace (ADR-015): one library crate per building block under `crates/`,
 | Notifications | D-Bus notification server, popups, panel | `crates/notifications/` |
 | XWM | Xwayland process + X11 window management *(planned)* | `crates/xwayland/` |
 | Screen cast / screenshots | portal backend, PipeWire streams, screenshot taker *(planned)* | `crates/screencast/` |
-| D-Bus | own minimal client: SASL EXTERNAL, little-endian marshalling of every type, calls with timeouts, signals, fd passing; server side (names, method handling) *(planned for M5)* | `crates/dbus/` |
+| D-Bus | own minimal client: SASL EXTERNAL, little-endian marshalling of every type, calls with timeouts, signals, fd passing; server side: name requests, method returns, errors, signals | `crates/dbus/` |
 | IPC | Unix socket commands, `davide-wm msg` CLI | `crates/davide-wm/src/ipc.rs` |
 | Process exec | detached spawn (`setsid`, close fds), helpers with timeouts *(planned)* | `crates/exec/` |
 
@@ -358,6 +362,8 @@ davide-wm/
 | 34 | Blanking inside the compositor | accepted | 2026-11-04 | No overlay window or `hyprctl`: blanking powers down every output except the `OUTPUT_BLANK_BLACK` ones (the OLED MSI, which would drop the signal and re-handshake), which get one black frame. Input during the 700 ms grace is ignored; then the first press, motion or scroll wakes and is swallowed, releases always pass so no key stays down in a client. Idle blanking skips while a client with a window on screen holds an idle inhibitor (monitor-manager ignored them). Screensaver settings persist in `$XDG_STATE_HOME/davide-wm/screensaver`. |
 | 35 | Lid inhibitor as a logind fd held by the compositor | accepted | 2026-11-04 | Replaces the `systemd-inhibit sleep infinity` process and its pidfile; the fd survives a live upgrade in the blob. While held, closing the lid leaves the session running and only darkens the panel. |
 | 36 | DP link check through `journalctl -k` | accepted | 2026-11-04 | After lighting an exclusive monitor, a worker job waits `LINK_CHECK_DELAY_MS` and greps the kernel log for amdgpu's `enabling link N failed`: when training fails, KMS still reports the output lit while it shows nothing. `/dev/kmsg` is not readable (`dmesg_restrict`). On failure the connector is skipped until unplugged and the panel comes back. A modeset error on an external monitor is handled the same way. |
+| 37 | Clipboard history captured by the compositor itself | accepted | 2026-11-04 | No `wl-paste --watch`: on each new clipboard selection the compositor asks the owner for one type through a pipe and reads it on the worker (3 s deadline). Primary selection is not recorded, like cliphist. When the owner exits, the compositor keeps serving the captured clip. Picker and history share the launcher box (`Launcher::picker`). The history lives in the live-upgrade blob and in its own file, written on the worker. |
+| 38 | Notification server on the main thread | accepted | 2026-11-04 | Uses `crates/dbus` (server side added) with the bus fd in the main epoll: calls are short and need compositor state. The name is requested with replace-existing and do-not-queue: when another server holds it (nested inside Hyprland) notifications stay off. Popups are cards drawn by `launcher::card` and composited like the launcher; the list reuses the picker. NotificationClosed is sent when a popup expires, while the entry stays in the list. Before switch-over, remove `~/.local/share/dbus-1/services/org.freedesktop.Notifications.service` and the `nwg-notifications` user service. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
@@ -411,7 +417,7 @@ davide-wm/
 | Compositor crash = whole session lost | Lost work in every open app | Non-blocking rule, panic isolation, headless integration tests, nested development. |
 | GPU/driver edge cases (dmabuf modifiers, atomic commit failures, hotplug) | Black screen, frozen outputs | Test hotplug with MSI and TV early (M1); keep a fallback modeset path. |
 | libpipewire FFI | Unsafe code, one more C dependency | Isolated in `crates/screencast/`; reconsider a native implementation later. |
-| Ported code inherits topbar debt: hand-written JSON/text parsers, compiled-in Spotify credentials, hard-coded machine paths (`BAT0`, `amdgpu_bl1`, `~/7Scripts`), a second D-Bus client in `crates/bar/src/dbus.rs` | Fragility, secrets in the binary, duplicated code | Merge the bar's D-Bus code into `crates/dbus` (M5 needs its server side anyway); move secrets out of the binary. |
+| Ported code inherits topbar debt: hand-written JSON/text parsers, compiled-in Spotify credentials, hard-coded machine paths (`BAT0`, `amdgpu_bl1`, `~/7Scripts`), a second D-Bus client in `crates/bar/src/dbus.rs` | Fragility, secrets in the binary, duplicated code | The bar's D-Bus client lost its monitor and notification code in M5 but still serves UPower, BlueZ and MPRIS; port those widgets to `crates/dbus`; move secrets out of the binary. |
 | Some current behaviour depends on Hyprland specifics (socket2 consumers, `hyprctl` calls in helper scripts) | Regressions after switch-over | `dawn` inventoried in M4 (monitor-manager, blk, lid tools ported); still to check: the helper scripts the bar calls and `cast` (M7). |
 | Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, `persist_struct!` forces every field to be handled, automatic fallback to `davide-wm-prev`. Still missing: round-trip tests on a headless backend, and a test of the DRM path (logind bus, KMS fd, libinput re-open). |
 | One huge project, always built together | Long builds, harder refactors | Cargo workspace (ADR-015), clear crate boundaries, live upgrade makes deploying cheap. |

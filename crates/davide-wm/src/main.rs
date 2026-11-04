@@ -7,6 +7,7 @@ mod display;
 mod event_loop;
 mod ipc;
 mod keyboard;
+mod notify;
 mod server;
 mod worker;
 
@@ -22,7 +23,7 @@ use config::{mods, Action};
 use event_loop::{Epoll, HANGUP, READABLE};
 use backend::{nested::Nested, outputs, Drm, Event};
 use render::{Renderer, Target};
-use server::{seat, workspaces, ClientId, State};
+use server::{clipboard, seat, selection, workspaces, ClientId, Purpose, State};
 
 const TOKEN_LISTENER: u64 = 1;
 const TOKEN_HOST: u64 = 2;
@@ -35,6 +36,8 @@ const TOKEN_LOGIND: u64 = 8;
 const TOKEN_UEVENT: u64 = 9;
 const TOKEN_BAR: u64 = 10;
 const TOKEN_IDLE: u64 = 11;
+const TOKEN_NOTIFY_BUS: u64 = 12;
+const TOKEN_NOTIFY_TIMER: u64 = 13;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -154,6 +157,12 @@ struct App {
     last_frame: Option<usize>,
     /// Mirror heads still showing an older frame than `last_frame`.
     mirrors_stale: Vec<usize>,
+    notifier: notify::Notifier,
+    cards: Option<launcher::card::Cards>,
+    /// Notification count last sent to the bar.
+    bar_notifications: Option<usize>,
+    /// The clipboard history changed and is not saved yet.
+    clipboard_dirty: bool,
 }
 
 impl App {
@@ -212,6 +221,17 @@ impl App {
                         self.state.close_launcher();
                         self.spawn(&cmd);
                     }
+                    launcher::Outcome::Pick(i) => {
+                        let purpose = view.purpose.clone();
+                        self.state.close_launcher();
+                        self.picked(purpose, i);
+                    }
+                    launcher::Outcome::Delete(i) => {
+                        view.dirty = true;
+                        self.state.needs_redraw = true;
+                        let purpose = view.purpose.clone();
+                        self.deleted(purpose, i);
+                    }
                 }
             }
             return;
@@ -251,6 +271,7 @@ impl App {
             Action::ToggleBar => {
                 s.bar.visible = !s.bar.visible;
                 s.relayout();
+                self.sync_notices();
             }
             Action::SwitchVt(vt) => {
                 if let Backend::Drm(d) = &mut self.backend {
@@ -258,8 +279,110 @@ impl App {
                 }
             }
             Action::Upgrade => self.upgrade = true,
+            Action::ClipboardHistory => self.open_clipboard(),
+            Action::Notifications => self.open_notifications(),
             Action::Exit => self.running = false,
         }
+    }
+
+    fn open_clipboard(&mut self) {
+        let entries = &self.state.selection.history.entries;
+        let labels = entries.iter().map(clipboard::label).collect();
+        let hashes = entries.iter().map(clip_hash).collect();
+        self.state.open_view(launcher::Launcher::picker(labels), Purpose::Clipboard(hashes));
+    }
+
+    fn open_notifications(&mut self) {
+        if self.state.launcher.as_ref().is_some_and(|l| matches!(l.purpose, Purpose::Notifications(_))) {
+            self.state.close_launcher();
+            return;
+        }
+        let list: Vec<&notify::Notification> = self.notifier.list.iter().rev().collect();
+        let labels = std::iter::once(format!("Clear all ({})", list.len())).chain(list.iter().map(|n| n.label())).collect();
+        let ids = list.iter().map(|n| n.id).collect();
+        self.state.open_view(launcher::Launcher::picker(labels), Purpose::Notifications(ids));
+    }
+
+    fn clip_index(&self, hashes: &[u64], i: usize) -> Option<usize> {
+        let h = hashes.get(i)?;
+        self.state.selection.history.entries.iter().position(|c| clip_hash(c) == *h)
+    }
+
+    /// Enter in a picker.
+    fn picked(&mut self, purpose: Purpose, i: usize) {
+        match purpose {
+            Purpose::Apps => {}
+            Purpose::Clipboard(hashes) => {
+                if let Some(clip) = self.clip_index(&hashes, i).map(|j| self.state.selection.history.entries[j].clone()) {
+                    selection::set_server(&mut self.state, clip);
+                    self.save_clipboard();
+                }
+            }
+            Purpose::Notifications(ids) => match i.checked_sub(1).and_then(|j| ids.get(j)) {
+                None => self.notifier.clear(),
+                Some(id) => {
+                    if let Some((app, entry)) = self.notifier.invoke(*id) {
+                        self.focus_notifier(&app, &entry);
+                    }
+                }
+            },
+        }
+        self.sync_notices();
+    }
+
+    /// Delete in a picker.
+    fn deleted(&mut self, purpose: Purpose, i: usize) {
+        match purpose {
+            Purpose::Apps => {}
+            Purpose::Clipboard(hashes) => {
+                if let Some(j) = self.clip_index(&hashes, i) {
+                    self.state.selection.history.entries.remove(j);
+                    self.save_clipboard();
+                }
+            }
+            Purpose::Notifications(ids) => match i.checked_sub(1).and_then(|j| ids.get(j)) {
+                None => {
+                    self.notifier.clear();
+                    self.state.close_launcher();
+                }
+                Some(id) => self.notifier.dismiss(*id),
+            },
+        }
+        self.sync_notices();
+    }
+
+    /// Focuses the window of the app that raised a notification.
+    fn focus_notifier(&mut self, app: &str, entry: &str) {
+        if [entry, app].iter().any(|a| !a.is_empty() && self.focus_app(a)) {
+            return;
+        }
+        let want = app.to_lowercase();
+        let found = self.state.window_ws.keys().find(|k| {
+            let id = self.state.app_id(**k).to_lowercase();
+            !want.is_empty() && !id.is_empty() && (id.contains(&want) || want.contains(&id))
+        });
+        if let Some(id) = found.map(|k| self.state.app_id(*k).to_string()) {
+            self.focus_app(&id);
+        }
+    }
+
+    /// Writes the clipboard history on the worker.
+    fn save_clipboard(&mut self) {
+        self.clipboard_dirty = true;
+    }
+
+    /// Redraws the popups from the notification list.
+    fn sync_notices(&mut self) {
+        if self.cards.is_none() {
+            self.cards = launcher::card::Cards::new().map_err(|e| log!("notification cards: {e}")).ok();
+        }
+        let Some(cards) = &self.cards else { return };
+        let list = self.notifier.popups().into_iter().map(|n| (n.id, Some(cards.render(&n.title(), &n.body, n.critical)))).collect();
+        self.state.set_notices(list);
+    }
+
+    fn notifications_text(&self) -> String {
+        self.notifier.list.iter().rev().map(|n| format!("{}\t{}\t{}\n", n.id, if n.live { "popup" } else { "list" }, n.label())).collect()
     }
 
     fn command(&mut self, cmd: ipc::Command) -> String {
@@ -291,9 +414,13 @@ impl App {
             }
             ipc::Command::Upgrade => self.upgrade = true,
             ipc::Command::Pointer(x, y) => self.backend_event(Event::PointerMotion(x, y)),
-            ipc::Command::Key(code) => {
-                self.backend_event(Event::Key(code, true));
-                self.backend_event(Event::Key(code, false));
+            ipc::Command::Key(codes) => {
+                for c in &codes {
+                    self.backend_event(Event::Key(*c, true));
+                }
+                for c in codes.iter().rev() {
+                    self.backend_event(Event::Key(*c, false));
+                }
             }
             ipc::Command::Click => {
                 self.backend_event(Event::PointerButton(0x110, true));
@@ -338,6 +465,10 @@ impl App {
                 return if self.display.lid_inhibitor.is_some() { "on\n" } else { "off\n" }.into();
             }
             ipc::Command::Outputs => return self.outputs_text(),
+            ipc::Command::Clipboard => {
+                return self.state.selection.history.entries.iter().enumerate().map(|(i, c)| format!("{i}\t{}\n", clipboard::label(c))).collect();
+            }
+            ipc::Command::Notifications => return self.notifications_text(),
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -372,6 +503,7 @@ impl App {
                 self.focus_app(&app);
             }
             bar::FromBar::Blank => self.blank(),
+            bar::FromBar::ToggleNotifications => self.open_notifications(),
             bar::FromBar::CycleScreensaver => {
                 let mut ss = self.display.screensaver;
                 ss.cycle();
@@ -402,6 +534,11 @@ impl App {
         if self.bar_display.as_ref() != Some(&display) {
             bar.send(bar::ToBar::Display { screensaver: display.0.clone(), lid_inhibited: display.1 });
             self.bar_display = Some(display);
+        }
+        let count = self.notifier.list.len();
+        if self.bar_notifications != Some(count) {
+            bar.send(bar::ToBar::NotificationCount(count as u32));
+            self.bar_notifications = Some(count);
         }
         let snapshot = self.state.bar_snapshot();
         if self.state.bar.sent.as_ref() != Some(&snapshot) {
@@ -465,6 +602,7 @@ impl App {
         self.last_frame = None;
         self.mirrors_stale.clear();
         self.state.needs_redraw = true;
+        self.sync_notices();
     }
 
     fn layout_events(&mut self, events: io::Result<Vec<Event>>) {
@@ -595,6 +733,20 @@ impl App {
                 _ => {}
             }
         }
+        if let Event::PointerButton(b, true) = e {
+            if let Some(id) = self.state.notice_at(self.state.pointer.x, self.state.pointer.y) {
+                const BTN_LEFT: u32 = 0x110;
+                if b == BTN_LEFT {
+                    if let Some((app, entry)) = self.notifier.invoke(id) {
+                        self.focus_notifier(&app, &entry);
+                    }
+                } else {
+                    self.notifier.dismiss(id);
+                }
+                self.sync_notices();
+                return;
+            }
+        }
         match e {
             Event::Resize(w, h) => self.state.set_output_size(w, h),
             Event::OutputName(name) => self.state.output.name = name,
@@ -637,7 +789,7 @@ struct Ctx {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool, display: display::Display) -> App {
+fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool, display: display::Display, notifier: notify::Notifier) -> App {
     App {
         backend,
         bar: None,
@@ -656,7 +808,18 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         bar_display: None,
         last_frame: None,
         mirrors_stale: Vec::new(),
+        notifier,
+        cards: None,
+        bar_notifications: None,
+        clipboard_dirty: false,
     }
+}
+
+fn clip_hash(c: &clipboard::Clip) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    c.data.hash(&mut h);
+    h.finish()
 }
 
 /// Registers every fd with a fresh epoll and starts background jobs.
@@ -686,6 +849,11 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     ep.add(worker.raw_fd(), TOKEN_WORKER)?;
     ep.add(bar.raw_fd(), TOKEN_BAR)?;
     ep.add(app.display.timer_fd(), TOKEN_IDLE)?;
+    ep.add(app.notifier.timer_fd(), TOKEN_NOTIFY_TIMER)?;
+    if let Some(fd) = app.notifier.bus_fd() {
+        ep.add(fd, TOKEN_NOTIFY_BUS)?;
+    }
+    app.sync_notices();
     app.bar = Some(bar);
     for (id, fd) in app.state.client_fds() {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
@@ -723,7 +891,9 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
     let ipc = ipc::Ipc::bind(&socket.name)?;
     log!("listening on {}", socket.name);
     let state = State::new(keyboard, output, renderer.dmabuf_formats());
-    let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(None)?);
+    let mut state = state;
+    state.selection.history = clipboard::History::load();
+    let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(None)?, notify::Notifier::start()?);
     if let Backend::Drm(d) = &mut app.backend {
         let events = d.apply_layout(&mut renderer);
         app.layout_events(events);
@@ -744,7 +914,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 3;
+const BLOB_FORMAT: u32 = 4;
 
 fn prev_binary() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("davide-wm-prev"))
@@ -771,6 +941,8 @@ fn encode(ctx: Ctx) -> state::Enc {
     let inhibitor = app.display.lid_inhibitor;
     inhibitor.save(&mut e);
     std::mem::forget(inhibitor);
+    app.notifier.save(&mut e);
+    std::mem::forget(app.notifier);
     match app.backend {
         Backend::Nested(n) => {
             0u8.save(&mut e);
@@ -805,6 +977,7 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let socket = Socket::load(&mut d).map_err(err)?;
     let ipc = ipc::Ipc::load(&mut d).map_err(err)?;
     let inhibitor: Option<OwnedFd> = Persist::load(&mut d).map_err(err)?;
+    let notifier = notify::Notifier::load(&mut d).map_err(err)?;
     let (backend, mut renderer) = match u8::load(&mut d).map_err(err)? {
         0 => {
             let n = Nested::restore(Persist::load(&mut d).map_err(err)?)?;
@@ -818,7 +991,7 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
     let formats = renderer.dmabuf_formats();
     let state = State::restore(&mut d, keyboard, formats, &mut renderer).map_err(err)?;
-    let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(inhibitor)?);
+    let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(inhibitor)?, notifier);
     app.outputs_changed();
     log!("live upgrade done");
     finish(app, renderer, PathBuf::from(exe))
@@ -925,6 +1098,11 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                                 app.state.wallpaper = Some(tex);
                                 app.state.needs_redraw = true;
                             }
+                            Ok(worker::Done::Clip { generation, clip }) => {
+                                selection::captured(&mut app.state, generation, clip);
+                                app.clipboard_dirty = true;
+                            }
+                            Ok(worker::Done::Saved) => {}
                             Ok(worker::Done::LinkCheck { name, failed }) => {
                                 let lit = app.backend.heads().iter().any(|h| h.name == name);
                                 if let (true, true, Backend::Drm(d)) = (failed, lit, &mut app.backend) {
@@ -943,6 +1121,20 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                     }
                 }
                 TOKEN_IDLE => app.idle(),
+                TOKEN_NOTIFY_BUS => {
+                    for (app_name, entry) in app.notifier.dispatch() {
+                        if let Some(bar) = &app.bar {
+                            let name = if entry.is_empty() { app_name } else { entry };
+                            bar.send(bar::ToBar::Notification { app: name });
+                        }
+                    }
+                    app.sync_notices();
+                }
+                TOKEN_NOTIFY_TIMER => {
+                    if app.notifier.expire() {
+                        app.sync_notices();
+                    }
+                }
                 TOKEN_SIGNAL => {
                     log!("signal received, exiting");
                     app.running = false;
@@ -1001,6 +1193,16 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                     Ok(worker::Done::LinkCheck { failed: outputs::link_failed_since(since), name })
                 });
             }
+        }
+        for (fd, generation, mime) in std::mem::take(&mut app.state.selection.captures) {
+            worker.run(move || {
+                let data = clipboard::capture(fd)?;
+                Ok(worker::Done::Clip { generation, clip: clipboard::Clip { mime, data } })
+            });
+        }
+        if std::mem::take(&mut app.clipboard_dirty) {
+            let bytes = app.state.selection.history.encode();
+            worker.run(move || clipboard::save(&bytes).map(|_| worker::Done::Saved).map_err(|e| format!("saving the clipboard history: {e}")));
         }
         app.update_bar();
         app.render(renderer)?;

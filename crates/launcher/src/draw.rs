@@ -149,9 +149,11 @@ fn row_target_bottom(row_h: u32, rise: i32) -> i32 {
 }
 
 fn text_width(font: &Font, s: &str) -> i32 {
-    s.chars()
-        .map(|c| font.metrics(c, config::FONT_SIZE).advance_width.ceil() as i32)
-        .sum()
+    text_width_at(font, s, config::FONT_SIZE)
+}
+
+pub fn text_width_at(font: &Font, s: &str, size: f32) -> i32 {
+    s.chars().map(|c| font.metrics(c, size).advance_width.ceil() as i32).sum()
 }
 
 fn argb_bytes(color: u32) -> [u8; 4] {
@@ -163,7 +165,7 @@ fn argb_bytes(color: u32) -> [u8; 4] {
     ]
 }
 
-fn fill_rect_opaque(buf: &mut [u8], stride: usize, x0: u32, y0: u32, w: u32, h: u32, color: u32) {
+pub fn fill_rect_opaque(buf: &mut [u8], stride: usize, x0: u32, y0: u32, w: u32, h: u32, color: u32) {
     let [b, g, r, a] = argb_bytes(color);
     let width = (stride / 4) as u32;
     let x1 = (x0 + w).min(width);
@@ -194,11 +196,27 @@ fn draw_line(
     s: &str,
     color: u32,
 ) {
+    draw_text(buf, stride, width, height, font, config::FONT_SIZE, start_x, target_bottom, s, color);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text(
+    buf: &mut [u8],
+    stride: usize,
+    width: i32,
+    height: u32,
+    font: &Font,
+    size: f32,
+    start_x: i32,
+    target_bottom: i32,
+    s: &str,
+    color: u32,
+) {
     let [fg_b, fg_g, fg_r, _] = argb_bytes(color);
     let h = height as i32;
     let mut x = start_x;
     for c in s.chars() {
-        let (metrics, bitmap) = font.rasterize(c, config::FONT_SIZE);
+        let (metrics, bitmap) = font.rasterize(c, size);
         let glyph_h = metrics.height as i32;
         let origin_y = target_bottom - metrics.ymin - (glyph_h - 1);
         for (i, &alpha) in bitmap.iter().enumerate() {
@@ -208,7 +226,7 @@ fn draw_line(
             let bx = i % metrics.width;
             let by = i / metrics.width;
             let px_x = x + metrics.xmin + bx as i32;
-            let px_y = origin_y + metrics.ymin + by as i32;
+            let px_y = origin_y + by as i32;
             if px_x >= 0 && px_x < width && px_y >= 0 && px_y < h {
                 let idx = (px_y as usize * stride) + (px_x as usize) * 4;
                 // Anti-aliasing: blend the glyph color into whatever is

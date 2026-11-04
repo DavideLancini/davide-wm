@@ -2,11 +2,15 @@
 //! middle of the screen listing desktop entries and `~/2Bookmarks`, filtered
 //! as you type; a query starting with `=` is evaluated as arithmetic.
 //!
+//! The same box doubles as a picker over a list the compositor supplies
+//! (clipboard history, notifications), and `card` draws notification popups.
+//!
 //! The compositor owns the window and the keyboard: it feeds keys in and
 //! draws the pixels this crate renders.
 
 mod apps;
 mod calc;
+pub mod card;
 mod draw;
 mod settings;
 
@@ -18,6 +22,10 @@ pub enum Outcome {
     Close,
     /// Close and run this shell command.
     Launch(String),
+    /// Picker: this item (index in the list given to `picker`) was chosen.
+    Pick(usize),
+    /// Picker: delete this item; it is already gone from the list.
+    Delete(usize),
 }
 
 pub mod keys {
@@ -27,11 +35,16 @@ pub mod keys {
     pub const BACKSPACE: u32 = 0xff08;
     pub const UP: u32 = 0xff52;
     pub const DOWN: u32 = 0xff54;
+    pub const DELETE: u32 = 0xffff;
 }
 
 pub struct Launcher {
     font: fontdue::Font,
     apps: Vec<apps::App>,
+    /// Row labels: application names, or the picker's items.
+    labels: Vec<String>,
+    /// Picker mode: original index of each label.
+    picks: Option<Vec<usize>>,
     query: String,
     filtered: Vec<usize>,
     selected: usize,
@@ -47,13 +60,24 @@ impl Launcher {
     /// applications show up.
     pub fn open() -> Result<Launcher, String> {
         let apps = apps::scan();
-        let filtered = (0..apps.len()).collect();
-        Ok(Launcher { font: draw::load_font()?, apps, query: String::new(), filtered, selected: 0 })
+        let labels = apps.iter().map(|a| a.name.clone()).collect();
+        Ok(Launcher { font: draw::load_font()?, apps, labels, picks: None, query: String::new(), filtered: Vec::new(), selected: 0 }.filtered())
+    }
+
+    /// A picker over `items`, filtered as you type; Enter picks, Delete removes.
+    pub fn picker(items: Vec<String>) -> Result<Launcher, String> {
+        let picks = Some((0..items.len()).collect());
+        Ok(Launcher { font: draw::load_font()?, apps: Vec::new(), labels: items, picks, query: String::new(), filtered: Vec::new(), selected: 0 }.filtered())
+    }
+
+    fn filtered(mut self) -> Launcher {
+        self.refresh_filter();
+        self
     }
 
     /// A query starting with "=" is a calculation: nothing to filter or launch.
     fn is_calc_mode(&self) -> bool {
-        self.query.starts_with('=')
+        self.picks.is_none() && self.query.starts_with('=')
     }
 
     fn refresh_filter(&mut self) {
@@ -64,10 +88,10 @@ impl Launcher {
         }
         let needle = self.query.to_lowercase();
         self.filtered = self
-            .apps
+            .labels
             .iter()
             .enumerate()
-            .filter(|(_, a)| needle.is_empty() || a.name.to_lowercase().contains(&needle))
+            .filter(|(_, l)| needle.is_empty() || l.to_lowercase().contains(&needle))
             .map(|(i, _)| i)
             .collect();
     }
@@ -101,10 +125,22 @@ impl Launcher {
                 if self.is_calc_mode() {
                     return Outcome::Nothing;
                 }
+                if let Some(picks) = &self.picks {
+                    return self.filtered.get(self.selected).map_or(Outcome::Nothing, |i| Outcome::Pick(picks[*i]));
+                }
                 match self.filtered.get(self.selected).and_then(|i| Self::command(&self.apps[*i])) {
                     Some(cmd) => Outcome::Launch(cmd),
                     None => Outcome::Close,
                 }
+            }
+            keys::DELETE if self.picks.is_some() => {
+                let Some(&i) = self.filtered.get(self.selected) else { return Outcome::Nothing };
+                let original = self.picks.as_mut().unwrap().remove(i);
+                self.labels.remove(i);
+                let keep = self.selected;
+                self.refresh_filter();
+                self.selected = keep.min(self.filtered.len().saturating_sub(1));
+                Outcome::Delete(original)
             }
             keys::BACKSPACE => {
                 self.query.pop();
@@ -153,7 +189,7 @@ impl Launcher {
             .skip(offset)
             .take(settings::VISIBLE_RESULTS as usize)
             .enumerate()
-            .map(|(i, &idx)| draw::ResultRow { label: &self.apps[idx].name, selected: offset + i == self.selected })
+            .map(|(i, &idx)| draw::ResultRow { label: &self.labels[idx], selected: offset + i == self.selected })
             .collect();
         draw::draw_window(&mut buf, w, h, &area, &self.font, &self.query, &rows);
         buf
@@ -173,5 +209,21 @@ mod tests {
         assert!(matches!(l.key(keys::RETURN, None), Outcome::Nothing));
         assert_eq!(l.render().len(), (WIDTH * HEIGHT * 4) as usize);
         assert_eq!(quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn picker_filters_picks_and_deletes() {
+        let mut p = Launcher::picker(vec!["alpha".into(), "beta".into(), "alphabet".into()]).unwrap();
+        for c in "alph".chars() {
+            p.key(0, Some(c));
+        }
+        p.key(keys::DOWN, None);
+        assert!(matches!(p.key(keys::RETURN, None), Outcome::Pick(2)));
+        assert!(matches!(p.key(keys::DELETE, None), Outcome::Delete(2)));
+        assert!(matches!(p.key(keys::RETURN, None), Outcome::Pick(0)));
+        for c in "=1+1".chars() {
+            p.key(0, Some(c));
+        }
+        assert!(matches!(p.key(keys::RETURN, None), Outcome::Nothing));
     }
 }

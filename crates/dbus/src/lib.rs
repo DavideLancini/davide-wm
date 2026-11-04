@@ -139,6 +139,35 @@ impl Message {
         }
     }
 
+    /// The method return for this call.
+    pub fn reply(&self, body: Vec<Value>) -> Message {
+        Message { kind: METHOD_RETURN, reply_serial: Some(self.serial), destination: self.sender.clone(), body, ..Default::default() }
+    }
+
+    pub fn error_reply(&self, name: &str, text: &str) -> Message {
+        Message {
+            kind: ERROR,
+            error_name: Some(name.into()),
+            reply_serial: Some(self.serial),
+            destination: self.sender.clone(),
+            body: vec![Value::Str(text.into())],
+            ..Default::default()
+        }
+    }
+
+    pub fn signal(path: &str, iface: &str, member: &str, body: Vec<Value>) -> Message {
+        Message { kind: SIGNAL, path: Some(path.into()), interface: Some(iface.into()), member: Some(member.into()), body, ..Default::default() }
+    }
+
+    pub fn is_call(&self, iface: &str, member: &str) -> bool {
+        self.kind == METHOD_CALL && self.interface.as_deref() == Some(iface) && self.member.as_deref() == Some(member)
+    }
+
+    /// The caller expects no reply.
+    pub fn no_reply(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
     pub fn is_signal(&self, iface: &str, member: &str) -> bool {
         self.kind == SIGNAL && self.interface.as_deref() == Some(iface) && self.member.as_deref() == Some(member)
     }
@@ -469,7 +498,10 @@ impl Bus {
     }
 
     pub fn session() -> Result<Bus, Error> {
-        let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").map_err(|_| Error::Protocol("DBUS_SESSION_BUS_ADDRESS not set"))?;
+        let addr = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(a) => a,
+            Err(_) => format!("unix:path={}/bus", std::env::var("XDG_RUNTIME_DIR").map_err(|_| Error::Protocol("no session bus address"))?),
+        };
         Bus::connect(&addr)
     }
 
@@ -558,6 +590,15 @@ impl Bus {
 
     pub fn pop(&mut self) -> Option<Message> {
         self.queue.pop_front()
+    }
+
+    /// Asks for a well-known name; true when we are its primary owner.
+    /// `flags`: 1 allow replacement, 2 replace existing, 4 do not queue.
+    pub fn request_name(&mut self, name: &str, flags: u32) -> Result<bool, Error> {
+        let m = Message::call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", vec![Value::Str(name.into()), Value::U32(flags)]);
+        let reply = self.call(m, Duration::from_secs(1))?;
+        // 1 primary owner, 4 already the owner.
+        Ok(matches!(reply.body.first().and_then(Value::as_u32), Some(1 | 4)))
     }
 
     pub fn add_match(&mut self, rule: &str) -> Result<(), Error> {

@@ -59,10 +59,9 @@ impl Widget {
             // The same command the Print key runs: select a region, then hand
             // it to the editor rather than straight to a file.
             Screenshot => "grim -g \"$(slurp)\" - | swappy -f -",
-            Notifications => "nwg-notifications --toggle-panel",
             // Handled by the bar thread or the compositor: these change state
             // rather than running anything.
-            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid => return None,
+            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid | Notifications => return None,
         })
     }
 }
@@ -104,7 +103,6 @@ mod tests {
         assert_eq!(BtHeadphones.command().unwrap(), "blueman-manager");
         assert!(Backlight.command().unwrap().ends_with("brightness set 0"));
         assert!(Timer.command().unwrap().contains("set-timer.sh"));
-        assert_eq!(Notifications.command().unwrap(), "nwg-notifications --toggle-panel");
     }
 
     /// The audio widgets mute through the PulseAudio connection the bar keeps
@@ -113,7 +111,7 @@ mod tests {
     /// of them may shell out.
     #[test]
     fn stateful_widgets_have_no_command() {
-        for w in [Volume, Microphone, Clock, Spotify, Blk, Screensaver, Lid] {
+        for w in [Volume, Microphone, Clock, Spotify, Blk, Screensaver, Lid, Notifications] {
             assert!(w.command().is_none(), "{w:?} must not shell out");
         }
     }
@@ -122,7 +120,7 @@ mod tests {
     #[test]
     fn command_widgets_keep_their_action() {
         let widgets = [
-            CpuFreq, Network, BtHeadphones, Backlight, Timer, Notifications, Screenshot,
+            CpuFreq, Network, BtHeadphones, Backlight, Timer, Screenshot,
         ];
         for w in widgets {
             assert!(w.command().is_some(), "{w:?} lost its action");

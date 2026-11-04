@@ -55,9 +55,8 @@ pub struct State {
     pub lid: String,
     pub screensaver: String,
     pub bt_headphones: super::helpers::Helper,
-    pub notifications: super::notifications::Notifications,
-    /// Desktop notifications, watched to mark the workspace they came from.
-    pub notify: crate::notify::Notify,
+    /// Notification count, set by the compositor.
+    pub notifications: String,
     /// Timer helper, cached at a rate that follows whether one is running.
     pub timer: super::timer::Timer,
     /// Whether the clock shows the date as well as the time. Off at startup:
@@ -78,8 +77,7 @@ impl Default for State {
             lid: String::new(),
             screensaver: String::new(),
             bt_headphones: super::helpers::bt_headphones(),
-            notifications: super::notifications::Notifications::default(),
-            notify: crate::notify::Notify::default(),
+            notifications: String::new(),
             timer: super::timer::Timer::default(),
             clock_date: false,
             spotify: super::spotify::NowPlaying::default(),
@@ -250,7 +248,7 @@ fn status_widgets(state: &mut State) -> Vec<(String, Target, u32)> {
         (icons::with(icons::HEADPHONES, &state.bt_headphones.text()), Target::Widget(Widget::BtHeadphones), icons::color::BT_HEADPHONES),
         (icons::with(icons::BRIGHTNESS, &super::backlight::text()), Target::Widget(Widget::Backlight), icons::color::BACKLIGHT),
         (icons::with(icons::BATTERY, &super::battery::text()), Target::Widget(Widget::Backlight), battery_color()),
-        (icons::with(icons::BELL, &state.notifications.text()), Target::Widget(Widget::Notifications), icons::color::NOTIFICATIONS),
+        (icons::with(icons::BELL, &state.notifications), Target::Widget(Widget::Notifications), icons::color::NOTIFICATIONS),
         (icons::BLANK.to_string(), Target::Widget(Widget::Blk), icons::color::BLK),
         (icons::with(icons::MOON, &state.screensaver), Target::Widget(Widget::Screensaver), icons::color::SCREENSAVER),
         // Idle timers show the icon alone: "--:--" is five characters saying

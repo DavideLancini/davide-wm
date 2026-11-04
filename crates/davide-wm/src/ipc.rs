@@ -58,8 +58,8 @@ pub enum Command {
     /// Test helpers: move the pointer, click the left button, report the focus.
     Pointer(f64, f64),
     Click,
-    /// Press and release an evdev key code.
-    Key(u32),
+    /// Press evdev key codes in order, release them in reverse (a chord).
+    Key(Vec<u32>),
     Focused,
     /// Black screen until the next input.
     Blank,
@@ -69,6 +69,8 @@ pub enum Command {
     /// Shows the lid switch inhibitor; true toggles it.
     LidInhibit(bool),
     Outputs,
+    Clipboard,
+    Notifications,
     Exit,
 }
 
@@ -105,7 +107,10 @@ fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "click" => Ok(Command::Click),
-        "key" => arg.parse().map(Command::Key).map_err(|_| "key <evdev code>".into()),
+        "key" => match arg.split_whitespace().map(str::parse).collect::<Result<Vec<u32>, _>>() {
+            Ok(codes) if !codes.is_empty() => Ok(Command::Key(codes)),
+            _ => Err("key <evdev code>...".into()),
+        },
         "focused" => Ok(Command::Focused),
         "blank" => Ok(Command::Blank),
         "wake" => Ok(Command::Wake),
@@ -116,8 +121,10 @@ fn parse(line: &str) -> Result<Command, String> {
             _ => Err("lid-inhibit [toggle]".into()),
         },
         "outputs" => Ok(Command::Outputs),
+        "clipboard" => Ok(Command::Clipboard),
+        "notifications" => Ok(Command::Notifications),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>, focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, exit".into()),
     }
 }
 

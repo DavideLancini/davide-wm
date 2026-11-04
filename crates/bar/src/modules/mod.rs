@@ -13,7 +13,6 @@ pub mod layout;
 pub mod memory;
 pub mod mega;
 pub mod network;
-pub mod notifications;
 pub mod pulseaudio;
 pub mod spotify;
 pub mod temp;
