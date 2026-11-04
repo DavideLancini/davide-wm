@@ -58,6 +58,8 @@ pub enum Action {
     MoveToWorkspace(WsId),
     ToggleSpecial,
     ToggleMaximize,
+    /// Hides or shows the bar, giving its space back to the windows.
+    ToggleBar,
     SwitchVt(u32),
     /// Live upgrade to the binary on disk (README, ADR-014).
     Upgrade,
@@ -95,7 +97,7 @@ pub fn binds() -> Vec<Bind> {
         b(0, keys::MON_BRIGHTNESS_DOWN, Action::Spawn("brightness down")),
         b(0, keys::MON_BRIGHTNESS_UP, Action::Spawn("brightness up")),
         b(0, keys::PRINT, Action::Spawn(r#"grim -g "$(slurp)" - | swappy -f -"#)),
-        b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::Spawn("killall -SIGUSR1 topbar")),
+        b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::ToggleBar),
         b(MAIN | SHIFT, keys::P, Action::Spawn("poweroff")),
         b(MAIN | SHIFT, keys::R, Action::Spawn("reboot")),
         b(MAIN, keys::Q, Action::CloseWindow),

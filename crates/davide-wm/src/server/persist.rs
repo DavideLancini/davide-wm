@@ -337,6 +337,8 @@ impl State {
             selection,
             idle_inhibitors,
             wallpaper,
+            urgent_ws,
+            bar,
             serial,
             start,
             needs_redraw: _,
@@ -363,6 +365,8 @@ impl State {
         pointer.save(e);
         selection.save(e);
         idle_inhibitors.save(e);
+        urgent_ws.save(e);
+        bar.visible.save(e);
         wallpaper.is_some().save(e);
         if let Some(t) = wallpaper {
             save_texture(t, e, r);
@@ -394,6 +398,8 @@ impl State {
         s.pointer = Persist::load(d)?;
         s.selection = Persist::load(d)?;
         s.idle_inhibitors = Persist::load(d)?;
+        s.urgent_ws = Persist::load(d)?;
+        s.bar.visible = Persist::load(d)?;
         if bool::load(d)? {
             s.wallpaper = Some(load_texture(d, r, true)?);
         }

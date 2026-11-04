@@ -32,6 +32,7 @@ const TOKEN_KMS: u64 = 6;
 const TOKEN_INPUT: u64 = 7;
 const TOKEN_LOGIND: u64 = 8;
 const TOKEN_UEVENT: u64 = 9;
+const TOKEN_BAR: u64 = 10;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -119,6 +120,9 @@ impl Backend {
 
 struct App {
     backend: Backend,
+    /// Started once the environment for spawned programs is set.
+    bar: Option<bar::Bar>,
+    bar_width: u32,
     state: State,
     socket: Socket,
     ipc: ipc::Ipc,
@@ -188,6 +192,10 @@ impl App {
             Action::MoveToWorkspace(ws) => workspaces::move_to(s, ws),
             Action::ToggleSpecial => workspaces::toggle_special(s),
             Action::ToggleMaximize => workspaces::toggle_maximize(s),
+            Action::ToggleBar => {
+                s.bar.visible = !s.bar.visible;
+                s.relayout();
+            }
             Action::SwitchVt(vt) => {
                 if let Backend::Drm(d) = &mut self.backend {
                     d.switch_vt(vt);
@@ -221,16 +229,66 @@ impl App {
                 return out;
             }
             ipc::Command::FocusApp(app_id) => {
-                let Some((key, ws)) = s.window_ws.iter().find(|(k, _)| s.app_id(**k) == app_id).map(|(k, w)| (*k, *w)) else {
+                if !self.focus_app(&app_id) {
                     return format!("error: no window with app id {app_id}\n");
-                };
-                workspaces::switch(s, ws);
-                seat::set_focus(s, Some(key));
+                }
             }
             ipc::Command::Upgrade => self.upgrade = true,
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
+    }
+
+    /// Switches to the window of an app (app id compared case-insensitively).
+    fn focus_app(&mut self, app_id: &str) -> bool {
+        let s = &mut self.state;
+        let Some((key, ws)) = s.window_ws.iter().find(|(k, _)| s.app_id(**k).eq_ignore_ascii_case(app_id)).map(|(k, w)| (*k, *w)) else {
+            return false;
+        };
+        workspaces::switch(s, ws);
+        seat::set_focus(s, Some(key));
+        true
+    }
+
+    fn bar_message(&mut self, msg: bar::FromBar, r: &mut Renderer) {
+        let ws_of = |id: i32| match id {
+            -1 => Some(wm::WsId::Chat),
+            -99 => Some(wm::WsId::Special),
+            n if n > 0 => Some(wm::WsId::Num(n as u32)),
+            _ => None,
+        };
+        match msg {
+            bar::FromBar::Frame { width, height, pixels } => self.state.set_bar_frame(r, width, height, &pixels),
+            bar::FromBar::Workspace { id, .. } => {
+                if let Some(ws) = ws_of(id) {
+                    workspaces::switch(&mut self.state, ws);
+                }
+            }
+            bar::FromBar::FocusApp(app) => {
+                self.focus_app(&app);
+            }
+            bar::FromBar::Notified { workspace } => {
+                if let Some(ws) = ws_of(workspace).filter(|w| *w != self.state.active) {
+                    self.state.urgent_ws.insert(ws);
+                }
+            }
+        }
+    }
+
+    /// Tells the bar thread what changed since the last call.
+    fn update_bar(&mut self) {
+        let Some(bar) = &self.bar else { return };
+        let width = self.state.output.width as u32;
+        if width != self.bar_width {
+            self.bar_width = width;
+            bar.send(bar::ToBar::Width(width));
+        }
+        let snapshot = self.state.bar_snapshot();
+        if self.state.bar.sent.as_ref() != Some(&snapshot) {
+            bar.send(bar::ToBar::Workspaces(snapshot.0.clone()));
+            bar.send(bar::ToBar::Clients(snapshot.1.clone()));
+            self.state.bar.sent = Some(snapshot);
+        }
     }
 
     fn backend_event(&mut self, e: Event) {
@@ -242,6 +300,14 @@ impl App {
             Event::PointerMotionRelative(dx, dy) => {
                 let (x, y) = (self.state.pointer.x + dx, self.state.pointer.y + dy);
                 seat::pointer_motion(&mut self.state, x, y);
+            }
+            Event::PointerButton(b, p) if self.state.in_bar(self.state.pointer.y) => {
+                const BTN_LEFT: u32 = 0x110;
+                if b == BTN_LEFT && !p {
+                    if let Some(bar) = &self.bar {
+                        bar.send(bar::ToBar::Click { x: self.state.pointer.x as i32 });
+                    }
+                }
             }
             Event::PointerButton(b, p) => seat::pointer_button(&mut self.state, b, p),
             Event::PointerAxis(a, v) => seat::pointer_axis(&mut self.state, a, v),
@@ -268,11 +334,19 @@ struct Ctx {
 }
 
 fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool) -> App {
-    App { backend, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), running: true, upgrade: false, session }
+    App { backend, bar: None, bar_width: 0, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), running: true, upgrade: false, session }
 }
 
 /// Registers every fd with a fresh epoll and starts background jobs.
-fn finish(app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
+fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
+    // Programs started by the bar inherit these.
+    std::env::set_var("WAYLAND_DISPLAY", &app.socket.name);
+    std::env::set_var(ipc::ENV, &app.ipc.path);
+    std::env::set_var("XDG_CURRENT_DESKTOP", "davide-wm");
+    std::env::remove_var("WAYLAND_SOCKET");
+    let bar = bar::Bar::spawn()?;
+    app.state.bar.height = bar.height() as i32;
+    app.state.relayout();
     let signals = event_loop::signal_fd()?;
     let ep = Epoll::new()?;
     let worker = worker::Worker::new()?;
@@ -288,6 +362,8 @@ fn finish(app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     ep.add(signals.as_raw_fd(), TOKEN_SIGNAL)?;
     ep.add(app.ipc.listener.as_raw_fd(), TOKEN_IPC)?;
     ep.add(worker.raw_fd(), TOKEN_WORKER)?;
+    ep.add(bar.raw_fd(), TOKEN_BAR)?;
+    app.bar = Some(bar);
     for (id, fd) in app.state.client_fds() {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
     }
@@ -345,7 +421,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 1;
+const BLOB_FORMAT: u32 = 2;
 
 fn prev_binary() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("davide-wm-prev"))
@@ -525,6 +601,12 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                         }
                     }
                 }
+                TOKEN_BAR => {
+                    let msgs = app.bar.as_ref().map(|b| b.recv()).unwrap_or_default();
+                    for m in msgs {
+                        app.bar_message(m, renderer);
+                    }
+                }
                 TOKEN_SIGNAL => {
                     log!("signal received, exiting");
                     app.running = false;
@@ -562,6 +644,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
             }
             app.state.remove_client(id);
         }
+        app.update_bar();
         if app.state.needs_redraw {
             if let Some(i) = app.backend.acquire(renderer)? {
                 app.state.render(renderer, app.backend.target(i));

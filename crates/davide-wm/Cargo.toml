@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bar.workspace = true
 state.workspace = true
 config.workspace = true
 dbus.workspace = true

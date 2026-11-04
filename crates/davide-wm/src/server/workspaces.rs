@@ -59,6 +59,7 @@ pub fn switch(s: &mut State, target: WsId) {
         s.active = target;
         s.workspaces.entry(target).or_default();
     }
+    s.urgent_ws.remove(&target);
     s.relayout();
     refocus(s);
 }

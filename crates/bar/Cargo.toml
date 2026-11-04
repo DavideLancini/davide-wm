@@ -1,0 +1,11 @@
+[package]
+name = "bar"
+description = "Status bar ported from topbar; collects its data and renders on its own thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+fontdue.workspace = true
+ureq.workspace = true

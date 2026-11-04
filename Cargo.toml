@@ -8,7 +8,12 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+bar = { path = "crates/bar" }
 libc = "0.2"
+fontdue = "0.9"
+# HTTPS for the Spotify Web API: rustls rather than OpenSSL, so no system
+# library is needed.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 config = { path = "crates/config" }
 dbus = { path = "crates/dbus" }
 jpeg = { path = "crates/jpeg" }

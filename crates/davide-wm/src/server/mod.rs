@@ -212,6 +212,16 @@ pub struct PointerState {
     pub cursor: CursorImage,
 }
 
+/// The status bar as the compositor sees it: a strip on top of the output.
+#[derive(Default)]
+pub struct BarSurface {
+    pub height: i32,
+    pub visible: bool,
+    pub tex: Option<Texture>,
+    /// Last snapshot sent to the bar thread, to send only changes.
+    pub sent: Option<(Vec<bar::WsEntry>, Vec<bar::Client>)>,
+}
+
 pub struct State {
     pub clients: HashMap<ClientId, Client>,
     next_client: ClientId,
@@ -238,6 +248,9 @@ pub struct State {
     pub selection: selection::Selections,
     pub idle_inhibitors: HashMap<SKey, SKey>,
     pub wallpaper: Option<Texture>,
+    /// Workspaces marked by a desktop notification, until visited.
+    pub urgent_ws: HashSet<WsId>,
+    pub bar: BarSurface,
     serial: u32,
     start: Instant,
     pub needs_redraw: bool,
@@ -271,6 +284,8 @@ impl State {
             selection: selection::Selections::default(),
             idle_inhibitors: HashMap::new(),
             wallpaper: None,
+            urgent_ws: HashSet::new(),
+            bar: BarSurface { visible: true, ..Default::default() },
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
@@ -575,7 +590,67 @@ impl State {
 
     /// Area available to tiled windows.
     pub fn work_area(&self) -> Rect {
-        self.output_rect()
+        let top = if self.bar.visible { self.bar.height } else { 0 };
+        Rect::new(0, top, self.output.width, self.output.height - top)
+    }
+
+    /// True when a point falls on the visible bar (not covered by a fullscreen window).
+    pub fn in_bar(&self, y: f64) -> bool {
+        let covered = self.workspaces.get(&workspaces::focused_ws(self)).is_some_and(|w| matches!(w.fullscreen, Some((_, wm::FsMode::Fullscreen))));
+        self.bar.visible && self.bar.tex.is_some() && y < self.bar.height as f64 && !covered
+    }
+
+    pub fn set_bar_frame(&mut self, r: &mut Renderer, width: u32, height: u32, pixels: &[u8]) {
+        let old = self.bar.tex.take();
+        self.bar.tex = Some(r.upload(old, width as i32, height as i32, width as i32 * 4, pixels));
+        self.needs_redraw = true;
+    }
+
+    /// What the bar shows about workspaces and windows.
+    pub fn bar_snapshot(&self) -> (Vec<bar::WsEntry>, Vec<bar::Client>) {
+        let id = |ws: WsId| match ws {
+            WsId::Num(n) => n as i32,
+            WsId::Chat => -1,
+            WsId::Special => -99,
+        };
+        let name = |ws: WsId| match ws {
+            WsId::Num(n) => n.to_string(),
+            WsId::Chat => "chat".to_string(),
+            WsId::Special => "special:resize".to_string(),
+        };
+        let mut list: Vec<WsId> = self.workspaces.iter().filter(|(_, w)| !w.tiling.is_empty()).map(|(id, _)| *id).collect();
+        if !list.contains(&self.active) {
+            list.push(self.active);
+        }
+        list.sort_by_key(|w| match w {
+            WsId::Chat => (0, 0),
+            WsId::Num(n) => (1, *n),
+            WsId::Special => (2, 0),
+        });
+        let urgent: HashSet<WsId> = self.urgent.iter().filter_map(|k| self.window_ws.get(k).copied()).chain(self.urgent_ws.iter().copied()).collect();
+        let entries = list
+            .into_iter()
+            .map(|w| bar::WsEntry {
+                id: id(w),
+                name: name(w),
+                active: w == self.active || (w == WsId::Special && self.special_shown),
+                urgent: urgent.contains(&w),
+            })
+            .collect();
+        let mut clients: Vec<bar::Client> = self
+            .window_ws
+            .iter()
+            .map(|(k, w)| {
+                let title = match self.surfaces.get(k).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
+                    Some(XdgRole::Toplevel { title, .. }) => title.clone(),
+                    _ => String::new(),
+                };
+                let focus_age = if self.focus == Some(*k) { 0 } else { 1 };
+                bar::Client { app_id: self.app_id(*k).to_string(), title, workspace: id(*w), focus_age }
+            })
+            .collect();
+        clients.sort_by(|a, b| (a.workspace, &a.app_id, &a.title).cmp(&(b.workspace, &b.app_id, &b.title)));
+        (entries, clients)
     }
 
     pub fn output_rect(&self) -> Rect {
@@ -652,6 +727,9 @@ impl State {
         self.upload_buffers(r);
         r.begin(target, config::BACKGROUND);
         self.draw_background(r);
+        if let Some(t) = self.bar.tex.as_ref().filter(|_| self.bar.visible) {
+            r.draw(t, Quad { x: 0.0, y: 0.0, w: t.width as f32, h: t.height as f32 }, true);
+        }
         for (i, (key, rect)) in self.layout.clone().into_iter().enumerate() {
             if i == self.special_start {
                 r.fill(Quad { x: 0.0, y: 0.0, w: self.output.width as f32, h: self.output.height as f32 }, config::SPECIAL_DIM);
