@@ -55,17 +55,14 @@ impl Widget {
             // the laptop panel, leaving any external monitor lit. The helper
             // drives those over DDC as well.
             Backlight => "/home/davidelancini/7Scripts/brightness set 0",
-            Blk => "/home/davidelancini/7Scripts/blk",
-            Screensaver => "/home/davidelancini/7Scripts/monitor-manager cycle-screensaver",
             Timer => "/home/davidelancini/0Projects/myArch/configs/waybar/set-timer.sh",
-            Lid => "/home/davidelancini/7Scripts/lid-inhibit-toggle",
             // The same command the Print key runs: select a region, then hand
             // it to the editor rather than straight to a file.
             Screenshot => "grim -g \"$(slurp)\" - | swappy -f -",
             Notifications => "nwg-notifications --toggle-panel",
             // Handled by the bar thread or the compositor: these change state
             // rather than running anything.
-            Volume | Microphone | Clock | Spotify => return None,
+            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid => return None,
         })
     }
 }
@@ -106,19 +103,17 @@ mod tests {
         assert_eq!(Network.command().unwrap(), "nmgui");
         assert_eq!(BtHeadphones.command().unwrap(), "blueman-manager");
         assert!(Backlight.command().unwrap().ends_with("brightness set 0"));
-        assert!(Blk.command().unwrap().ends_with("/blk"));
-        assert!(Screensaver.command().unwrap().contains("cycle-screensaver"));
         assert!(Timer.command().unwrap().contains("set-timer.sh"));
-        assert!(Lid.command().unwrap().contains("lid-inhibit-toggle"));
         assert_eq!(Notifications.command().unwrap(), "nwg-notifications --toggle-panel");
     }
 
     /// The audio widgets mute through the PulseAudio connection the bar keeps
-    /// open, the clock toggles bar state and Spotify is focused by the
-    /// compositor, so none of them may shell out.
+    /// open, the clock toggles bar state, and Spotify, blanking, the
+    /// screensaver and the lid inhibitor belong to the compositor, so none
+    /// of them may shell out.
     #[test]
     fn stateful_widgets_have_no_command() {
-        for w in [Volume, Microphone, Clock, Spotify] {
+        for w in [Volume, Microphone, Clock, Spotify, Blk, Screensaver, Lid] {
             assert!(w.command().is_none(), "{w:?} must not shell out");
         }
     }
@@ -127,8 +122,7 @@ mod tests {
     #[test]
     fn command_widgets_keep_their_action() {
         let widgets = [
-            CpuFreq, Network, BtHeadphones, Backlight, Blk,
-            Screensaver, Timer, Lid, Notifications, Screenshot,
+            CpuFreq, Network, BtHeadphones, Backlight, Timer, Notifications, Screenshot,
         ];
         for w in widgets {
             assert!(w.command().is_some(), "{w:?} lost its action");

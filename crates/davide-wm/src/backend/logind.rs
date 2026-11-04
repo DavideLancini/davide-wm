@@ -123,3 +123,12 @@ impl Logind {
         Ok(out)
     }
 }
+
+/// Takes a logind inhibitor lock ("block" mode) on its own bus connection,
+/// so it works nested too; dropping the fd releases it.
+pub fn inhibit(what: &str, why: &str) -> io::Result<OwnedFd> {
+    let mut bus = Bus::system().map_err(err)?;
+    let args = [what, "davide-wm", why, "block"].map(|s| Value::Str(s.into())).to_vec();
+    let mut reply = bus.call(Message::call(DEST, "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "Inhibit", args), TIMEOUT).map_err(err)?;
+    reply.take_fd(0).ok_or_else(|| io::Error::other("Inhibit returned no fd"))
+}

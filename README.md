@@ -38,11 +38,11 @@
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
 > Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
-> Status: **M3 done** — bar and launcher in-process; runs on the TTY (DRM) and nested; live upgrade works nested (DRM upgrade untested). Next: M4 (monitors, after the `dawn` inventory).
+> Status: **M4 done** (tested nested; DRM paths untested) — monitor policy, mirrors, blanking, idle screensaver, lid; bar and launcher in-process. Next: M5 (clipboard history, notifications).
 
 | Field | Value |
 |---|---|
-| Doc version | 0.8 |
+| Doc version | 0.9 |
 | Last updated | 2026-11-04 |
 | Owner | Davide Lancini |
 | Project status | development |
@@ -170,12 +170,15 @@
   - **M1b — Live upgrade (done 2026-11-04, tested nested; DRM path untested):** `davide-wm msg upgrade`, Super+Shift+C or `./run.sh` re-exec the binary on disk with state and fd handover (ADR-014). About 170 ms in a debug build with Chromium and foot open; windows, clipboard, workspaces and the wallpaper survive.
   - **M2 — Bar (done 2026-11-04):** `topbar` ported to `crates/bar`, running on its own thread (ADR-029); the compositor reserves its strip, draws its frames, routes clicks and feeds it workspaces, urgency and windows. Main+Ctrl+Alt+Shift+F12 hides/shows it. Topbar's systemd service is retired at switch-over.
   - **M3 — Launcher (done 2026-11-04):** `super` ported to `crates/launcher` (desktop entries, `~/2Bookmarks`, `=` calculator). Tapping the main modifier (Super; Alt when nested) toggles it; while open it has the keyboard, Esc or a click outside closes it, Enter launches through the compositor's spawn.
-  - **M4 — Monitors:** detailed inventory of `~/0Projects/dawn/crates/` first; then port `monitor-manager`, `blk`, `lid-action`; DPMS, idle blanking (the wallpaper is already done, ADR-023).
+  - **M4 — Monitors (done 2026-11-04, tested nested; the DRM paths still need a TTY test with the MSI):**
+    - *Inventory of `dawn`:* `monitor-manager` (2200 lines: hotplug via socket2, EDID classification, layouts MSI-only / Hisense mirror / other above eDP / laptop-only, eDP-1 disabled under the MSI, DP link-training check in the kernel log, watchdog, idle blanking from `/dev/input`, screensaver state 1m/5m/30m/OFF with auto/manual source, waybar JSON), `blackout-core` + `blk` (DPMS off, or a black `foot` window over the MSI, until the first input, 700 ms grace, guard loop against the MSI re-handshake), `lid-action` / `lid-inhibit-toggle` / `lid-status` (a `systemd-inhibit` process in a pidfile; eDP-1 off on close while inhibited). `cast` is left for M7; the other `dawn` crates are unrelated to the compositor.
+    - *Ported:* several outputs at once (ADR-033): an exclusive monitor (`config::OUTPUT_EXCLUSIVE`, the MSI) alone at its highest refresh, else the laptop panel with other monitors mirroring it; the link check after lighting the MSI (ADR-036); DPMS per output; `blk` as an in-process black screen (black frames on the MSI, DPMS off elsewhere; ADR-034); the idle screensaver with its auto/manual policy, honouring idle inhibitors on screen; the lid inhibitor as a logind fd (ADR-035); with the lid closed the panel stays dark and an external monitor takes over. The bar's blk, screensaver and lid widgets now talk to the compositor. IPC: `blank`, `wake`, `screensaver [cycle|on|off|auto|<secs>]`, `lid-inhibit [toggle]`, `outputs`.
+    - *Not ported:* HDR / 10-bit on the MSI (needs a colour pipeline), the watchdog (the compositor knows what it lit), the guard loop (the MSI is never powered down).
   - **M5 — Clipboard history + notifications:** history picker, data-control, notification server with popups/panel.
   - **M6 — Xwayland:** XWM in-process.
   - **M7 — Screen sharing:** portal backend, PipeWire stream (outputs and windows), headless outputs for `cast`, screenshot taker.
   - **Switch-over:** remove Hyprland, xdg-desktop-portal-hyprland/-wlr, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
-  - **Afterwards:** keep migrating the remaining `dawn` crates and helper scripts the bar calls (`cpu-cycle`, `brightness`, `set-timer.sh`, `bt-headphones-battery`, `lid-status`, ...).
+  - **Afterwards:** keep migrating the remaining `dawn` crates and helper scripts the bar calls (`cpu-cycle`, `brightness`, `set-timer.sh`, `bt-headphones-battery`, ...).
 
 ---
 
@@ -199,7 +202,7 @@ Cargo workspace (ADR-015): one library crate per building block under `crates/`,
 | Renderer | EGL on GBM (surfaceless GLES 3 context), render targets exported as dmabufs, shm texture upload, solid/textured quads, scissor clip; later dmabuf import, damage, scanout planes, text | `crates/render/` |
 | Wayland server | clients and object maps, globals, protocol handlers (core, seat/output/focus, xdg-shell), surface tree, rendering of the scene | `crates/davide-wm/src/server/` |
 | Window manager | dwindle tree, directional neighbours, `Rect`; later workspaces, rules, fullscreen/maximize, urgency | `crates/wm/` |
-| Outputs | output model, monitor rules, DPMS, idle blanking, blk, lid, headless outputs *(planned)* | `crates/outputs/` |
+| Outputs | monitor policy and EDID, several CRTCs with mirroring, DPMS, blanking, idle screensaver, lid; headless outputs *(M7)* | `crates/davide-wm/src/backend/{kms,outputs}.rs`, `display.rs` |
 | Bar | topbar's widgets, layout and drawing on a dedicated thread with its own epoll loop (`event_loop.rs`, `zones.rs`); talks to the compositor only through `ToBar`/`FromBar` messages and an eventfd | `crates/bar/` |
 | Launcher | desktop-entry and bookmark scan, filtering, calculator, drawing of the box (`apps.rs`, `calc.rs`, `draw.rs`); the compositor owns the overlay (`LauncherView` in `crates/davide-wm/src/server/mod.rs`) and the keyboard grab | `crates/launcher/` |
 | Clipboard | selections, persisted history, picker, data-control *(planned)* | `crates/clipboard/` |
@@ -246,7 +249,7 @@ davide-wm/
 
 **Launcher (`crates/launcher/`)** — `apps.rs`, `calc.rs` and `draw.rs` come from `~/0Projects/super` almost unchanged; the layer-shell client, singleton and idle watchdog are gone (the compositor always keeps Esc, the tap and a click outside as ways out). It runs on the main thread: scanning entries on open takes a few milliseconds. Spawned programs get every fd above stderr closed (`close_range`, super's ADR-8).
 
-**Outputs (`crates/outputs/`)** — Absorbs `~/0Projects/dawn/crates/` `monitor-manager` (hotplug rules, workspace placement, eDP-1 watchdog, idle blanking from input activity), `blk`/`blackout-core` (black screen per output; the MSI loses signal on DPMS, so it gets a black plane instead of DPMS off), `lid-action`, and `cast` (headless outputs). Idle blanking honours `idle-inhibit`.
+**Outputs (`backend/outputs.rs`, `backend/kms.rs`, `display.rs`)** — Absorbs `~/0Projects/dawn/crates/` `monitor-manager` (hotplug rules, workspace placement, eDP-1 watchdog, idle blanking from input activity), `blk`/`blackout-core` (black screen per output; the MSI loses signal on DPMS, so it gets a black plane instead of DPMS off), `lid-action`, and `cast` (headless outputs). Idle blanking honours `idle-inhibit`.
 
 **XWM (`crates/xwayland/`)** — Spawns `Xwayland` on demand with a WM socketpair, runs an X11 window manager with `x11rb` (EWMH/ICCCM subset: map/configure, focus, transient/override-redirect, `_NET_WM_STATE` fullscreen, selections bridged to the Wayland clipboard) and pairs X11 windows with `wl_surface`s through `xwayland-shell-v1`.
 
@@ -344,13 +347,17 @@ davide-wm/
 | 23 | One wallpaper, compiled into the binary, decoded at startup on a worker thread | accepted | 2026-11-04 | The owner only ever uses `/wallpapers/1.jpg`. `build.rs` embeds the file named in `config::WALLPAPER` (not committed to the repo); own baseline JPEG decoder, halved while it still covers 2560x1600, drawn with mipmaps and cropped to cover each output. Slideshow dropped. |
 | 24 | Activation requests mark windows urgent instead of focusing them | accepted | 2026-11-04 | Same as Hyprland's default; urgency feeds the bar's red workspaces (M2). |
 | 25 | KMS through raw kernel ioctls, no libdrm | accepted | 2026-11-04 | A dozen ioctls with stable uapi structs; same reasoning as ADR-020. |
-| 26 | One output at a time until M4 | accepted | 2026-11-04 | All workspaces live on eDP-1 today; real multi-monitor rules need the `dawn`/monitor-manager inventory planned for M4. Order: `config::OUTPUT_PRIORITY`, then any connected output. |
+| 26 | One output at a time until M4 | superseded by 33 | 2026-11-04 | All workspaces live on eDP-1 today; real multi-monitor rules need the `dawn`/monitor-manager inventory planned for M4. Order: `config::OUTPUT_PRIORITY`, then any connected output. |
 | 27 | GPU memory on the render node, KMS on the card node | accepted | 2026-11-04 | The card fd survives a live upgrade, so everything allocated through it would leak; render-node allocations die with the process. Scanout buffers are imported into KMS via PRIME and freed by the next process after its first flip. |
 | 28 | Upgrade blob with a format number and a copy of the previous binary | accepted | 2026-11-04 | `BLOB_FORMAT` changes on incompatible layout changes; a binary that cannot read the blob execs `$XDG_RUNTIME_DIR/davide-wm-prev` (copied at every start) with it, so the session survives. Textures travel as pixels, dmabufs are imported again, shm pools mapped again; keys held during the upgrade are forgotten. |
 | 29 | The bar runs on its own thread, not in the main loop | accepted | 2026-11-04 | topbar's sources block (helpers up to 1 s, HTTP up to 3 s) and may panic; a thread keeps the compositor responsive and alive, and the port stays close to topbar. Its state is not part of the live upgrade: the new process starts a fresh bar. |
 | 30 | `fontdue` and `ureq` (rustls) allowed in `crates/bar` | accepted | 2026-11-04 | Inherited from topbar: font rasterising and the Spotify Web API. Pure Rust; to be revisited (own TLS is out of scope). |
 | 31 | Focus follows the mouse | accepted | 2026-11-04 | Like Hyprland's default (`follow_mouse = 1`): the toplevel under the pointer gets the keyboard focus, and a new window splits the window under the pointer. Workspace switches restore the last focused window until the pointer moves. |
 | 32 | Launcher on the main thread, opened by tapping the main modifier | accepted | 2026-11-04 | Unlike the bar it has no blocking sources; keys go straight to it with no thread hop. The tap is detected in the key handler: the modifier pressed and released with no other key in between. |
+| 33 | One primary output plus mirrors | accepted | 2026-11-04 | The owner works on one screen at a time (the MSI, or the laptop). Workspaces live on the primary output; any other lit output gets a scaled, letterboxed copy (`glBlitFramebuffer`). An unknown external monitor therefore mirrors the panel instead of extending it above (monitor-manager's "dual" layout), which also suits projectors; real extended layouts can come later. Policy in `backend/outputs.rs`, pure and tested; matching on the EDID model, never on the connector, which changes with the cabling. |
+| 34 | Blanking inside the compositor | accepted | 2026-11-04 | No overlay window or `hyprctl`: blanking powers down every output except the `OUTPUT_BLANK_BLACK` ones (the OLED MSI, which would drop the signal and re-handshake), which get one black frame. Input during the 700 ms grace is ignored; then the first press, motion or scroll wakes and is swallowed, releases always pass so no key stays down in a client. Idle blanking skips while a client with a window on screen holds an idle inhibitor (monitor-manager ignored them). Screensaver settings persist in `$XDG_STATE_HOME/davide-wm/screensaver`. |
+| 35 | Lid inhibitor as a logind fd held by the compositor | accepted | 2026-11-04 | Replaces the `systemd-inhibit sleep infinity` process and its pidfile; the fd survives a live upgrade in the blob. While held, closing the lid leaves the session running and only darkens the panel. |
+| 36 | DP link check through `journalctl -k` | accepted | 2026-11-04 | After lighting an exclusive monitor, a worker job waits `LINK_CHECK_DELAY_MS` and greps the kernel log for amdgpu's `enabling link N failed`: when training fails, KMS still reports the output lit while it shows nothing. `/dev/kmsg` is not readable (`dmesg_restrict`). On failure the connector is skipped until unplugged and the panel comes back. A modeset error on an external monitor is handled the same way. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
@@ -405,7 +412,7 @@ davide-wm/
 | GPU/driver edge cases (dmabuf modifiers, atomic commit failures, hotplug) | Black screen, frozen outputs | Test hotplug with MSI and TV early (M1); keep a fallback modeset path. |
 | libpipewire FFI | Unsafe code, one more C dependency | Isolated in `crates/screencast/`; reconsider a native implementation later. |
 | Ported code inherits topbar debt: hand-written JSON/text parsers, compiled-in Spotify credentials, hard-coded machine paths (`BAT0`, `amdgpu_bl1`, `~/7Scripts`), a second D-Bus client in `crates/bar/src/dbus.rs` | Fragility, secrets in the binary, duplicated code | Merge the bar's D-Bus code into `crates/dbus` (M5 needs its server side anyway); move secrets out of the binary. |
-| Some current behaviour depends on Hyprland specifics (MSI black overlay window, `eval` rules, socket2 consumers) | Regressions after switch-over | Inventory `~/0Projects/dawn/crates/` in detail before M4. |
+| Some current behaviour depends on Hyprland specifics (socket2 consumers, `hyprctl` calls in helper scripts) | Regressions after switch-over | `dawn` inventoried in M4 (monitor-manager, blk, lid tools ported); still to check: the helper scripts the bar calls and `cast` (M7). |
 | Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, `persist_struct!` forces every field to be handled, automatic fallback to `davide-wm-prev`. Still missing: round-trip tests on a headless backend, and a test of the DRM path (logind bus, KMS fd, libinput re-open). |
 | One huge project, always built together | Long builds, harder refactors | Cargo workspace (ADR-015), clear crate boundaries, live upgrade makes deploying cheap. |
 | Remaining simplifications | Visual glitches with some clients | Subsurfaces are always desynchronised, popups have no constraint adjustment or grabs, full redraw every frame, buffer scale 1 only, no drag and drop, fullscreen requests before the first commit are ignored. |

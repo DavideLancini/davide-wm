@@ -68,7 +68,6 @@ impl Helper {
     }
 }
 
-/// Lid inhibit state: "LID:ON" / "LID:OFF".
 /// Shortens `text` to at most `max` characters, marking the cut with an
 /// ellipsis when something was dropped.
 ///
@@ -93,15 +92,6 @@ pub fn shorten(text: &str, max: usize) -> String {
     }
     out.push('…');
     out
-}
-
-pub fn lid() -> Helper {
-    Helper::new("/home/davidelancini/7Scripts/lid-status 2>/dev/null")
-}
-
-/// Screen saver state, e.g. "OFF" / "1m" / "5m".
-pub fn screensaver() -> Helper {
-    Helper::new("/home/davidelancini/7Scripts/monitor-manager waybar 2>/dev/null")
 }
 
 /// Bluetooth headphone battery, e.g. "L 80% R 75%".
@@ -214,20 +204,5 @@ mod tests {
         h.command = "echo second";
         assert!(h.refresh(), "changed output must report true");
         assert_eq!(h.text(), "second");
-    }
-
-    /// Parity with the real helpers, when present.
-    #[test]
-    fn live_helpers_produce_the_expected_shape() {
-        let mut lid = lid();
-        let text = lid.text();
-        if !text.is_empty() {
-            assert!(text.starts_with("LID:"), "unexpected lid text: {text:?}");
-        }
-
-        let mut saver = screensaver();
-        let saver_text = saver.text();
-        // monitor-manager reports a short state string, max 4 chars in Waybar.
-        assert!(saver_text.chars().count() <= 8, "unexpected: {saver_text:?}");
     }
 }

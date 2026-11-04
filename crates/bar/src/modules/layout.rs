@@ -51,8 +51,9 @@ pub struct State {
     pub cpu: super::cpu::Cpu,
     pub audio: super::pulseaudio::Audio,
     pub bluetooth: super::bluetooth::Bluetooth,
-    pub lid: super::helpers::Helper,
-    pub screensaver: super::helpers::Helper,
+    /// Set by the compositor (ToBar::Display).
+    pub lid: String,
+    pub screensaver: String,
     pub bt_headphones: super::helpers::Helper,
     pub notifications: super::notifications::Notifications,
     /// Desktop notifications, watched to mark the workspace they came from.
@@ -74,8 +75,8 @@ impl Default for State {
             cpu: super::cpu::Cpu::default(),
             audio: super::pulseaudio::Audio::default(),
             bluetooth: super::bluetooth::Bluetooth::default(),
-            lid: super::helpers::lid(),
-            screensaver: super::helpers::screensaver(),
+            lid: String::new(),
+            screensaver: String::new(),
             bt_headphones: super::helpers::bt_headphones(),
             notifications: super::notifications::Notifications::default(),
             notify: crate::notify::Notify::default(),
@@ -91,8 +92,6 @@ impl State {
     /// Drops the cached values of the widgets a click can change, so the next
     /// render re-reads them. Cheap: these helpers only run when asked.
     pub fn invalidate_cached(&mut self) {
-        self.lid.invalidate();
-        self.screensaver.invalidate();
         self.bt_headphones.invalidate();
         // Clicking the timer widget is how a timer gets set, so its cache has
         // to go with the rest.
@@ -253,13 +252,13 @@ fn status_widgets(state: &mut State) -> Vec<(String, Target, u32)> {
         (icons::with(icons::BATTERY, &super::battery::text()), Target::Widget(Widget::Backlight), battery_color()),
         (icons::with(icons::BELL, &state.notifications.text()), Target::Widget(Widget::Notifications), icons::color::NOTIFICATIONS),
         (icons::BLANK.to_string(), Target::Widget(Widget::Blk), icons::color::BLK),
-        (icons::with(icons::MOON, &state.screensaver.text()), Target::Widget(Widget::Screensaver), icons::color::SCREENSAVER),
+        (icons::with(icons::MOON, &state.screensaver), Target::Widget(Widget::Screensaver), icons::color::SCREENSAVER),
         // Idle timers show the icon alone: "--:--" is five characters saying
         // nothing is running, which the bare icon says in one.
         (timer_text(state), Target::Widget(Widget::Timer), icons::color::TIMER),
         // The lid is one letter, red or green: "LID:OFF" spelled out a state
         // the colour already carries.
-        (LID_LABEL.to_string(), Target::Widget(Widget::Lid), lid_color(&state.lid.text())),
+        (LID_LABEL.to_string(), Target::Widget(Widget::Lid), lid_color(&state.lid)),
         // No icon: a clock face beside "14:21" says nothing the digits do not.
         // Clicking adds the date, which is off by default to save the width.
         (super::clock::text(state.clock_date), Target::Widget(Widget::Clock), icons::color::CLOCK),

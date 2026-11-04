@@ -168,12 +168,34 @@ pub const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 /// Dims the workspace below the special one.
 pub const SPECIAL_DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.4];
 
-/// Preferred modes by connector name: (width, height, refresh in Hz).
-/// Other outputs use their preferred mode.
-pub const OUTPUT_MODES: &[(&str, i32, i32, u32)] = &[("eDP-1", 2160, 1440, 60), ("DP-1", 2560, 1440, 120)];
-/// Until multi-monitor support (M4) a single output is driven: the first
-/// connected one in this list, else any connected one.
-pub const OUTPUT_PRIORITY: &[&str] = &["eDP-1"];
+/// The laptop panel. With the lid closed it is never lit while another
+/// output is connected.
+pub const INTERNAL_OUTPUT: &str = "eDP-1";
+/// Preferred modes by connector name or monitor model (a substring of the
+/// EDID name, case-insensitive): (width, height, refresh in Hz), refresh 0 =
+/// the highest the monitor offers at that size. Other outputs use their
+/// preferred mode.
+pub const OUTPUT_MODES: &[(&str, i32, i32, u32)] = &[("eDP-1", 2160, 1440, 60), ("273Q", 2560, 1440, 0)];
+/// Monitors that, when connected, are the only lit output: the laptop panel
+/// goes dark and every workspace shows there (the MSI MAG 273Q X24).
+/// Any other external monitor mirrors the laptop panel.
+pub const OUTPUT_EXCLUSIVE: &[&str] = &["273Q"];
+/// Monitors blanked with black frames instead of being powered down: the MSI
+/// loses the signal on DPMS off and re-handshakes itself back on, and being
+/// OLED, black costs the same as off.
+pub const OUTPUT_BLANK_BLACK: &[&str] = &["273Q"];
+/// How long after a modeset of an exclusive monitor the kernel log is checked
+/// for a failed DP link training (the monitor stays black while every API
+/// reports it on); on failure the laptop panel comes back.
+pub const LINK_CHECK_DELAY_MS: u64 = 3000;
+
+/// Idle blanking: the timeout set automatically while an exclusive monitor is
+/// connected (unless chosen by hand), and the cycle of the bar's click.
+pub const SCREENSAVER_AUTO_TIMEOUT: u32 = 60;
+pub const SCREENSAVER_CYCLE: &[u32] = &[60, 300, 1800];
+/// Input is ignored this long after blanking, so the click or key that asked
+/// for it (and its release) does not wake the screen straight away.
+pub const BLANK_GRACE_MS: u64 = 700;
 
 /// Programs started once with `--session`, to make the session known
 /// to systemd and D-Bus activated services.

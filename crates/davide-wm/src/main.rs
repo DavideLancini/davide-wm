@@ -3,6 +3,7 @@ macro_rules! log {
 }
 
 mod backend;
+mod display;
 mod event_loop;
 mod ipc;
 mod keyboard;
@@ -19,7 +20,7 @@ use std::process::{Command, Stdio};
 
 use config::{mods, Action};
 use event_loop::{Epoll, HANGUP, READABLE};
-use backend::{nested::Nested, Drm, Event};
+use backend::{nested::Nested, outputs, Drm, Event};
 use render::{Renderer, Target};
 use server::{seat, workspaces, ClientId, State};
 
@@ -33,6 +34,7 @@ const TOKEN_INPUT: u64 = 7;
 const TOKEN_LOGIND: u64 = 8;
 const TOKEN_UEVENT: u64 = 9;
 const TOKEN_BAR: u64 = 10;
+const TOKEN_IDLE: u64 = 11;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -93,27 +95,35 @@ enum Backend {
 }
 
 impl Backend {
-    fn acquire(&mut self, r: &mut Renderer) -> io::Result<Option<usize>> {
+    fn acquire(&mut self, head: usize, r: &mut Renderer) -> io::Result<Option<usize>> {
         match self {
-            Backend::Nested(n) => n.acquire(r),
-            Backend::Drm(d) => Ok(d.acquire()),
+            Backend::Nested(n) if head == 0 => n.acquire(r),
+            Backend::Nested(_) => Ok(None),
+            Backend::Drm(d) => Ok(d.acquire(head)),
         }
     }
 
-    fn target(&self, idx: usize) -> &Target {
+    fn target(&self, head: usize, idx: usize) -> &Target {
         match self {
             Backend::Nested(n) => n.target(idx),
-            Backend::Drm(d) => d.target(idx),
+            Backend::Drm(d) => d.target(head, idx),
         }
     }
 
-    fn present(&mut self, idx: usize) -> io::Result<()> {
+    fn present(&mut self, head: usize, idx: usize) -> io::Result<()> {
         match self {
             Backend::Nested(n) => {
                 n.present(idx);
                 Ok(())
             }
-            Backend::Drm(d) => d.present(idx),
+            Backend::Drm(d) => d.present(head, idx),
+        }
+    }
+
+    fn heads(&self) -> Vec<backend::HeadInfo> {
+        match self {
+            Backend::Nested(n) => vec![backend::HeadInfo { name: "NESTED-1".into(), model: String::new(), size: n.size, refresh_mhz: 0 }],
+            Backend::Drm(d) => d.heads(),
         }
     }
 }
@@ -137,6 +147,13 @@ struct App {
     upgrade: bool,
     /// Exports the environment to systemd (`--session`).
     session: bool,
+    display: display::Display,
+    /// Screensaver label and lid inhibitor state last sent to the bar.
+    bar_display: Option<(String, bool)>,
+    /// The primary buffer last presented, copied to the mirrors.
+    last_frame: Option<usize>,
+    /// Mirror heads still showing an older frame than `last_frame`.
+    mirrors_stale: Vec<usize>,
 }
 
 impl App {
@@ -289,6 +306,38 @@ impl App {
                     None => "none\n".into(),
                 };
             }
+            ipc::Command::Blank => self.blank(),
+            ipc::Command::Wake => self.wake(),
+            ipc::Command::Screensaver(arg) => {
+                let mut ss = self.display.screensaver;
+                match arg.as_deref() {
+                    None => {}
+                    Some("cycle") => ss.cycle(),
+                    Some("on") => (ss.enabled, ss.manual) = (true, true),
+                    Some("off") => (ss.enabled, ss.manual) = (false, true),
+                    Some("auto") => {
+                        ss.manual = false;
+                        let exclusive = self.backend.heads().iter().any(|h| outputs::is_exclusive(&h.name, &h.model));
+                        ss.auto(exclusive);
+                    }
+                    Some(secs) => match secs.parse::<u32>() {
+                        Ok(t) if t > 0 => (ss.enabled, ss.manual, ss.timeout) = (true, true, t),
+                        _ => return "error: screensaver [cycle|on|off|auto|<seconds>]\n".into(),
+                    },
+                }
+                self.display.set_screensaver(ss);
+                let src = if ss.manual { "manual" } else { "auto" };
+                return format!("{} ({src}, {}s)\n", ss.label(), ss.timeout);
+            }
+            ipc::Command::LidInhibit(toggle) => {
+                if toggle {
+                    if let Err(e) = self.toggle_lid_inhibitor() {
+                        return format!("error: {e}\n");
+                    }
+                }
+                return if self.display.lid_inhibitor.is_some() { "on\n" } else { "off\n" }.into();
+            }
+            ipc::Command::Outputs => return self.outputs_text(),
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -322,6 +371,17 @@ impl App {
             bar::FromBar::FocusApp(app) => {
                 self.focus_app(&app);
             }
+            bar::FromBar::Blank => self.blank(),
+            bar::FromBar::CycleScreensaver => {
+                let mut ss = self.display.screensaver;
+                ss.cycle();
+                self.display.set_screensaver(ss);
+            }
+            bar::FromBar::ToggleLid => {
+                if let Err(e) = self.toggle_lid_inhibitor() {
+                    log!("lid inhibitor: {e}");
+                }
+            }
             bar::FromBar::Notified { workspace } => {
                 if let Some(ws) = ws_of(workspace).filter(|w| *w != self.state.active) {
                     self.state.urgent_ws.insert(ws);
@@ -338,6 +398,11 @@ impl App {
             self.bar_width = width;
             bar.send(bar::ToBar::Width(width));
         }
+        let display = (self.display.screensaver.label(), self.display.lid_inhibitor.is_some());
+        if self.bar_display.as_ref() != Some(&display) {
+            bar.send(bar::ToBar::Display { screensaver: display.0.clone(), lid_inhibited: display.1 });
+            self.bar_display = Some(display);
+        }
         let snapshot = self.state.bar_snapshot();
         if self.state.bar.sent.as_ref() != Some(&snapshot) {
             bar.send(bar::ToBar::Workspaces(snapshot.0.clone()));
@@ -346,7 +411,166 @@ impl App {
         }
     }
 
+    /// Blanks every output until the next input (blk).
+    fn blank(&mut self) {
+        if self.display.blanked {
+            return;
+        }
+        log!("blank");
+        self.display.blank();
+        self.state.close_launcher();
+        if let Backend::Drm(d) = &mut self.backend {
+            if let Err(e) = d.set_blank(true) {
+                log!("blank: {e}");
+            }
+        }
+    }
+
+    fn wake(&mut self) {
+        if !self.display.blanked {
+            return;
+        }
+        log!("wake");
+        self.display.wake();
+        if let Backend::Drm(d) = &mut self.backend {
+            if let Err(e) = d.set_blank(false) {
+                log!("wake: {e}");
+            }
+        }
+        self.last_frame = None;
+        self.state.needs_redraw = true;
+    }
+
+    /// The idle timer fired.
+    fn idle(&mut self) {
+        if !self.display.timer_fired() {
+            return;
+        }
+        if self.state.idle_inhibited() {
+            self.display.activity();
+            return;
+        }
+        log!("idle for {}s", self.display.screensaver.timeout);
+        self.blank();
+    }
+
+    /// The set of lit outputs changed: the automatic screensaver policy and
+    /// a full redraw.
+    fn outputs_changed(&mut self) {
+        let exclusive = self.backend.heads().iter().any(|h| outputs::is_exclusive(&h.name, &h.model));
+        let mut s = self.display.screensaver;
+        s.auto(exclusive);
+        self.display.set_screensaver(s);
+        self.display.black_shown.clear();
+        self.last_frame = None;
+        self.mirrors_stale.clear();
+        self.state.needs_redraw = true;
+    }
+
+    fn layout_events(&mut self, events: io::Result<Vec<Event>>) {
+        match events {
+            Ok(events) => {
+                for e in events {
+                    self.backend_event(e);
+                }
+            }
+            Err(e) => log!("output layout: {e}"),
+        }
+        self.outputs_changed();
+    }
+
+    fn toggle_lid_inhibitor(&mut self) -> io::Result<()> {
+        self.display.toggle_lid_inhibitor()?;
+        log!("lid inhibitor {}", if self.display.lid_inhibitor.is_some() { "on" } else { "off" });
+        Ok(())
+    }
+
+    fn outputs_text(&self) -> String {
+        let mut out = String::new();
+        for (i, h) in self.backend.heads().iter().enumerate() {
+            let role = if i == 0 { "primary" } else { "mirror" };
+            out += &format!("{}\t{}x{}@{:.2}\t{role}\t{}\n", h.name, h.size.0, h.size.1, h.refresh_mhz as f64 / 1000.0, h.model);
+        }
+        out
+    }
+
+    /// Draws the primary output, copies it to the mirrors, or shows black
+    /// while blanked.
+    fn render(&mut self, r: &mut Renderer) -> io::Result<()> {
+        let heads = self.backend.heads().len();
+        if self.display.blanked {
+            for h in 0..heads {
+                if self.display.black_shown.contains(&h) {
+                    continue;
+                }
+                if let Some(i) = self.backend.acquire(h, r)? {
+                    r.begin(self.backend.target(h, i), [0.0, 0.0, 0.0, 1.0]);
+                    r.finish();
+                    self.present(h, i, r)?;
+                    self.display.black_shown.push(h);
+                }
+            }
+            return Ok(());
+        }
+        if self.state.needs_redraw {
+            if let Some(i) = self.backend.acquire(0, r)? {
+                self.state.render(r, self.backend.target(0, i));
+                self.last_frame = Some(i);
+                self.mirrors_stale = (1..heads).collect();
+                self.present(0, i, r)?;
+            }
+        }
+        let Some(src) = self.last_frame else { return Ok(()) };
+        for h in std::mem::take(&mut self.mirrors_stale) {
+            match self.backend.acquire(h, r)? {
+                Some(i) => {
+                    r.blit(self.backend.target(0, src), self.backend.target(h, i));
+                    r.finish();
+                    self.present(h, i, r)?;
+                }
+                None => self.mirrors_stale.push(h),
+            }
+        }
+        Ok(())
+    }
+
+    fn present(&mut self, head: usize, idx: usize, r: &mut Renderer) -> io::Result<()> {
+        let Err(e) = self.backend.present(head, idx) else { return Ok(()) };
+        let name = self.backend.heads().get(head).map(|h| h.name.clone()).unwrap_or_default();
+        if !e.to_string().starts_with("modeset") {
+            // Expected while switching VT: logind has already revoked DRM master.
+            log!("present failed: {e}");
+            return Ok(());
+        }
+        match &mut self.backend {
+            // A monitor that refuses its mode is dropped; the laptop panel
+            // refusing leaves nothing to show, so give up instead of running blind.
+            Backend::Drm(d) if name != config::INTERNAL_OUTPUT => {
+                log!("{e}");
+                let events = d.link_failed(&name, r);
+                self.layout_events(events);
+                Ok(())
+            }
+            _ => Err(e),
+        }
+    }
+
     fn backend_event(&mut self, e: Event) {
+        let input = matches!(e, Event::PointerMotion(..) | Event::PointerMotionRelative(..) | Event::PointerButton(..) | Event::PointerAxis(..) | Event::Key(..));
+        if input && self.display.input() {
+            // Releases go through: a key held when the screen blanked must
+            // not stay down (and repeat) in its client.
+            let release = matches!(e, Event::Key(_, false) | Event::PointerButton(_, false));
+            if !release {
+                if self.display.may_wake() {
+                    self.wake();
+                    if let Event::Key(k, true) = e {
+                        self.swallowed.push(k);
+                    }
+                }
+                return;
+            }
+        }
         if self.state.launcher.is_some() {
             match e {
                 Event::PointerMotion(..) | Event::PointerMotionRelative(..) => {
@@ -395,8 +619,8 @@ impl App {
                 self.state.keyboard.reset();
                 self.swallowed.clear();
             }
-            // Lid handling (blank, lid-action) arrives with M4.
-            Event::Lid(closed) => log!("lid {}", if closed { "closed" } else { "open" }),
+            // Handled in the event loop, which has the renderer.
+            Event::Lid(_) => {}
         }
     }
 }
@@ -412,8 +636,27 @@ struct Ctx {
     exe: PathBuf,
 }
 
-fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool) -> App {
-    App { backend, bar: None, bar_width: 0, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), tap: None, running: true, upgrade: false, session }
+#[allow(clippy::too_many_arguments)]
+fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool, display: display::Display) -> App {
+    App {
+        backend,
+        bar: None,
+        bar_width: 0,
+        state,
+        socket,
+        ipc,
+        binds: config::binds(),
+        main_mod,
+        swallowed: Vec::new(),
+        tap: None,
+        running: true,
+        upgrade: false,
+        session,
+        display,
+        bar_display: None,
+        last_frame: None,
+        mirrors_stale: Vec::new(),
+    }
 }
 
 /// Registers every fd with a fresh epoll and starts background jobs.
@@ -442,6 +685,7 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     ep.add(app.ipc.listener.as_raw_fd(), TOKEN_IPC)?;
     ep.add(worker.raw_fd(), TOKEN_WORKER)?;
     ep.add(bar.raw_fd(), TOKEN_BAR)?;
+    ep.add(app.display.timer_fd(), TOKEN_IDLE)?;
     app.bar = Some(bar);
     for (id, fd) in app.state.client_fds() {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
@@ -479,14 +723,14 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
     let ipc = ipc::Ipc::bind(&socket.name)?;
     log!("listening on {}", socket.name);
     let state = State::new(keyboard, output, renderer.dmabuf_formats());
-    let mut app = new_app(backend, state, socket, ipc, main_mod, session);
+    let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(None)?);
     if let Backend::Drm(d) = &mut app.backend {
-        for e in d.setup_output(&mut renderer)? {
-            app.backend_event(e);
-        }
+        let events = d.apply_layout(&mut renderer);
+        app.layout_events(events);
         app.state.pointer.x = (app.state.output.width / 2) as f64;
         app.state.pointer.y = (app.state.output.height / 2) as f64;
     }
+    app.outputs_changed();
     if session {
         for line in config::SESSION_AUTOSTART {
             app.spawn(line);
@@ -500,7 +744,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 2;
+const BLOB_FORMAT: u32 = 3;
 
 fn prev_binary() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("davide-wm-prev"))
@@ -524,6 +768,9 @@ fn encode(ctx: Ctx) -> state::Enc {
     (app.session, app.main_mod, exe.to_string_lossy().into_owned()).save(&mut e);
     app.socket.save(&mut e);
     app.ipc.save(&mut e);
+    let inhibitor = app.display.lid_inhibitor;
+    inhibitor.save(&mut e);
+    std::mem::forget(inhibitor);
     match app.backend {
         Backend::Nested(n) => {
             0u8.save(&mut e);
@@ -557,6 +804,7 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let (session, main_mod, exe): (bool, u32, String) = Persist::load(&mut d).map_err(err)?;
     let socket = Socket::load(&mut d).map_err(err)?;
     let ipc = ipc::Ipc::load(&mut d).map_err(err)?;
+    let inhibitor: Option<OwnedFd> = Persist::load(&mut d).map_err(err)?;
     let (backend, mut renderer) = match u8::load(&mut d).map_err(err)? {
         0 => {
             let n = Nested::restore(Persist::load(&mut d).map_err(err)?)?;
@@ -570,7 +818,8 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
     let formats = renderer.dmabuf_formats();
     let state = State::restore(&mut d, keyboard, formats, &mut renderer).map_err(err)?;
-    let app = new_app(backend, state, socket, ipc, main_mod, session);
+    let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(inhibitor)?);
+    app.outputs_changed();
     log!("live upgrade done");
     finish(app, renderer, PathBuf::from(exe))
 }
@@ -676,6 +925,13 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                                 app.state.wallpaper = Some(tex);
                                 app.state.needs_redraw = true;
                             }
+                            Ok(worker::Done::LinkCheck { name, failed }) => {
+                                let lit = app.backend.heads().iter().any(|h| h.name == name);
+                                if let (true, true, Backend::Drm(d)) = (failed, lit, &mut app.backend) {
+                                    let events = d.link_failed(&name, renderer);
+                                    app.layout_events(events);
+                                }
+                            }
                             Err(e) => log!("background job failed: {e}"),
                         }
                     }
@@ -686,6 +942,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                         app.bar_message(m, renderer);
                     }
                 }
+                TOKEN_IDLE => app.idle(),
                 TOKEN_SIGNAL => {
                     log!("signal received, exiting");
                     app.running = false;
@@ -698,9 +955,13 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                     (Backend::Drm(d), TOKEN_INPUT) => backend_events = d.dispatch_input(),
                     (Backend::Drm(d), TOKEN_LOGIND) => {
                         backend_events = d.dispatch_logind()?;
-                        app.state.needs_redraw = true;
+                        app.outputs_changed();
                     }
-                    (Backend::Drm(d), _) => backend_events = d.dispatch_uevent(renderer)?,
+                    (Backend::Drm(d), _) => {
+                        if let Some(events) = d.dispatch_uevent(renderer) {
+                            app.layout_events(events);
+                        }
+                    }
                 },
                 t => {
                     let id = (t - TOKEN_CLIENT) as ClientId;
@@ -714,7 +975,14 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 }
             }
             for e in backend_events {
-                app.backend_event(e);
+                match (e, &mut app.backend) {
+                    (Event::Lid(closed), Backend::Drm(d)) => {
+                        log!("lid {}", if closed { "closed" } else { "open" });
+                        let events = d.set_lid(closed, renderer);
+                        app.layout_events(events);
+                    }
+                    (e, _) => app.backend_event(e),
+                }
             }
         }
         for id in app.state.dead_clients() {
@@ -726,19 +994,16 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         if app.state.pointer_dirty {
             seat::refresh_pointer(&mut app.state);
         }
-        app.update_bar();
-        if app.state.needs_redraw {
-            if let Some(i) = app.backend.acquire(renderer)? {
-                app.state.render(renderer, app.backend.target(i));
-                if let Err(e) = app.backend.present(i) {
-                    if e.to_string().starts_with("modeset failed") {
-                        return Err(e);
-                    }
-                    // Expected while switching VT: logind has already revoked DRM master.
-                    log!("present failed: {e}");
-                }
+        if let Backend::Drm(d) = &mut app.backend {
+            if let Some((name, since)) = d.link_check.take() {
+                worker.run(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(config::LINK_CHECK_DELAY_MS));
+                    Ok(worker::Done::LinkCheck { failed: outputs::link_failed_since(since), name })
+                });
             }
         }
+        app.update_bar();
+        app.render(renderer)?;
         if let Backend::Nested(n) = &mut app.backend {
             n.flush()?;
         }

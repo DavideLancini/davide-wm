@@ -392,6 +392,12 @@ impl<'a> Loop<'a> {
                 false
             }
             ToBar::Click { x } => self.click(x),
+            ToBar::Display { screensaver, lid_inhibited } => {
+                let m = &mut self.zones.modules;
+                m.screensaver = screensaver;
+                m.lid = if lid_inhibited { "LID:ON" } else { "LID:OFF" }.into();
+                true
+            }
         }
     }
 
@@ -420,6 +426,10 @@ impl<'a> Loop<'a> {
             }
             Widget::Clock => m.clock_date = !m.clock_date,
             Widget::Spotify => self.link.send(FromBar::FocusApp("spotify".into())),
+            // Compositor state: it answers with ToBar::Display.
+            Widget::Blk => self.link.send(FromBar::Blank),
+            Widget::Screensaver => self.link.send(FromBar::CycleScreensaver),
+            Widget::Lid => self.link.send(FromBar::ToggleLid),
             _ => {
                 if let Some(command) = widget.command() {
                     actions::run_detached(command);

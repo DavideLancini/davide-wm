@@ -5,6 +5,7 @@ mod input;
 mod kms;
 pub mod logind;
 pub mod nested;
+pub mod outputs;
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -30,9 +31,10 @@ pub struct Saved {
     logind: logind::Logind,
     card: (u32, u32),
     active: bool,
+    failed: Vec<String>,
 }
 
-state::persist_struct!(Saved { kms, logind, card, active });
+state::persist_struct!(Saved { kms, logind, card, active, failed });
 
 pub struct Drm {
     // Dropped first: libinput releases its devices through logind.
@@ -41,7 +43,24 @@ pub struct Drm {
     pub logind: Box<logind::Logind>,
     uevent: OwnedFd,
     card: (u32, u32),
+    card_path: String,
     pub active: bool,
+    lid_closed: bool,
+    /// Blanked: heads that cannot show black frames are powered down.
+    blanked: bool,
+    /// Connectors whose link failed to train; skipped until unplugged.
+    failed: Vec<String>,
+    /// An exclusive output was just modeset: (connector name, epoch seconds)
+    /// for the kernel log check.
+    pub link_check: Option<(String, u64)>,
+}
+
+/// What the compositor needs to know about a lit output.
+pub struct HeadInfo {
+    pub name: String,
+    pub model: String,
+    pub size: (i32, i32),
+    pub refresh_mhz: u32,
 }
 
 /// The DRM card driving the displays: the boot VGA device, else the first.
@@ -90,11 +109,29 @@ pub fn describe_outputs() -> io::Result<String> {
     let card = find_card()?;
     let file = std::fs::OpenOptions::new().read(true).write(true).open(&card)?;
     let kms = kms::Kms::new(OwnedFd::from(file))?;
-    let chosen = match kms.choose()? {
-        Some(o) => format!("would drive {} with CRTC {} and plane {}\n", o.name, o.crtc, o.plane),
+    let monitors = monitors(&kms, &card)?;
+    let mut out = format!("{card}\n{}", kms.describe()?);
+    for m in &monitors {
+        out += &format!("{}: {:?}\n", m.name, m.model);
+    }
+    out += &match outputs::layout(&monitors, outputs::lid_closed_now(), &[]) {
+        Some(l) => format!("primary {}, mirrors {:?}\n", monitors[l.primary].name, l.mirrors.iter().map(|i| &monitors[*i].name).collect::<Vec<_>>()),
         None => "nothing to drive\n".into(),
     };
-    Ok(format!("{card}\n{}{chosen}", kms.describe()?))
+    Ok(out)
+}
+
+fn monitors(kms: &kms::Kms, card: &str) -> io::Result<Vec<outputs::Monitor>> {
+    Ok(kms
+        .connectors()?
+        .into_iter()
+        .filter(|c| c.connected && !c.modes.is_empty())
+        .map(|c| outputs::Monitor { connector: c.id, model: outputs::edid_model(&outputs::read_edid(card, &c.name)), name: c.name, modes: c.modes })
+        .collect())
+}
+
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 impl Drm {
@@ -106,14 +143,32 @@ impl Drm {
         let renderer = Renderer::new(&render_node(&card)?).map_err(io::Error::other)?;
         let kms = kms::Kms::new(fd)?;
         let input = input::Input::new(&mut *logind)?;
-        let drm = Drm { input, kms, logind, uevent: uevent_socket()?, card: logind::device_numbers(&card)?, active: true };
+        let numbers = logind::device_numbers(&card)?;
+        let drm = Drm::assemble(input, kms, logind, numbers, card, true, Vec::new())?;
         Ok((drm, renderer))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(input: input::Input, kms: kms::Kms, logind: Box<logind::Logind>, card: (u32, u32), card_path: String, active: bool, failed: Vec<String>) -> io::Result<Drm> {
+        Ok(Drm {
+            input,
+            kms,
+            logind,
+            uevent: uevent_socket()?,
+            card,
+            card_path,
+            active,
+            lid_closed: outputs::lid_closed_now(),
+            blanked: false,
+            failed,
+            link_check: None,
+        })
     }
 
     /// Releases the input devices and hands the rest over for a live upgrade.
     pub fn save(self) -> Saved {
         drop(self.input);
-        Saved { kms: self.kms.save(), logind: *self.logind, card: self.card, active: self.active }
+        Saved { kms: self.kms.save(), logind: *self.logind, card: self.card, active: self.active, failed: self.failed }
     }
 
     pub fn restore(saved: Saved) -> io::Result<(Drm, Renderer)> {
@@ -122,26 +177,93 @@ impl Drm {
         let kms = kms::Kms::restore(saved.kms, &mut renderer)?;
         let mut logind = Box::new(saved.logind);
         let input = input::Input::new(&mut *logind)?;
-        Ok((Drm { input, kms, logind, uevent: uevent_socket()?, card: saved.card, active: saved.active }, renderer))
+        Ok((Drm::assemble(input, kms, logind, saved.card, card, saved.active, saved.failed)?, renderer))
     }
 
     pub fn fds(&self) -> [RawFd; 4] {
         [self.kms.raw_fd(), self.input.raw_fd(), self.logind.bus.raw_fd(), self.uevent.as_raw_fd()]
     }
 
-    /// Picks and configures the output; reports its name and size.
-    pub fn setup_output(&mut self, r: &mut Renderer) -> io::Result<Vec<Event>> {
-        let Some(out) = self.kms.choose()? else {
+    /// Applies the monitor policy to what is connected; reports the primary
+    /// output's name and size when they change.
+    pub fn apply_layout(&mut self, r: &mut Renderer) -> io::Result<Vec<Event>> {
+        let monitors = monitors(&self.kms, &self.card_path)?;
+        let connected: Vec<&str> = monitors.iter().map(|m| m.name.as_str()).collect();
+        self.failed.retain(|f| connected.contains(&f.as_str()));
+        let before = self.kms.outputs().next().map(|o| (o.name.clone(), o.mode.hdisplay, o.mode.vdisplay));
+        let Some(layout) = outputs::layout(&monitors, self.lid_closed, &self.failed) else {
             log!("no connected output");
+            self.kms.configure(Vec::new(), r)?;
             return Ok(Vec::new());
         };
-        let same = self.kms.output.as_ref().is_some_and(|o| o.connector == out.connector && o.mode.hdisplay == out.mode.hdisplay && o.mode.vdisplay == out.mode.vdisplay && o.mode.clock == out.mode.clock);
-        if same {
+        let wanted: Vec<_> = std::iter::once(layout.primary)
+            .chain(layout.mirrors)
+            .filter_map(|i| {
+                let m = &monitors[i];
+                outputs::pick_mode(m).map(|mode| (m.connector, m.name.clone(), m.model.clone(), mode))
+            })
+            .collect();
+        let assigned = self.kms.assign(wanted)?;
+        let was_driven: Vec<(u32, u16, u16)> = self.kms.outputs().map(|o| (o.connector, o.mode.hdisplay, o.mode.vdisplay)).collect();
+        self.kms.configure(assigned, r)?;
+        if let Some(p) = self.kms.outputs().next() {
+            if outputs::is_exclusive(&p.name, &p.model) && !was_driven.contains(&(p.connector, p.mode.hdisplay, p.mode.vdisplay)) {
+                self.link_check = Some((p.name.clone(), epoch_now().saturating_sub(5)));
+            }
+        }
+        self.apply_power()?;
+        let after = self.kms.outputs().next().map(|o| (o.name.clone(), o.mode.hdisplay, o.mode.vdisplay));
+        Ok(match after {
+            Some((name, w, h)) if after != before => vec![Event::OutputName(name), Event::Resize(w as i32, h as i32)],
+            _ => Vec::new(),
+        })
+    }
+
+    /// Powers each head for the blank and lid state: the laptop panel goes
+    /// down with the lid closed; blanking powers down whatever cannot show
+    /// black frames.
+    fn apply_power(&mut self) -> io::Result<()> {
+        let heads: Vec<(String, String)> = self.kms.outputs().map(|o| (o.name.clone(), o.model.clone())).collect();
+        for (i, (name, model)) in heads.iter().enumerate() {
+            let lid_off = self.lid_closed && name == config::INTERNAL_OUTPUT;
+            let blank_off = self.blanked && !outputs::blanks_black(name, model);
+            self.kms.set_power(i, !(lid_off || blank_off))?;
+        }
+        Ok(())
+    }
+
+    pub fn heads(&self) -> Vec<HeadInfo> {
+        self.kms
+            .outputs()
+            .map(|o| HeadInfo {
+                name: o.name.clone(),
+                model: o.model.clone(),
+                size: (o.mode.hdisplay as i32, o.mode.vdisplay as i32),
+                refresh_mhz: o.mode.refresh_mhz(),
+            })
+            .collect()
+    }
+
+    pub fn set_blank(&mut self, blanked: bool) -> io::Result<()> {
+        self.blanked = blanked;
+        self.apply_power()
+    }
+
+    pub fn set_lid(&mut self, closed: bool, r: &mut Renderer) -> io::Result<Vec<Event>> {
+        if self.lid_closed == closed {
             return Ok(Vec::new());
         }
-        let (name, w, h) = (out.name.clone(), out.mode.hdisplay as i32, out.mode.vdisplay as i32);
-        self.kms.set_output(out, r)?;
-        Ok(vec![Event::OutputName(name), Event::Resize(w, h)])
+        self.lid_closed = closed;
+        self.apply_layout(r)
+    }
+
+    /// The link of `name` did not train: fall back to the other outputs.
+    pub fn link_failed(&mut self, name: &str, r: &mut Renderer) -> io::Result<Vec<Event>> {
+        log!("{name}: DP link training failed, falling back");
+        if !self.failed.iter().any(|f| f == name) {
+            self.failed.push(name.to_string());
+        }
+        self.apply_layout(r)
     }
 
     /// True when a page flip completed.
@@ -181,8 +303,8 @@ impl Drm {
         Ok(out)
     }
 
-    /// Handles kernel uevents; rescans outputs on DRM hotplug.
-    pub fn dispatch_uevent(&mut self, r: &mut Renderer) -> io::Result<Vec<Event>> {
+    /// Handles kernel uevents; on a DRM hotplug re-applies the layout.
+    pub fn dispatch_uevent(&mut self, r: &mut Renderer) -> Option<io::Result<Vec<Event>>> {
         let mut hotplug = false;
         let mut buf = [0u8; 8192];
         loop {
@@ -196,26 +318,25 @@ impl Drm {
                 hotplug = true;
             }
         }
-        if hotplug && self.active {
+        (hotplug && self.active).then(|| {
             log!("display hotplug");
-            return self.setup_output(r);
-        }
-        Ok(Vec::new())
+            self.apply_layout(r)
+        })
     }
 
-    pub fn acquire(&self) -> Option<usize> {
+    pub fn acquire(&self, head: usize) -> Option<usize> {
         if !self.active {
             return None;
         }
-        self.kms.acquire()
+        self.kms.acquire(head)
     }
 
-    pub fn target(&self, idx: usize) -> &Target {
-        self.kms.target(idx)
+    pub fn target(&self, head: usize, idx: usize) -> &Target {
+        self.kms.target(head, idx)
     }
 
-    pub fn present(&mut self, idx: usize) -> io::Result<()> {
-        self.kms.present(idx)
+    pub fn present(&mut self, head: usize, idx: usize) -> io::Result<()> {
+        self.kms.present(head, idx)
     }
 
     pub fn switch_vt(&mut self, vt: u32) {

@@ -332,6 +332,20 @@ impl Renderer {
         }
     }
 
+    /// Copies `src` into `dst` scaled to fit, centred on black (mirroring).
+    pub fn blit(&mut self, src: &Target, dst: &Target) {
+        let scale = (dst.width as f32 / src.width as f32).min(dst.height as f32 / src.height as f32);
+        let (w, h) = ((src.width as f32 * scale) as i32, (src.height as f32 * scale) as i32);
+        let (x, y) = ((dst.width - w) / 2, (dst.height - h) / 2);
+        self.begin(dst, [0.0, 0.0, 0.0, 1.0]);
+        unsafe {
+            gl::glBindFramebuffer(gl::READ_FRAMEBUFFER, src.fbo);
+            gl::glBindFramebuffer(gl::DRAW_FRAMEBUFFER, dst.fbo);
+            gl::glBlitFramebuffer(0, 0, src.width, src.height, x, y, x + w, y + h, gl::COLOR_BUFFER_BIT, gl::LINEAR as gl::GLenum);
+            gl::glBindFramebuffer(gl::FRAMEBUFFER, dst.fbo);
+        }
+    }
+
     /// Waits for the GPU so the buffer can be handed out.
     pub fn finish(&mut self) {
         unsafe { gl::glFinish() };

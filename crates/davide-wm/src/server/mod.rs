@@ -699,6 +699,11 @@ impl State {
         (entries, clients)
     }
 
+    /// An idle inhibitor belongs to a client with a window on screen.
+    pub fn idle_inhibited(&self) -> bool {
+        self.idle_inhibitors.keys().any(|i| self.layout.iter().any(|(w, _)| w.client == i.client))
+    }
+
     pub fn output_rect(&self) -> Rect {
         Rect::new(0, 0, self.output.width, self.output.height)
     }

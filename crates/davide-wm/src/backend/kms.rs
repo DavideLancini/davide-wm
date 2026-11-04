@@ -12,17 +12,18 @@ pub struct Connector {
     pub name: String,
     pub connected: bool,
     pub modes: Vec<ModeInfo>,
-    pub encoders: Vec<u32>,
     pub mm: (u32, u32),
 }
 
-/// The output being driven.
+/// An output being driven.
+#[derive(Clone)]
 pub struct Output {
     pub connector: u32,
     pub crtc: u32,
     pub plane: u32,
     pub mode: ModeInfo,
     pub name: String,
+    pub model: String,
 }
 
 struct ScanBuffer {
@@ -32,18 +33,25 @@ struct ScanBuffer {
     handle: u32,
 }
 
+struct Head {
+    output: Output,
+    buffers: Vec<ScanBuffer>,
+    front: Option<usize>,
+    pending: Option<usize>,
+    modeset: bool,
+    mode_blob: Option<u32>,
+    /// False while powered down (DPMS off): the CRTC is disabled.
+    on: bool,
+}
+
 pub struct Kms {
     fd: OwnedFd,
     props: HashMap<(u32, &'static str), u32>,
     crtcs: Vec<u32>,
     planes: Vec<(u32, u32, u64)>,
     connectors_all: Vec<u32>,
-    pub output: Option<Output>,
-    buffers: Vec<ScanBuffer>,
-    front: Option<usize>,
-    pending: Option<usize>,
-    modeset: bool,
-    mode_blob: Option<u32>,
+    /// The primary output first.
+    heads: Vec<Head>,
     /// Framebuffers left by the process before a live upgrade, freed after
     /// the first page flip of this one.
     stale: Vec<(u32, u32)>,
@@ -52,24 +60,24 @@ pub struct Kms {
 /// What survives a live upgrade.
 pub struct Saved {
     pub fd: OwnedFd,
-    pub output: Option<Output>,
-    pub mode_blob: Option<u32>,
+    pub heads: Vec<(Output, Option<u32>)>,
     pub stale: Vec<(u32, u32)>,
 }
 
-state::persist_struct!(Saved { fd, output, mode_blob, stale });
+state::persist_struct!(Saved { fd, heads, stale });
 
 impl state::Persist for Output {
     fn save(&self, e: &mut state::Enc) {
         let mode: [u8; std::mem::size_of::<ModeInfo>()] = unsafe { std::mem::transmute(self.mode) };
-        (self.connector, self.crtc, self.plane, self.name.clone()).save(e);
+        (self.connector, self.crtc, self.plane, self.name.clone(), self.model.clone()).save(e);
         state::save_bytes(&mode, e);
     }
     fn load(d: &mut state::Dec) -> state::Result<Self> {
-        let (connector, crtc, plane, name) = state::Persist::load(d)?;
+        let (connector, crtc, plane, name, model) = state::Persist::load(d)?;
         let bytes = state::load_bytes(d)?;
         let bytes: [u8; std::mem::size_of::<ModeInfo>()] = bytes.try_into().map_err(|_| state::Error("bad mode".into()))?;
-        Ok(Output { connector, crtc, plane, mode: unsafe { std::mem::transmute::<[u8; std::mem::size_of::<ModeInfo>()], ModeInfo>(bytes) }, name })
+        let mode = unsafe { std::mem::transmute::<[u8; std::mem::size_of::<ModeInfo>()], ModeInfo>(bytes) };
+        Ok(Output { connector, crtc, plane, mode, name, model })
     }
 }
 
@@ -79,6 +87,10 @@ fn vec_ptr<T>(v: &mut [T]) -> u64 {
 
 fn prop_names() -> [&'static str; 14] {
     ["CRTC_ID", "MODE_ID", "ACTIVE", "FB_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "type", "DPMS"]
+}
+
+fn same_mode(a: &ModeInfo, b: &ModeInfo) -> bool {
+    (a.hdisplay, a.vdisplay, a.clock, a.htotal, a.vtotal, a.flags) == (b.hdisplay, b.vdisplay, b.clock, b.htotal, b.vtotal, b.flags)
 }
 
 impl Kms {
@@ -113,12 +125,7 @@ impl Kms {
             crtcs: crtcs.clone(),
             planes: Vec::new(),
             connectors_all: connectors.clone(),
-            output: None,
-            buffers: Vec::new(),
-            front: None,
-            pending: None,
-            modeset: true,
-            mode_blob: None,
+            heads: Vec::new(),
             stale: Vec::new(),
         };
         for c in &crtcs {
@@ -176,15 +183,7 @@ impl Kms {
             let mut c = drm::GetConnector { connector_id: *id, ..Default::default() };
             ioctl(raw, drm::IOCTL_MODE_GETCONNECTOR, &mut c)?;
             let mut modes = vec![ModeInfo::default(); c.count_modes as usize];
-            let mut encoders = vec![0u32; c.count_encoders as usize];
-            let mut c2 = drm::GetConnector {
-                connector_id: *id,
-                modes_ptr: vec_ptr(&mut modes),
-                encoders_ptr: vec_ptr(&mut encoders),
-                count_modes: c.count_modes,
-                count_encoders: c.count_encoders,
-                ..Default::default()
-            };
+            let mut c2 = drm::GetConnector { connector_id: *id, modes_ptr: vec_ptr(&mut modes), count_modes: c.count_modes, ..Default::default() };
             ioctl(raw, drm::IOCTL_MODE_GETCONNECTOR, &mut c2)?;
             // The mode count can change between the two calls.
             modes.truncate(c2.count_modes.min(c.count_modes) as usize);
@@ -193,43 +192,53 @@ impl Kms {
                 name: format!("{}-{}", drm::connector_type_name(c2.connector_type), c2.connector_type_id),
                 connected: c2.connection == drm::MODE_CONNECTED,
                 modes,
-                encoders,
                 mm: (c2.mm_width, c2.mm_height),
             });
         }
         Ok(out)
     }
 
-    /// Picks the connector, mode, CRTC and primary plane to drive.
-    pub fn choose(&self) -> io::Result<Option<Output>> {
-        let conns: Vec<Connector> = self.connectors()?.into_iter().filter(|c| c.connected && !c.modes.is_empty()).collect();
-        let pick = config::OUTPUT_PRIORITY.iter().find_map(|n| conns.iter().find(|c| c.name == *n)).or(conns.first());
-        let Some(conn) = pick else { return Ok(None) };
-        let wanted = config::OUTPUT_MODES.iter().find(|(n, ..)| *n == conn.name);
-        let mode = wanted
-            .and_then(|(_, w, h, hz)| {
-                conn.modes.iter().copied().filter(|m| m.hdisplay as i32 == *w && m.vdisplay as i32 == *h).min_by_key(|m| m.refresh_mhz().abs_diff(hz * 1000))
-            })
-            .or(conn.modes.iter().copied().find(|m| m.kind & drm::MODE_TYPE_PREFERRED != 0))
-            .unwrap_or(conn.modes[0]);
+    /// Assigns a CRTC and a primary plane to each (connector, mode), keeping
+    /// the CRTC a connector already has.
+    pub fn assign(&self, wanted: Vec<(u32, String, String, ModeInfo)>) -> io::Result<Vec<Output>> {
         let raw = self.fd.as_raw_fd();
-        let mut possible = 0u32;
-        for e in &conn.encoders {
-            let mut enc = drm::GetEncoder { encoder_id: *e, ..Default::default() };
-            if ioctl(raw, drm::IOCTL_MODE_GETENCODER, &mut enc).is_ok() {
-                possible |= enc.possible_crtcs;
+        let mut used: Vec<u32> = Vec::new();
+        let mut out = Vec::new();
+        let mut order: Vec<usize> = (0..wanted.len()).collect();
+        // Connectors keeping their CRTC claim it first.
+        order.sort_by_key(|i| !self.heads.iter().any(|h| h.output.connector == wanted[*i].0));
+        let mut slots: Vec<Option<Output>> = vec![None; wanted.len()];
+        for i in order {
+            let (connector, name, model, mode) = wanted[i].clone();
+            let mut gc = drm::GetConnector { connector_id: connector, ..Default::default() };
+            ioctl(raw, drm::IOCTL_MODE_GETCONNECTOR, &mut gc)?;
+            let mut encoders = vec![0u32; gc.count_encoders as usize];
+            let mut gc2 = drm::GetConnector { connector_id: connector, encoders_ptr: vec_ptr(&mut encoders), count_encoders: gc.count_encoders, ..Default::default() };
+            ioctl(raw, drm::IOCTL_MODE_GETCONNECTOR, &mut gc2)?;
+            let mut possible = 0u32;
+            for e in &encoders {
+                let mut enc = drm::GetEncoder { encoder_id: *e, ..Default::default() };
+                if ioctl(raw, drm::IOCTL_MODE_GETENCODER, &mut enc).is_ok() {
+                    possible |= enc.possible_crtcs;
+                }
             }
-        }
-        for (i, crtc) in self.crtcs.iter().enumerate() {
-            if possible & (1 << i) == 0 {
+            let current = self.heads.iter().find(|h| h.output.connector == connector).map(|h| h.output.crtc);
+            let mut candidates: Vec<usize> = (0..self.crtcs.len()).filter(|i| possible & (1 << i) != 0 && !used.contains(&self.crtcs[*i])).collect();
+            candidates.sort_by_key(|i| Some(self.crtcs[*i]) != current);
+            let pick = candidates.into_iter().find_map(|i| {
+                let plane = self.planes.iter().find(|(p, pc, kind)| pc & (1 << i) != 0 && *kind == drm::PLANE_TYPE_PRIMARY && !out.iter().any(|o: &Output| o.plane == *p));
+                plane.map(|(p, ..)| (self.crtcs[i], *p))
+            });
+            let Some((crtc, plane)) = pick else {
+                log!("no CRTC/plane left for {name}");
                 continue;
-            }
-            let plane = self.planes.iter().find(|(_, pc, kind)| pc & (1 << i) != 0 && *kind == drm::PLANE_TYPE_PRIMARY);
-            if let Some((plane, ..)) = plane {
-                return Ok(Some(Output { connector: conn.id, crtc: *crtc, plane: *plane, mode, name: conn.name.clone() }));
-            }
+            };
+            used.push(crtc);
+            let o = Output { connector, crtc, plane, mode, name, model };
+            out.push(o.clone());
+            slots[i] = Some(o);
         }
-        Err(io::Error::other(format!("no CRTC/plane for {}", conn.name)))
+        Ok(slots.into_iter().flatten().collect())
     }
 
     fn prop(&self, obj: u32, name: &'static str) -> io::Result<u32> {
@@ -297,63 +306,111 @@ impl Kms {
         let _ = ioctl(raw, drm::IOCTL_GEM_CLOSE, &mut close);
     }
 
-    fn drop_buffers(&mut self, r: &mut Renderer) {
-        for b in std::mem::take(&mut self.buffers) {
+    fn drop_head(&mut self, mut h: Head, r: &mut Renderer) {
+        for b in h.buffers.drain(..) {
             self.free_fb(b.fb, b.handle);
             r.destroy_target(b.target);
         }
-        self.front = None;
-        self.pending = None;
+        if let Some(blob) = h.mode_blob {
+            self.destroy_blob(blob);
+        }
     }
 
-    /// Switches to `output` (or re-applies the current one after a VT switch).
-    pub fn set_output(&mut self, output: Output, r: &mut Renderer) -> io::Result<()> {
-        let size = (output.mode.hdisplay as i32, output.mode.vdisplay as i32);
-        if self.buffers.first().is_none_or(|b| (b.target.width, b.target.height) != size) {
-            self.drop_buffers(r);
+    fn destroy_blob(&self, blob: u32) {
+        let mut b = drm::DestroyBlob { blob_id: blob };
+        let _ = ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_DESTROYPROPBLOB, &mut b);
+    }
+
+    /// The outputs being driven, the primary first.
+    pub fn outputs(&self) -> impl Iterator<Item = &Output> {
+        self.heads.iter().map(|h| &h.output)
+    }
+
+    /// Drives exactly `outputs` (the primary first); unchanged heads keep
+    /// their buffers and skip the modeset.
+    pub fn configure(&mut self, outputs: Vec<Output>, r: &mut Renderer) -> io::Result<()> {
+        let mut old = std::mem::take(&mut self.heads);
+        let mut dropped = false;
+        for o in outputs {
+            let same = |h: &Head| h.output.connector == o.connector && h.output.crtc == o.crtc && h.output.plane == o.plane && same_mode(&h.output.mode, &o.mode);
+            if let Some(i) = old.iter().position(same) {
+                self.heads.push(old.remove(i));
+                continue;
+            }
+            let size = (o.mode.hdisplay as i32, o.mode.vdisplay as i32);
+            let mut buffers = Vec::new();
+            if let Some(i) = old.iter().position(|h| h.output.connector == o.connector) {
+                let h = old.remove(i);
+                self.drop_head(h, r);
+                dropped = true;
+            }
             for _ in 0..2 {
                 let target = r.create_target(size.0, size.1, sys::gbm::BO_USE_SCANOUT).map_err(io::Error::other)?;
                 let (fb, handle) = self.add_fb(&target)?;
-                self.buffers.push(ScanBuffer { target, fb, handle });
+                buffers.push(ScanBuffer { target, fb, handle });
+            }
+            log!("output {} ({}): {}x{}@{:.2}", o.name, o.model, size.0, size.1, o.mode.refresh_mhz() as f64 / 1000.0);
+            self.heads.push(Head { output: o, buffers, front: None, pending: None, modeset: true, mode_blob: None, on: true });
+        }
+        for h in old {
+            log!("output {} released", h.output.name);
+            self.drop_head(h, r);
+            dropped = true;
+        }
+        if dropped {
+            for h in &mut self.heads {
+                h.modeset = true;
+            }
+            if self.heads.is_empty() {
+                self.disable_others()?;
             }
         }
-        log!(
-            "output {}: {}x{}@{:.2}",
-            output.name,
-            output.mode.hdisplay,
-            output.mode.vdisplay,
-            output.mode.refresh_mhz() as f64 / 1000.0
-        );
-        self.output = Some(output);
-        self.modeset = true;
-        self.pending = None;
-        self.front = None;
         Ok(())
     }
 
-    pub fn request_modeset(&mut self) {
-        self.modeset = true;
-        self.pending = None;
-    }
-
-    pub fn acquire(&self) -> Option<usize> {
-        if self.pending.is_some() || self.output.is_none() {
-            return None;
+    /// Powers a head down (CRTC off) or back up (modeset on the next present).
+    pub fn set_power(&mut self, head: usize, on: bool) -> io::Result<()> {
+        let Some(h) = self.heads.get_mut(head) else { return Ok(()) };
+        if h.on == on {
+            return Ok(());
         }
-        (0..self.buffers.len()).find(|i| Some(*i) != self.front)
+        h.on = on;
+        h.pending = None;
+        h.front = None;
+        h.modeset = true;
+        if on {
+            return Ok(());
+        }
+        let o = h.output.clone();
+        log!("output {} off", o.name);
+        let objs = vec![(o.plane, vec![("FB_ID", 0), ("CRTC_ID", 0)]), (o.connector, vec![("CRTC_ID", 0)]), (o.crtc, vec![("ACTIVE", 0), ("MODE_ID", 0)])];
+        self.commit(objs, drm::MODE_ATOMIC_ALLOW_MODESET)
     }
 
-    pub fn target(&self, idx: usize) -> &Target {
-        &self.buffers[idx].target
+    pub fn request_modeset(&mut self) {
+        for h in &mut self.heads {
+            h.modeset = true;
+            h.pending = None;
+        }
     }
 
-    pub fn present(&mut self, idx: usize) -> io::Result<()> {
-        if self.modeset {
+    pub fn acquire(&self, head: usize) -> Option<usize> {
+        let h = self.heads.get(head).filter(|h| h.on && h.pending.is_none())?;
+        (0..h.buffers.len()).find(|i| Some(*i) != h.front)
+    }
+
+    pub fn target(&self, head: usize, idx: usize) -> &Target {
+        &self.heads[head].buffers[idx].target
+    }
+
+    pub fn present(&mut self, head: usize, idx: usize) -> io::Result<()> {
+        if self.heads[head].modeset {
             self.disable_others()?;
         }
-        let Some(o) = &self.output else { return Ok(()) };
-        let fb = self.buffers[idx].fb as u64;
-        let (w, h) = (o.mode.hdisplay as u64, o.mode.vdisplay as u64);
+        let h = &self.heads[head];
+        let o = &h.output;
+        let fb = h.buffers[idx].fb as u64;
+        let (w, h_px) = (o.mode.hdisplay as u64, o.mode.vdisplay as u64);
         let mut objs = vec![(
             o.plane,
             vec![
@@ -362,55 +419,53 @@ impl Kms {
                 ("SRC_X", 0),
                 ("SRC_Y", 0),
                 ("SRC_W", w << 16),
-                ("SRC_H", h << 16),
+                ("SRC_H", h_px << 16),
                 ("CRTC_X", 0),
                 ("CRTC_Y", 0),
                 ("CRTC_W", w),
-                ("CRTC_H", h),
+                ("CRTC_H", h_px),
             ],
         )];
         let mut flags = drm::MODE_PAGE_FLIP_EVENT;
-        let modeset = self.modeset;
-        if modeset {
+        if h.modeset {
             let blob = self.create_blob(&o.mode)?;
             objs.push((o.connector, vec![("CRTC_ID", o.crtc as u64)]));
             objs.push((o.crtc, vec![("MODE_ID", blob as u64), ("ACTIVE", 1)]));
             flags |= drm::MODE_ATOMIC_ALLOW_MODESET;
+            let name = o.name.clone();
             let res = self.commit(objs, flags);
-            if let Some(old) = self.mode_blob.replace(blob) {
-                let mut b = drm::DestroyBlob { blob_id: old };
-                let _ = ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_DESTROYPROPBLOB, &mut b);
+            if let Some(old) = self.heads[head].mode_blob.replace(blob) {
+                self.destroy_blob(old);
             }
-            // A failed modeset leaves nothing on screen: give up instead of
-            // running blind.
-            res.map_err(|e| io::Error::other(format!("modeset failed: {e}")))?;
+            res.map_err(|e| io::Error::other(format!("modeset of {name} failed: {e}")))?;
         } else {
             flags |= drm::MODE_ATOMIC_NONBLOCK;
             self.commit(objs, flags)?;
         }
-        self.modeset = false;
-        self.pending = Some(idx);
+        let h = &mut self.heads[head];
+        h.modeset = false;
+        h.pending = Some(idx);
         Ok(())
     }
 
     /// Turns off what the previous DRM master left on, in its own commit:
     /// a commit asking for a page-flip event must not contain disabled CRTCs.
     fn disable_others(&mut self) -> io::Result<()> {
-        let Some(o) = &self.output else { return Ok(()) };
-        let (connector, crtc, plane) = (o.connector, o.crtc, o.plane);
+        let mine = |f: fn(&Output) -> u32| self.heads.iter().filter(|h| h.on).map(|h| f(&h.output)).collect::<Vec<u32>>();
+        let (connectors, crtcs, planes) = (mine(|o| o.connector), mine(|o| o.crtc), mine(|o| o.plane));
         let mut objs = Vec::new();
         for c in self.connectors_all.clone() {
-            if c != connector && self.current(c, drm::OBJECT_CONNECTOR, "CRTC_ID")? != 0 {
+            if !connectors.contains(&c) && self.current(c, drm::OBJECT_CONNECTOR, "CRTC_ID")? != 0 {
                 objs.push((c, vec![("CRTC_ID", 0)]));
             }
         }
         for (p, ..) in self.planes.clone() {
-            if p != plane && (self.current(p, drm::OBJECT_PLANE, "FB_ID")? != 0 || self.current(p, drm::OBJECT_PLANE, "CRTC_ID")? != 0) {
+            if !planes.contains(&p) && (self.current(p, drm::OBJECT_PLANE, "FB_ID")? != 0 || self.current(p, drm::OBJECT_PLANE, "CRTC_ID")? != 0) {
                 objs.push((p, vec![("FB_ID", 0), ("CRTC_ID", 0)]));
             }
         }
         for c in self.crtcs.clone() {
-            if c != crtc && self.current(c, drm::OBJECT_CRTC, "ACTIVE")? != 0 {
+            if !crtcs.contains(&c) && self.current(c, drm::OBJECT_CRTC, "ACTIVE")? != 0 {
                 objs.push((c, vec![("ACTIVE", 0), ("MODE_ID", 0)]));
             }
         }
@@ -433,15 +488,18 @@ impl Kms {
         while n > 0 && off + 8 <= n as usize {
             let kind = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
             let len = u32::from_ne_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
-            if kind == drm::EVENT_FLIP_COMPLETE {
+            if kind == drm::EVENT_FLIP_COMPLETE && off + std::mem::size_of::<drm::EventVblank>() <= n as usize {
+                let crtc = u32::from_ne_bytes(buf[off + 28..off + 32].try_into().unwrap());
+                if let Some(h) = self.heads.iter_mut().find(|h| h.output.crtc == crtc) {
+                    if let Some(p) = h.pending.take() {
+                        h.front = Some(p);
+                    }
+                }
                 flipped = true;
             }
             off += len.max(8);
         }
         if flipped {
-            if let Some(p) = self.pending.take() {
-                self.front = Some(p);
-            }
             for (fb, handle) in std::mem::take(&mut self.stale) {
                 self.free_fb(fb, handle);
             }
@@ -453,18 +511,23 @@ impl Kms {
     /// stay on screen until it presents its first frame.
     pub fn save(mut self) -> Saved {
         let mut stale = std::mem::take(&mut self.stale);
-        stale.extend(self.buffers.iter().map(|b| (b.fb, b.handle)));
-        // The targets live on the render node, which closes with the process.
-        self.buffers.clear();
-        Saved { fd: self.fd, output: self.output, mode_blob: self.mode_blob, stale }
+        let mut heads = Vec::new();
+        for mut h in std::mem::take(&mut self.heads) {
+            stale.extend(h.buffers.iter().map(|b| (b.fb, b.handle)));
+            // The targets live on the render node, which closes with the process.
+            h.buffers.clear();
+            heads.push((h.output, h.mode_blob));
+        }
+        Saved { fd: self.fd, heads, stale }
     }
 
     pub fn restore(saved: Saved, r: &mut Renderer) -> io::Result<Kms> {
         let mut kms = Kms::new(saved.fd)?;
-        kms.mode_blob = saved.mode_blob;
         kms.stale = saved.stale;
-        if let Some(o) = saved.output {
-            kms.set_output(o, r)?;
+        let blobs: Vec<Option<u32>> = saved.heads.iter().map(|(_, b)| *b).collect();
+        kms.configure(saved.heads.into_iter().map(|(o, _)| o).collect(), r)?;
+        for (h, b) in kms.heads.iter_mut().zip(blobs) {
+            h.mode_blob = b;
         }
         Ok(kms)
     }

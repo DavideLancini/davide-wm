@@ -31,6 +31,8 @@ pub const VERTEX_SHADER: GLenum = 0x8B31;
 pub const COMPILE_STATUS: GLenum = 0x8B81;
 pub const LINK_STATUS: GLenum = 0x8B82;
 pub const FRAMEBUFFER: GLenum = 0x8D40;
+pub const READ_FRAMEBUFFER: GLenum = 0x8CA8;
+pub const DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
 pub const RENDERBUFFER: GLenum = 0x8D41;
 pub const COLOR_ATTACHMENT0: GLenum = 0x8CE0;
 pub const FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
@@ -56,6 +58,8 @@ extern "C" {
     pub fn glFramebufferRenderbuffer(target: GLenum, attachment: GLenum, rbtarget: GLenum, rb: GLuint);
     pub fn glFramebufferTexture2D(target: GLenum, attachment: GLenum, textarget: GLenum, tex: GLuint, level: GLint);
     pub fn glReadPixels(x: GLint, y: GLint, w: GLsizei, h: GLsizei, format: GLenum, kind: GLenum, data: *mut c_void);
+    #[allow(clippy::too_many_arguments)]
+    pub fn glBlitFramebuffer(sx0: GLint, sy0: GLint, sx1: GLint, sy1: GLint, dx0: GLint, dy0: GLint, dx1: GLint, dy1: GLint, mask: GLbitfield, filter: GLenum);
     pub fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
     pub fn glGenRenderbuffers(n: GLsizei, ids: *mut GLuint);
     pub fn glDeleteRenderbuffers(n: GLsizei, ids: *const GLuint);

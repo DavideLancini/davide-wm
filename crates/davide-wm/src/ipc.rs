@@ -61,6 +61,14 @@ pub enum Command {
     /// Press and release an evdev key code.
     Key(u32),
     Focused,
+    /// Black screen until the next input.
+    Blank,
+    Wake,
+    /// Shows the screensaver, or changes it: cycle, on, off, auto, seconds.
+    Screensaver(Option<String>),
+    /// Shows the lid switch inhibitor; true toggles it.
+    LidInhibit(bool),
+    Outputs,
     Exit,
 }
 
@@ -99,8 +107,17 @@ fn parse(line: &str) -> Result<Command, String> {
         "click" => Ok(Command::Click),
         "key" => arg.parse().map(Command::Key).map_err(|_| "key <evdev code>".into()),
         "focused" => Ok(Command::Focused),
+        "blank" => Ok(Command::Blank),
+        "wake" => Ok(Command::Wake),
+        "screensaver" => Ok(Command::Screensaver((!arg.is_empty()).then(|| arg.to_string()))),
+        "lid-inhibit" => match arg {
+            "" => Ok(Command::LidInhibit(false)),
+            "toggle" => Ok(Command::LidInhibit(true)),
+            _ => Err("lid-inhibit [toggle]".into()),
+        },
+        "outputs" => Ok(Command::Outputs),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>, focused, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>, focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, exit".into()),
     }
 }
 

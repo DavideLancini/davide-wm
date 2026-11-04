@@ -53,6 +53,8 @@ pub enum ToBar {
     Clients(Vec<Client>),
     /// Left-button release at bar x coordinate.
     Click { x: i32 },
+    /// Screensaver label ("OFF", "1m") and whether the lid switch is inhibited.
+    Display { screensaver: String, lid_inhibited: bool },
 }
 
 pub enum FromBar {
@@ -65,6 +67,10 @@ pub enum FromBar {
     FocusApp(String),
     /// A desktop notification came from an app on this workspace.
     Notified { workspace: i32 },
+    /// The blk widget: black screen until the next input.
+    Blank,
+    CycleScreensaver,
+    ToggleLid,
 }
 
 /// Handle owned by the compositor.

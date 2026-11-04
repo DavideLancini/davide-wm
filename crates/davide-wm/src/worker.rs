@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 pub enum Done {
     Wallpaper(jpeg::Image),
+    /// The kernel log check after lighting an exclusive monitor.
+    LinkCheck { name: String, failed: bool },
 }
 
 pub struct Worker {
