@@ -174,7 +174,7 @@ pub fn scan() -> Vec<App> {
     scan_desktop_dir(&bookmarks_dir(), &mut bookmarks_by_id);
     apps.extend(bookmarks_by_id.into_values());
 
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.sort_by_key(|a| a.name.to_lowercase());
     apps.push(exit_entry());
     apps
 }

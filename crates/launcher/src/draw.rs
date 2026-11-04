@@ -60,8 +60,8 @@ pub struct Box2D {
     pub h: u32,
 }
 
-/// 1) Fully transparent fullscreen buffer. 2) Opaque black box at `box2d`:
-/// search row (query text + cursor) + result rows.
+/// Opaque black box at `box2d`: search row (query text + cursor), then the
+/// result rows.
 pub fn draw_window(
     buf: &mut [u8],
     screen_w: u32,
@@ -182,6 +182,7 @@ fn fill_rect_opaque(buf: &mut [u8], stride: usize, x0: u32, y0: u32, w: u32, h: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_line(
     buf: &mut [u8],
     stride: usize,
