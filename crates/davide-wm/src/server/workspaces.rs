@@ -16,7 +16,9 @@ pub fn focused_ws(s: &State) -> WsId {
 /// Tiles a new toplevel on the focused workspace (at its first commit).
 pub fn add_window(s: &mut State, key: SKey) {
     let ws_id = focused_ws(s);
-    let target = s.focus.filter(|f| s.window_ws.get(f) == Some(&ws_id));
+    // Split the window under the pointer, else the focused one.
+    let hovered = s.pointer.focus.and_then(|k| seat::toplevel_of(s, k));
+    let target = hovered.or(s.focus).filter(|f| s.window_ws.get(f) == Some(&ws_id));
     let fullscreen = s.rule(key).is_some_and(|r| r.fullscreen);
     let ws = s.workspaces.entry(ws_id).or_default();
     ws.tiling.insert(key, target);

@@ -342,6 +342,7 @@ impl State {
             serial,
             start,
             needs_redraw: _,
+            pointer_dirty: _,
             dead_textures: _,
         } = self;
         clients.save(e);

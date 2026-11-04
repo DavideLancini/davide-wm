@@ -233,7 +233,24 @@ fn pointer_frame(s: &mut State, c: ClientId) {
     }
 }
 
+/// The pointer moved: the window under it gets the keyboard focus too
+/// (focus follows the mouse, like Hyprland's default).
 pub fn pointer_motion(s: &mut State, x: f64, y: f64) {
+    update_pointer(s, x, y);
+    let top = s.pointer.focus.and_then(|k| toplevel_of(s, k));
+    if top.is_some() && top != s.focus {
+        set_focus(s, top);
+    }
+}
+
+/// Re-targets the pointer after the windows under it changed (workspace
+/// switch, new layout) without moving the keyboard focus.
+pub fn refresh_pointer(s: &mut State) {
+    s.pointer_dirty = false;
+    update_pointer(s, s.pointer.x, s.pointer.y);
+}
+
+fn update_pointer(s: &mut State, x: f64, y: f64) {
     s.pointer.x = x.clamp(0.0, (s.output.width - 1).max(0) as f64);
     s.pointer.y = y.clamp(0.0, (s.output.height - 1).max(0) as f64);
     let hit = surface_at(s, s.pointer.x, s.pointer.y);

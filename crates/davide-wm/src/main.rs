@@ -234,6 +234,18 @@ impl App {
                 }
             }
             ipc::Command::Upgrade => self.upgrade = true,
+            ipc::Command::Pointer(x, y) => self.backend_event(Event::PointerMotion(x, y)),
+            ipc::Command::Click => {
+                self.backend_event(Event::PointerButton(0x110, true));
+                self.backend_event(Event::PointerButton(0x110, false));
+            }
+            ipc::Command::Focused => {
+                let s = &self.state;
+                return match s.focus {
+                    Some(k) => format!("{} on {}\n", s.app_id(k), s.window_ws.get(&k).map_or("?".into(), |w| ipc::ws_name(*w))),
+                    None => "none\n".into(),
+                };
+            }
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -643,6 +655,9 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 ep.delete(c.conn.raw_fd());
             }
             app.state.remove_client(id);
+        }
+        if app.state.pointer_dirty {
+            seat::refresh_pointer(&mut app.state);
         }
         app.update_bar();
         if app.state.needs_redraw {

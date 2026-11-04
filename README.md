@@ -152,7 +152,7 @@
 | Devices | DRM ioctls (atomic KMS), GBM, EGL + GLES2; libinput (path backend, fds from logind); netlink uevents for hotplug | |
 | Notifications | D-Bus `org.freedesktop.Notifications` (server side) *(planned)* | Own D-Bus implementation, extended from `topbar/src/dbus.rs`. |
 | Screen cast | D-Bus `org.freedesktop.impl.portal.ScreenCast` (+ `Screenshot`), PipeWire stream via libpipewire | `davide-wm.portal` file + `davide-wm-portals.conf` installed under `/usr/share/xdg-desktop-portal/`. |
-| IPC | Unix socket `$XDG_RUNTIME_DIR/davide-wm-<wayland socket>.sock` (path exported to children as `DAVIDE_WM_SOCKET`): one text command per connection (`workspace`, `exec`, `close`, `windows`, `focus-app`, `exit`), one reply; event stream *(planned)* | For scripts that remain outside; replaces `hyprctl`/socket2. Client: `davide-wm msg <command>`. |
+| IPC | Unix socket `$XDG_RUNTIME_DIR/davide-wm-<wayland socket>.sock` (path exported to children as `DAVIDE_WM_SOCKET`): one text command per connection (`workspace`, `exec`, `close`, `windows`, `focus-app`, `upgrade`, `exit`; test helpers `pointer`, `click`, `focused`), one reply; event stream *(planned)* | For scripts that remain outside; replaces `hyprctl`/socket2. Client: `davide-wm msg <command>`. |
 | Signals | `signalfd`: TERM/INT (clean exit), USR1/USR2 kept for compatibility (bar toggle/refresh) | |
 
 ---
@@ -348,6 +348,7 @@ davide-wm/
 | 28 | Upgrade blob with a format number and a copy of the previous binary | accepted | 2026-11-04 | `BLOB_FORMAT` changes on incompatible layout changes; a binary that cannot read the blob execs `$XDG_RUNTIME_DIR/davide-wm-prev` (copied at every start) with it, so the session survives. Textures travel as pixels, dmabufs are imported again, shm pools mapped again; keys held during the upgrade are forgotten. |
 | 29 | The bar runs on its own thread, not in the main loop | accepted | 2026-11-04 | topbar's sources block (helpers up to 1 s, HTTP up to 3 s) and may panic; a thread keeps the compositor responsive and alive, and the port stays close to topbar. Its state is not part of the live upgrade: the new process starts a fresh bar. |
 | 30 | `fontdue` and `ureq` (rustls) allowed in `crates/bar` | accepted | 2026-11-04 | Inherited from topbar: font rasterising and the Spotify Web API. Pure Rust; to be revisited (own TLS is out of scope). |
+| 31 | Focus follows the mouse | accepted | 2026-11-04 | Like Hyprland's default (`follow_mouse = 1`): the toplevel under the pointer gets the keyboard focus, and a new window splits the window under the pointer. Workspace switches restore the last focused window until the pointer moves. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>

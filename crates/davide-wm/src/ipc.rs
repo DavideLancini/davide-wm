@@ -55,6 +55,10 @@ pub enum Command {
     Windows,
     FocusApp(String),
     Upgrade,
+    /// Test helpers: move the pointer, click the left button, report the focus.
+    Pointer(f64, f64),
+    Click,
+    Focused,
     Exit,
 }
 
@@ -83,8 +87,17 @@ fn parse(line: &str) -> Result<Command, String> {
         "windows" => Ok(Command::Windows),
         "focus-app" if !arg.is_empty() => Ok(Command::FocusApp(arg.to_string())),
         "upgrade" => Ok(Command::Upgrade),
+        "pointer" => {
+            let mut it = arg.split_whitespace().map(str::parse::<f64>);
+            match (it.next(), it.next()) {
+                (Some(Ok(x)), Some(Ok(y))) => Ok(Command::Pointer(x, y)),
+                _ => Err("pointer <x> <y>".into()),
+            }
+        }
+        "click" => Ok(Command::Click),
+        "focused" => Ok(Command::Focused),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, focused, exit".into()),
     }
 }
 

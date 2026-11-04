@@ -254,6 +254,8 @@ pub struct State {
     serial: u32,
     start: Instant,
     pub needs_redraw: bool,
+    /// The layout changed: the surface under the pointer may be another one.
+    pub pointer_dirty: bool,
     dead_textures: Vec<Texture>,
 }
 
@@ -289,6 +291,7 @@ impl State {
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
+            pointer_dirty: false,
             dead_textures: Vec::new(),
         };
         for (iface, version) in [
@@ -684,6 +687,7 @@ impl State {
             xdg::configure_toplevel(self, key, rect.w, rect.h);
         }
         self.needs_redraw = true;
+        self.pointer_dirty = true;
     }
 
     pub fn fs_mode(&self, key: SKey) -> Option<wm::FsMode> {
