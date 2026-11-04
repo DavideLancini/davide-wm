@@ -41,6 +41,7 @@ pub struct Kms {
     front: Option<usize>,
     pending: Option<usize>,
     modeset: bool,
+    mode_blob: Option<u32>,
 }
 
 fn vec_ptr<T>(v: &mut [T]) -> u64 {
@@ -88,6 +89,7 @@ impl Kms {
             front: None,
             pending: None,
             modeset: true,
+            mode_blob: None,
         };
         for c in &crtcs {
             kms.load_props(*c, drm::OBJECT_CRTC)?;
@@ -300,6 +302,9 @@ impl Kms {
     }
 
     pub fn present(&mut self, idx: usize) -> io::Result<()> {
+        if self.modeset {
+            self.disable_others()?;
+        }
         let Some(o) = &self.output else { return Ok(()) };
         let fb = self.buffers[idx].fb as u64;
         let (w, h) = (o.mode.hdisplay as u64, o.mode.vdisplay as u64);
@@ -319,34 +324,58 @@ impl Kms {
             ],
         )];
         let mut flags = drm::MODE_PAGE_FLIP_EVENT;
-        if self.modeset {
-            let blob = self.create_blob(&o.mode)? as u64;
+        let modeset = self.modeset;
+        if modeset {
+            let blob = self.create_blob(&o.mode)?;
             objs.push((o.connector, vec![("CRTC_ID", o.crtc as u64)]));
-            objs.push((o.crtc, vec![("MODE_ID", blob), ("ACTIVE", 1)]));
-            // Turn off everything else the previous owner may have left on.
-            for c in &self.connectors_all {
-                if *c != o.connector {
-                    objs.push((*c, vec![("CRTC_ID", 0)]));
-                }
-            }
-            for c in &self.crtcs {
-                if *c != o.crtc {
-                    objs.push((*c, vec![("ACTIVE", 0), ("MODE_ID", 0)]));
-                }
-            }
-            for (p, ..) in &self.planes {
-                if *p != o.plane {
-                    objs.push((*p, vec![("FB_ID", 0), ("CRTC_ID", 0)]));
-                }
-            }
+            objs.push((o.crtc, vec![("MODE_ID", blob as u64), ("ACTIVE", 1)]));
             flags |= drm::MODE_ATOMIC_ALLOW_MODESET;
+            let res = self.commit(objs, flags);
+            if let Some(old) = self.mode_blob.replace(blob) {
+                let mut b = drm::DestroyBlob { blob_id: old };
+                let _ = ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_DESTROYPROPBLOB, &mut b);
+            }
+            // A failed modeset leaves nothing on screen: give up instead of
+            // running blind.
+            res.map_err(|e| io::Error::other(format!("modeset failed: {e}")))?;
         } else {
             flags |= drm::MODE_ATOMIC_NONBLOCK;
+            self.commit(objs, flags)?;
         }
-        self.commit(objs, flags)?;
         self.modeset = false;
         self.pending = Some(idx);
         Ok(())
+    }
+
+    /// Turns off what the previous DRM master left on, in its own commit:
+    /// a commit asking for a page-flip event must not contain disabled CRTCs.
+    fn disable_others(&mut self) -> io::Result<()> {
+        let Some(o) = &self.output else { return Ok(()) };
+        let (connector, crtc, plane) = (o.connector, o.crtc, o.plane);
+        let mut objs = Vec::new();
+        for c in self.connectors_all.clone() {
+            if c != connector && self.current(c, drm::OBJECT_CONNECTOR, "CRTC_ID")? != 0 {
+                objs.push((c, vec![("CRTC_ID", 0)]));
+            }
+        }
+        for (p, ..) in self.planes.clone() {
+            if p != plane && (self.current(p, drm::OBJECT_PLANE, "FB_ID")? != 0 || self.current(p, drm::OBJECT_PLANE, "CRTC_ID")? != 0) {
+                objs.push((p, vec![("FB_ID", 0), ("CRTC_ID", 0)]));
+            }
+        }
+        for c in self.crtcs.clone() {
+            if c != crtc && self.current(c, drm::OBJECT_CRTC, "ACTIVE")? != 0 {
+                objs.push((c, vec![("ACTIVE", 0), ("MODE_ID", 0)]));
+            }
+        }
+        if objs.is_empty() {
+            return Ok(());
+        }
+        self.commit(objs, drm::MODE_ATOMIC_ALLOW_MODESET).map_err(|e| io::Error::other(format!("disabling unused outputs failed: {e}")))
+    }
+
+    fn current(&mut self, obj: u32, kind: u32, name: &str) -> io::Result<u64> {
+        Ok(self.load_props(obj, kind)?.get(name).copied().unwrap_or(0))
     }
 
     /// Reads DRM events; returns true when a page flip completed.

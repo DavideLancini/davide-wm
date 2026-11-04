@@ -379,6 +379,9 @@ fn run(nested: bool, session: bool) -> io::Result<()> {
             if let Some(i) = app.backend.acquire(&mut renderer)? {
                 app.state.render(&mut renderer, app.backend.target(i));
                 if let Err(e) = app.backend.present(i) {
+                    if e.to_string().starts_with("modeset failed") {
+                        return Err(e);
+                    }
                     log!("present failed: {e}");
                 }
             }
