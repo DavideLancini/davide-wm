@@ -1,0 +1,14 @@
+[package]
+name = "davide-wm"
+description = "Wayland compositor and tiling window manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+config.workspace = true
+libc.workspace = true
+render.workspace = true
+sys.workspace = true
+wire.workspace = true
+wm.workspace = true

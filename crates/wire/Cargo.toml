@@ -1,0 +1,9 @@
+[package]
+name = "wire"
+description = "Wayland wire protocol: message codec, connections and interface tables generated from the protocol XML files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true

@@ -1,0 +1,6 @@
+[package]
+name = "wm"
+description = "Window management logic independent from Wayland: dwindle tiling and geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

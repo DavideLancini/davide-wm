@@ -1,0 +1,9 @@
+[package]
+name = "config"
+description = "Compile-time configuration of davide-wm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wm.workspace = true

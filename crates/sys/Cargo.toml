@@ -1,0 +1,9 @@
+[package]
+name = "sys"
+description = "Minimal hand-written FFI to libEGL, libGLESv2, libgbm and libxkbcommon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true

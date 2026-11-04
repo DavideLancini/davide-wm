@@ -37,16 +37,16 @@
 > Wayland compositor and tiling window manager written from scratch in Rust, replacing Hyprland on Davide's Arch laptop.
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
-> Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, wayland-server; dwindle layout, compile-time config.
-> Status: **planning — no code yet.** Development starts only once this plan is approved.
+> Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
+> Status: **M0 done** — runs nested inside Hyprland as a window, tiles `foot` windows; M1 (TTY/DRM) next.
 
 | Field | Value |
 |---|---|
-| Doc version | 0.2 |
+| Doc version | 0.3 |
 | Last updated | 2026-11-04 |
 | Owner | Davide Lancini |
-| Project status | idea |
-| Repo | `~/0Projects/davide-wm` (no remote yet) |
+| Project status | development |
+| Repo | https://github.com/DavideLancini/davide-wm |
 
 ---
 
@@ -93,7 +93,7 @@
 *What is NOT negotiable: it narrows the choices. Helps the AI not to propose solutions that are out of scope.*
 
 - **Technical:**
-  - Rust only. Written from scratch: no compositor framework (no smithay, no wlroots). Low-level crates that are thin bindings (wayland-server protocol code, drm ioctls, libinput, xkbcommon, EGL/GL loaders, x11rb) are allowed.
+  - Rust only. Written from scratch: no compositor framework (no smithay, no wlroots). Thin bindings to system libraries are allowed; in practice they are hand-written FFI (ADR-020) and the Wayland protocol is our own (ADR-019).
   - Target: Arch Linux, Huawei MateBook KLVL-WXX9, AMD Renoir (amdgpu, Mesa), eDP-1 2160x1440@60 scale 1; external MSI MAG 273Q 2560x1440@120 (DP-1, 8-bit) and a Hisense TV. Scale 1 everywhere, no HDR, no VRR.
   - No lock screen (blanking with `blk` is enough). No animations, borders, gaps, rounding, blur or shadows.
   - Configuration is compile-time `const`s, like `topbar` and `super`; no config file, no scripting language.
@@ -150,9 +150,9 @@
 | Xwayland | X11 via `x11rb` on a socketpair; `xwayland-shell-v1` | Compositor spawns `Xwayland -rootless -wm <fd>`, sets `DISPLAY`. |
 | Session | logind over D-Bus (`TakeControl`, `TakeDevice`, `PauseDevice`, `ResumeDevice`, `SwitchTo`) | No libseat/seatd. |
 | Devices | DRM ioctls (atomic KMS), GBM, EGL + GLES2; libinput (path backend, fds from logind); netlink uevents for hotplug | |
-| Notifications | D-Bus `org.freedesktop.Notifications` (server side) | Own D-Bus implementation, extended from `topbar/src/dbus.rs`. |
+| Notifications | D-Bus `org.freedesktop.Notifications` (server side) *(planned)* | Own D-Bus implementation, extended from `topbar/src/dbus.rs`. |
 | Screen cast | D-Bus `org.freedesktop.impl.portal.ScreenCast` (+ `Screenshot`), PipeWire stream via libpipewire | `davide-wm.portal` file + `davide-wm-portals.conf` installed under `/usr/share/xdg-desktop-portal/`. |
-| IPC | Unix socket `$XDG_RUNTIME_DIR/davide-wm.sock`, line-based text commands + event stream | For scripts that remain outside; replaces `hyprctl`/socket2. |
+| IPC | Unix socket `$XDG_RUNTIME_DIR/davide-wm.sock`, line-based text commands + event stream *(planned)* | For scripts that remain outside; replaces `hyprctl`/socket2. |
 | Signals | `signalfd`: TERM/INT (clean exit), USR1/USR2 kept for compatibility (bar toggle/refresh) | |
 
 ---
@@ -160,12 +160,12 @@
 ## 4. Solution strategy
 *The fundamental decisions in brief: key technologies, patterns, approach. The condensed "why".*
 
-- **Main stack:** Rust (stable), `wayland-server` (wayland-rs, protocol code only) + `wayland-protocols`, `drm` + `gbm` crates, EGL/GLES2 via thin bindings (`khronos-egl`, `glow`), `input` (libinput), `xkbcommon`, `x11rb`, `pipewire` (libpipewire), `calloop` event loop, `fontdue` for text (already used by topbar and super), `ureq` only on a worker thread.
-- **Architectural patterns:** modular monolith, single-threaded event loop owning all state (`calloop`), with every potentially blocking operation (HTTP, process exec with output, file decoding, D-Bus calls with replies) moved to worker threads that post results back as events. Backends behind a small trait: `drm` (real hardware), `nested` (runs as a window inside an existing Wayland compositor, for development), `headless` (tests and cast outputs).
+- **Main stack:** Rust (stable). The only crate dependency is `libc`. Own Wayland wire protocol (`crates/wire`, tables generated from the vendored XML in `protocols/`, ADR-019); hand-written FFI to libEGL, libGLESv2, libgbm and libxkbcommon (`crates/sys`, ADR-020); own epoll event loop. Planned: libinput and libpipewire through the same kind of FFI, `x11rb` or own X11 code for the XWM, `fontdue` for text (already used by topbar and super).
+- **Architectural patterns:** modular monolith, single-threaded epoll event loop owning all state, with every potentially blocking operation (HTTP, process exec with output, file decoding, D-Bus calls with replies) moved to worker threads that post results back as events. Backends behind a small trait: `drm` (real hardware), `nested` (runs as a window inside an existing Wayland compositor, for development), `headless` (tests and cast outputs).
 - **Key technology decisions:** from scratch instead of smithay/wlroots (ADR-001); GLES2 renderer with direct scanout instead of software compositing (ADR-002); logind directly over D-Bus instead of libseat (ADR-003); compile-time config (ADR-004); topbar/super/dawn code ported as in-process modules (ADR-005); own XWM (ADR-008); own portal backend + PipeWire (ADR-009).
 - **How it meets the quality goals (sec. 1.2):** single process and in-memory state remove IPC, forks and polling (footprint, responsiveness); the non-blocking rule and per-feature panic isolation protect the session (reliability); every replaced daemon is one package less (minimal requirements); explicit modules with no framework and compile-time config keep it readable (maintainability).
 - **Milestones (each one usable before the next starts):**
-  - **M0 — Nested skeleton:** nested backend, `wayland-server` loop, `wl_shm`, `xdg_wm_base`, GLES2 composition, keyboard/pointer, spawn `foot`.
+  - **M0 — Nested skeleton (done 2026-11-04):** nested backend (dmabuf to the host), own wire protocol, `wl_compositor`/`wl_subcompositor`/`wl_shm`/`wl_seat`/`wl_output`/`xdg_wm_base` (toplevels, basic popups)/xdg-decoration (always server-side)/`wl_data_device_manager` stub, GLES composition, dwindle tiling, keyboard (xkb `it`) and pointer, keybinds, spawn `foot`.
   - **M1 — Daily-driver core on a TTY:** logind session, DRM/KMS atomic, libinput, xkb `it`, dmabuf, cursor, dwindle, workspaces/keybinds parity with `hyprland.lua`, maximize/fullscreen, multi-monitor hotplug, clipboard + primary selection, xdg-activation, system bell, idle inhibit, VT switching, IPC socket.
   - **M1b — Live upgrade:** in-place re-exec with state and fd handover (ADR-014), so every later milestone is deployed without closing windows. State is designed for handover from M0 on.
   - **M2 — Bar:** port `topbar` (rendering into a compositor-owned surface, workspace state read directly).
@@ -185,56 +185,51 @@
 ### 5.1 Level 1 — the system as a whole
 *A box diagram of the main modules/components and their responsibilities.*
 
-All paths are **planned**: nothing exists yet besides this README. Cargo workspace (ADR-015): one library crate per building block under `crates/`, one binary crate that wires them together. Update the table as crates are created.
+Cargo workspace (ADR-015): one library crate per building block under `crates/`, one binary crate that wires them together. Rows marked *(planned)* do not exist yet; the Wayland server currently lives inside the binary crate (`crates/davide-wm/src/server/`) and moves to its own crate when it grows. Update the table as crates are created.
 
 | Building block | Responsibility | Path |
 |----------------|----------------|------|
-| Binary / event loop | startup, backend selection, calloop loop, signals, crash handling, worker-thread pool, live upgrade orchestration | `crates/davide-wm/` |
-| Config | all settings as `const`s: keybinds, window rules, monitor rules, colors, fonts, paths | `crates/config/` |
-| State / handover | serialisable state types, fd table, versioned upgrade blob | `crates/state/` |
-| Backends | `drm` (KMS, GBM, logind session, libinput, uevents), `nested`, `headless` | `crates/backend/` |
-| Renderer | EGL/GLES2, texture import (shm, dmabuf), damage, scanout planes, text/icon drawing | `crates/render/` |
-| Wayland server | globals and protocol handlers, client/surface state | `crates/protocols/` |
-| Window manager | workspaces, dwindle tree, focus, rules, fullscreen/maximize, urgency, keybind actions | `crates/wm/` |
-| Outputs | output model, monitor rules, DPMS, idle blanking, blk, lid, headless outputs, wallpaper | `crates/outputs/` |
-| Bar | ported topbar widgets and layout | `crates/bar/` |
-| Launcher | ported super (apps, bookmarks, calc) | `crates/launcher/` |
-| Clipboard | selections, persisted history, picker, data-control | `crates/clipboard/` |
+| Binary / event loop | startup, epoll loop, signals, socket, keybind dispatch, spawning; later backend selection, crash handling, worker threads, live upgrade | `crates/davide-wm/src/main.rs`, `event_loop.rs`, `keyboard.rs` |
+| Wire protocol | message codec, connections with fd passing, interface tables and opcode constants generated at build time from `protocols/*.xml` | `crates/wire/` |
+| System FFI | hand-written bindings: EGL, GLES, GBM, xkbcommon | `crates/sys/` |
+| Config | all settings as `const`s: keybinds, colors, keyboard layout, render node; later window and monitor rules, fonts, paths | `crates/config/` |
+| State / handover *(planned)* | serialisable state types, fd table, versioned upgrade blob | `crates/state/` |
+| Backends | `nested` done (`crates/davide-wm/src/nested.rs`); `drm` (KMS, GBM, logind session, libinput, uevents) and `headless` *(planned)* | `crates/backend/` *(planned)* |
+| Renderer | EGL on GBM (surfaceless GLES 3 context), render targets exported as dmabufs, shm texture upload, solid/textured quads, scissor clip; later dmabuf import, damage, scanout planes, text | `crates/render/` |
+| Wayland server | clients and object maps, globals, protocol handlers (core, seat/output/focus, xdg-shell), surface tree, rendering of the scene | `crates/davide-wm/src/server/` |
+| Window manager | dwindle tree, directional neighbours, `Rect`; later workspaces, rules, fullscreen/maximize, urgency | `crates/wm/` |
+| Outputs | output model, monitor rules, DPMS, idle blanking, blk, lid, headless outputs, wallpaper *(planned)* | `crates/outputs/` |
+| Bar | ported topbar widgets and layout *(planned)* | `crates/bar/` |
+| Launcher | ported super (apps, bookmarks, calc) *(planned)* | `crates/launcher/` |
+| Clipboard | selections, persisted history, picker, data-control *(planned)* | `crates/clipboard/` |
 | Notifications | D-Bus notification server, popups, panel | `crates/notifications/` |
-| XWM | Xwayland process + X11 window management | `crates/xwayland/` |
-| Screen cast / screenshots | portal backend, PipeWire streams, screenshot taker | `crates/screencast/` |
-| D-Bus | own minimal client/server (SASL EXTERNAL, marshalling, names, signals) | `crates/dbus/` |
+| XWM | Xwayland process + X11 window management *(planned)* | `crates/xwayland/` |
+| Screen cast / screenshots | portal backend, PipeWire streams, screenshot taker *(planned)* | `crates/screencast/` |
+| D-Bus | own minimal client/server (SASL EXTERNAL, marshalling, names, signals) *(planned)* | `crates/dbus/` |
 | IPC | Unix socket commands and event stream, `davide-wm msg` CLI | `crates/ipc/` |
-| Process exec | detached spawn (`setsid`, close fds), helpers with timeouts | `crates/exec/` |
+| Process exec | detached spawn (`setsid`, close fds), helpers with timeouts *(planned)* | `crates/exec/` |
 
 ### 5.2 Directory structure
 ```
-davide-wm/                  (planned)
-├── Cargo.toml              # workspace
+davide-wm/
+├── Cargo.toml              # workspace; release profile
 ├── README.md               # this file
-├── run.sh                  # build + install + live upgrade (same pattern as topbar/super)
-├── assets/                 # embedded font subset with icons (from topbar/super)
-├── dist/                   # portal files, systemd user units
-├── tools/                  # font/icon build scripts (from topbar)
+├── protocols/              # vendored protocol XML (wayland, xdg-shell, xdg-decoration, linux-dmabuf)
 └── crates/
-    ├── davide-wm/          # binary: main.rs, event_loop.rs, crash.rs, upgrade.rs
-    ├── config/
-    ├── state/
-    ├── backend/            # drm/, nested.rs, headless.rs, session.rs (logind), input.rs
-    ├── render/             # gles.rs, dmabuf.rs, damage.rs, text.rs
-    ├── protocols/          # one module per protocol family
-    ├── wm/                 # workspace.rs, dwindle.rs, focus.rs, rules.rs, actions.rs
-    ├── outputs/            # rules.rs, dpms.rs, idle.rs, blk.rs, lid.rs, wallpaper.rs
-    ├── bar/                # widgets ported from topbar/src/modules/
-    ├── launcher/           # apps.rs, calc.rs, bookmarks.rs (from super)
-    ├── clipboard/
-    ├── notifications/
-    ├── xwayland/
-    ├── screencast/
-    ├── dbus/
-    ├── ipc/
-    └── exec/
+    ├── davide-wm/          # binary
+    │   └── src/
+    │       ├── main.rs         # startup, socket, epoll loop, keybinds, spawn
+    │       ├── event_loop.rs   # epoll + signalfd
+    │       ├── keyboard.rs     # xkb keymap/state, keymap memfd
+    │       ├── nested.rs       # nested backend (client of the host compositor)
+    │       └── server/         # mod.rs (state, clients, render), compositor.rs, seat.rs, xdg.rs
+    ├── wire/               # build.rs generates interface tables from protocols/
+    ├── sys/                # egl.rs, gl.rs, gbm.rs, xkb.rs
+    ├── render/
+    ├── wm/
+    └── config/
 ```
+Planned additions: `run.sh`, `assets/`, `dist/`, `tools/` and the crates marked *(planned)* in sec. 5.1.
 
 ### 5.3 Level 2 — detail of the relevant building blocks
 *Expand only the blocks that are not obvious. (Repeat for each one.)*
@@ -280,7 +275,7 @@ davide-wm/                  (planned)
 ### Scenario: "Blocking work"
 1. A bar widget needs a slow result (Spotify HTTP, helper process, MEGA).
 2. The request goes to a worker thread with a timeout; the main loop keeps running and the widget keeps its old value.
-3. The result comes back through a calloop channel and triggers a redraw only if the text or colour changed.
+3. The result comes back through a channel watched by the event loop and triggers a redraw only if the text or colour changed.
 
 ---
 
@@ -289,7 +284,7 @@ davide-wm/                  (planned)
 
 | Environment | Infrastructure | Notes |
 |-------------|----------------|-------|
-| dev | nested backend inside the running Hyprland session; headless backend for automated tests | No risk to the working session; DRM tests on a second TTY. |
+| dev | nested backend inside the running Hyprland session (`cargo run -p davide-wm`, then `WAYLAND_DISPLAY=<socket printed at startup> foot`); headless backend for automated tests later | Main modifier is Alt when nested (Super belongs to Hyprland): Alt+T terminal, Alt+Q close, Alt+arrows focus, Alt+Shift+E exit. No risk to the working session; DRM tests on a second TTY. |
 | prod | the laptop, started from a TTY login (`davide-wm`), DRM backend | Hyprland stays as fallback until switch-over. |
 
 - **Build/CI-CD:** `cargo build --release` (opt-level, LTO, strip, panic handling decided in ADR-006); `run.sh` installs the binary to `~/7Scripts/davide-wm` and the portal/unit files from `dist/`. No CI.
@@ -334,6 +329,10 @@ davide-wm/                  (planned)
 | 16 | Own screenshot taker without annotations | accepted | 2026-11-04 | Much simpler than an editor; replaces grim, slurp and swappy. |
 | 17 | No system tray (StatusNotifier host) | accepted | 2026-11-04 | nm-applet's icon is dropped; network status is already in the bar. |
 | 18 | Clipboard history persisted across reboots | accepted | 2026-11-04 | Same behaviour as cliphist today. |
+| 19 | Own Wayland wire protocol implementation instead of libwayland/wayland-rs | accepted | 2026-11-04 | Live upgrade needs full ownership of client object maps and ids; libraries hide them. Tables are generated from the XML. |
+| 20 | Hand-written FFI to C libraries, `libc` as the only crate | accepted | 2026-11-04 | Few functions are needed; no binding crates to track; fits the from-scratch rule. Supersedes the crate list in sec. 4. |
+| 21 | Nested backend renders through GBM and hands dmabufs to the host | accepted | 2026-11-04 | Same render path as the future DRM backend; no libwayland-client or wl_egl_window needed. |
+| 22 | Client buffers are uploaded at render time, then released | accepted | 2026-11-04 | Protocol handling never touches GL; only the render step needs the renderer. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
@@ -391,6 +390,8 @@ davide-wm/                  (planned)
 | Some current behaviour depends on Hyprland specifics (MSI black overlay window, `eval` rules, socket2 consumers) | Regressions after switch-over | Inventory `~/0Projects/dawn/crates/` in detail before M4. |
 | Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, round-trip tests (serialise → restore → compare) in CI-less `cargo test`, automatic fallback to `davide-wm.prev`. |
 | One huge project, always built together | Long builds, harder refactors | Cargo workspace (ADR-015), clear crate boundaries, live upgrade makes deploying cheap. |
+| shm pools are read through `mmap`: a client that truncates its file can trigger SIGBUS | Compositor crash | Install a SIGBUS handler that maps zero pages over the faulty pool (as libwayland does) before daily use (M1). |
+| M0 simplifications | Visual glitches with some clients | Subsurfaces are always desynchronised, popups have no constraint adjustment or grabs, full redraw every frame, no damage tracking, buffer scale 1 only. All to fix in M1. |
 | Open questions | Plan may change | Whether to keep layer-shell for any external client. |
 
 ---

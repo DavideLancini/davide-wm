@@ -1,0 +1,10 @@
+[package]
+name = "render"
+description = "GLES renderer on EGL/GBM: render targets exported as dmabufs, textures, quads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+sys.workspace = true
