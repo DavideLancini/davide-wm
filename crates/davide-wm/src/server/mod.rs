@@ -6,6 +6,7 @@
 mod compositor;
 mod dmabuf;
 mod misc;
+mod persist;
 pub mod seat;
 mod selection;
 pub mod workspaces;
@@ -109,7 +110,8 @@ pub struct Pending {
 pub enum Role {
     None,
     Cursor,
-    Subsurface { parent: u32, x: i32, y: i32 },
+    /// `sync`: state is applied when the parent commits (the default).
+    Subsurface { parent: u32, x: i32, y: i32, sync: bool },
     Xdg,
 }
 
@@ -138,6 +140,8 @@ pub enum Content {
 
 pub struct Surface {
     pub pending: Pending,
+    /// State committed by a synchronised subsurface, waiting for the parent.
+    pub cached: Option<Pending>,
     /// Committed buffer not uploaded yet.
     pub upload: Option<u32>,
     pub content: Content,
@@ -710,7 +714,31 @@ impl State {
         }
     }
 
+    /// Imports dmabufs that are shown but have no texture yet (after a live upgrade).
+    fn import_shown_dmabufs(&mut self, r: &mut Renderer) {
+        let shown: Vec<SKey> = self
+            .surfaces
+            .iter()
+            .filter_map(|(k, s)| match s.content {
+                Content::Dmabuf(id) => Some(SKey { client: k.client, id }),
+                _ => None,
+            })
+            .collect();
+        for key in shown {
+            if let Some(Buffer::Dmabuf { width, height, format, modifier, planes, tex: tex @ None, failed: failed @ false }) = self.buffers.get_mut(&key) {
+                match r.import_dmabuf(*width, *height, *format, *modifier, planes) {
+                    Ok(t) => *tex = Some(t),
+                    Err(e) => {
+                        log!("client {}: {e}", key.client);
+                        *failed = true;
+                    }
+                }
+            }
+        }
+    }
+
     fn upload_buffers(&mut self, r: &mut Renderer) {
+        self.import_shown_dmabufs(r);
         let keys: Vec<SKey> = self.surfaces.iter().filter(|(_, s)| s.upload.is_some()).map(|(k, _)| *k).collect();
         for key in keys {
             let bid = self.surfaces.get_mut(&key).unwrap().upload.take().unwrap();

@@ -1,0 +1,9 @@
+[package]
+name = "state"
+description = "Serialisation of the compositor state for the live upgrade: binary encoder, fd passing across exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true

@@ -65,6 +65,20 @@ impl Socket {
     }
 }
 
+impl state::Persist for Socket {
+    fn save(&self, e: &mut state::Enc) {
+        state::save_fd(&self.listener, e);
+        state::save_fd(&self._lock, e);
+        (self.name.clone(), self.path.to_string_lossy().into_owned(), self.lock_path.to_string_lossy().into_owned()).save(e);
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        let listener = UnixListener::from(OwnedFd::load(d)?);
+        let lock = File::from(OwnedFd::load(d)?);
+        let (name, path, lock_path): (String, String, String) = state::Persist::load(d)?;
+        Ok(Socket { listener, name, path: path.into(), lock_path: lock_path.into(), _lock: lock })
+    }
+}
+
 impl Drop for Socket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -113,6 +127,9 @@ struct App {
     /// Keys that triggered a binding: their release is not forwarded.
     swallowed: Vec<u32>,
     running: bool,
+    upgrade: bool,
+    /// Exports the environment to systemd (`--session`).
+    session: bool,
 }
 
 impl App {
@@ -176,6 +193,7 @@ impl App {
                     d.switch_vt(vt);
                 }
             }
+            Action::Upgrade => self.upgrade = true,
             Action::Exit => self.running = false,
         }
     }
@@ -209,6 +227,7 @@ impl App {
                 workspaces::switch(s, ws);
                 seat::set_focus(s, Some(key));
             }
+            ipc::Command::Upgrade => self.upgrade = true,
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -237,21 +256,63 @@ impl App {
     }
 }
 
-fn run(nested: bool, session: bool) -> io::Result<()> {
+/// Everything the event loop works with.
+struct Ctx {
+    app: App,
+    renderer: Renderer,
+    ep: Epoll,
+    worker: worker::Worker,
+    _signals: OwnedFd,
+    /// The binary to exec on a live upgrade (as it was when we started).
+    exe: PathBuf,
+}
+
+fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool) -> App {
+    App { backend, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), running: true, upgrade: false, session }
+}
+
+/// Registers every fd with a fresh epoll and starts background jobs.
+fn finish(app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     let signals = event_loop::signal_fd()?;
-    server::install_sigbus_handler();
-    let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
     let ep = Epoll::new()?;
+    let worker = worker::Worker::new()?;
+    match &app.backend {
+        Backend::Nested(n) => ep.add(n.raw_fd(), TOKEN_HOST)?,
+        Backend::Drm(d) => {
+            for (fd, token) in d.fds().into_iter().zip([TOKEN_KMS, TOKEN_INPUT, TOKEN_LOGIND, TOKEN_UEVENT]) {
+                ep.add(fd, token)?;
+            }
+        }
+    }
+    ep.add(app.socket.listener.as_raw_fd(), TOKEN_LISTENER)?;
+    ep.add(signals.as_raw_fd(), TOKEN_SIGNAL)?;
+    ep.add(app.ipc.listener.as_raw_fd(), TOKEN_IPC)?;
+    ep.add(worker.raw_fd(), TOKEN_WORKER)?;
+    for (id, fd) in app.state.client_fds() {
+        ep.add(fd, TOKEN_CLIENT + id as u64)?;
+    }
+    if app.state.wallpaper.is_none() && !WALLPAPER.is_empty() {
+        worker.run(|| {
+            let mut img = jpeg::decode(WALLPAPER).map_err(|e| e.to_string())?;
+            let (mw, mh) = config::WALLPAPER_MIN_SIZE;
+            while img.width / 2 >= mw && img.height / 2 >= mh {
+                img = jpeg::halve(&img);
+            }
+            Ok(worker::Done::Wallpaper(img))
+        });
+    }
+    keep_previous_binary();
+    Ok(Ctx { app, renderer, ep, worker, _signals: signals, exe })
+}
+
+fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
+    let exe = std::env::current_exe()?;
+    let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
     let (mut renderer, backend, main_mod) = if nested {
         let renderer = Renderer::new(config::RENDER_NODE).map_err(io::Error::other)?;
-        let host = Nested::connect()?;
-        ep.add(host.raw_fd(), TOKEN_HOST)?;
-        (renderer, Backend::Nested(host), mods::ALT)
+        (renderer, Backend::Nested(Nested::connect()?), mods::ALT)
     } else {
         let (drm, renderer) = Drm::open()?;
-        for (fd, token) in drm.fds().into_iter().zip([TOKEN_KMS, TOKEN_INPUT, TOKEN_LOGIND, TOKEN_UEVENT]) {
-            ep.add(fd, token)?;
-        }
         (renderer, Backend::Drm(drm), mods::SUPER)
     };
     let (w, h) = match &backend {
@@ -262,26 +323,8 @@ fn run(nested: bool, session: bool) -> io::Result<()> {
     let socket = Socket::bind()?;
     let ipc = ipc::Ipc::bind(&socket.name)?;
     log!("listening on {}", socket.name);
-
-    let worker = worker::Worker::new()?;
-    if !WALLPAPER.is_empty() {
-        worker.run(|| {
-            let mut img = jpeg::decode(WALLPAPER).map_err(|e| e.to_string())?;
-            let (mw, mh) = config::WALLPAPER_MIN_SIZE;
-            while img.width / 2 >= mw && img.height / 2 >= mh {
-                img = jpeg::halve(&img);
-            }
-            Ok(worker::Done::Wallpaper(img))
-        });
-    }
-
-    ep.add(socket.listener.as_raw_fd(), TOKEN_LISTENER)?;
-    ep.add(signals.as_raw_fd(), TOKEN_SIGNAL)?;
-    ep.add(ipc.listener.as_raw_fd(), TOKEN_IPC)?;
-    ep.add(worker.raw_fd(), TOKEN_WORKER)?;
-
     let state = State::new(keyboard, output, renderer.dmabuf_formats());
-    let mut app = App { backend, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), running: true };
+    let mut app = new_app(backend, state, socket, ipc, main_mod, session);
     if let Backend::Drm(d) = &mut app.backend {
         for e in d.setup_output(&mut renderer)? {
             app.backend_event(e);
@@ -297,7 +340,151 @@ fn run(nested: bool, session: bool) -> io::Result<()> {
     for line in config::AUTOSTART {
         app.spawn(line);
     }
-    while app.running {
+    finish(app, renderer, exe)
+}
+
+/// Bumped when the blob layout changes incompatibly; an older blob is then
+/// handed back to the previous binary.
+const BLOB_FORMAT: u32 = 1;
+
+fn prev_binary() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("davide-wm-prev"))
+}
+
+/// Keeps a copy of the running binary, to fall back to if a newer one
+/// cannot restore the state.
+fn keep_previous_binary() {
+    let Some(prev) = prev_binary() else { return };
+    let tmp = prev.with_extension("tmp");
+    if std::fs::copy("/proc/self/exe", &tmp).and_then(|_| std::fs::rename(&tmp, &prev)).is_err() {
+        log!("cannot keep a copy of the binary in {}", prev.display());
+    }
+}
+
+fn encode(ctx: Ctx) -> state::Enc {
+    use state::Persist;
+    let Ctx { app, mut renderer, exe, .. } = ctx;
+    let mut e = state::Enc::default();
+    BLOB_FORMAT.save(&mut e);
+    (app.session, app.main_mod, exe.to_string_lossy().into_owned()).save(&mut e);
+    app.socket.save(&mut e);
+    app.ipc.save(&mut e);
+    match app.backend {
+        Backend::Nested(n) => {
+            0u8.save(&mut e);
+            let saved = n.save();
+            saved.save(&mut e);
+            std::mem::forget(saved);
+        }
+        Backend::Drm(d) => {
+            1u8.save(&mut e);
+            let saved = d.save();
+            saved.save(&mut e);
+            std::mem::forget(saved);
+        }
+    }
+    app.state.save(&mut e, &mut renderer);
+    // Their fds now belong to the blob.
+    std::mem::forget(app.state);
+    std::mem::forget(app.socket);
+    std::mem::forget(app.ipc);
+    e
+}
+
+fn decode(blob: &[u8]) -> io::Result<Ctx> {
+    use state::Persist;
+    let err = |e: state::Error| io::Error::other(e.to_string());
+    let mut d = state::Dec::new(blob);
+    let format = u32::load(&mut d).map_err(err)?;
+    if format != BLOB_FORMAT {
+        return Err(io::Error::other(format!("state blob format {format}, this binary reads {BLOB_FORMAT}")));
+    }
+    let (session, main_mod, exe): (bool, u32, String) = Persist::load(&mut d).map_err(err)?;
+    let socket = Socket::load(&mut d).map_err(err)?;
+    let ipc = ipc::Ipc::load(&mut d).map_err(err)?;
+    let (backend, mut renderer) = match u8::load(&mut d).map_err(err)? {
+        0 => {
+            let n = Nested::restore(Persist::load(&mut d).map_err(err)?)?;
+            (Backend::Nested(n), Renderer::new(config::RENDER_NODE).map_err(io::Error::other)?)
+        }
+        _ => {
+            let (drm, r) = Drm::restore(Persist::load(&mut d).map_err(err)?)?;
+            (Backend::Drm(drm), r)
+        }
+    };
+    let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
+    let formats = renderer.dmabuf_formats();
+    let state = State::restore(&mut d, keyboard, formats, &mut renderer).map_err(err)?;
+    let app = new_app(backend, state, socket, ipc, main_mod, session);
+    log!("live upgrade done");
+    finish(app, renderer, PathBuf::from(exe))
+}
+
+fn exec_with_blob(exe: &std::path::Path, fd: i32) -> io::Error {
+    use std::ffi::CString;
+    let path = CString::new(exe.as_os_str().as_encoded_bytes()).unwrap_or_default();
+    let args = [c"davide-wm".to_owned(), c"--resume".to_owned(), CString::new(fd.to_string()).unwrap()];
+    let argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect();
+    unsafe { libc::execv(path.as_ptr(), argv.as_ptr()) };
+    io::Error::last_os_error()
+}
+
+/// Replaces the running binary with the newly built one, keeping every
+/// client connected. Returns only if the exec failed, with the state
+/// restored in this process.
+fn upgrade(ctx: Ctx) -> io::Result<Ctx> {
+    let exe = ctx.exe.clone();
+    log!("live upgrade to {}", exe.display());
+    let e = encode(ctx);
+    let blob = std::fs::File::from(memfd(&e.buf)?);
+    let err = exec_with_blob(&exe, blob.as_raw_fd());
+    log!("live upgrade failed: {err}; staying on the running binary");
+    decode(&e.buf)
+}
+
+fn memfd(data: &[u8]) -> io::Result<OwnedFd> {
+    use std::io::Write;
+    let fd = unsafe { libc::memfd_create(c"davide-wm-state".as_ptr(), 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut f = std::fs::File::from(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    f.write_all(data)?;
+    Ok(OwnedFd::from(f))
+}
+
+/// Started by a live upgrade: the state blob is in memfd `fd`.
+fn resume(fd: i32) -> io::Result<Ctx> {
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::from(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    }
+    f.rewind()?;
+    let mut blob = Vec::new();
+    f.read_to_end(&mut blob)?;
+    match decode(&blob) {
+        Ok(ctx) => Ok(ctx),
+        Err(e) => {
+            log!("cannot restore the state: {e}");
+            let Some(prev) = prev_binary().filter(|p| p.exists()) else { return Err(e) };
+            log!("falling back to {}", prev.display());
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+            let fd = f.as_raw_fd();
+            std::mem::forget(f);
+            Err(exec_with_blob(&prev, fd))
+        }
+    }
+}
+
+/// Runs until exit, or until a live upgrade is requested.
+fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
+    let Ctx { app, renderer, ep, worker, .. } = ctx;
+    while app.running && !app.upgrade {
         for (token, events) in ep.wait(-1)? {
             let mut backend_events = Vec::new();
             match token {
@@ -352,7 +539,7 @@ fn run(nested: bool, session: bool) -> io::Result<()> {
                         backend_events = d.dispatch_logind()?;
                         app.state.needs_redraw = true;
                     }
-                    (Backend::Drm(d), _) => backend_events = d.dispatch_uevent(&mut renderer)?,
+                    (Backend::Drm(d), _) => backend_events = d.dispatch_uevent(renderer)?,
                 },
                 t => {
                     let id = (t - TOKEN_CLIENT) as ClientId;
@@ -376,12 +563,13 @@ fn run(nested: bool, session: bool) -> io::Result<()> {
             app.state.remove_client(id);
         }
         if app.state.needs_redraw {
-            if let Some(i) = app.backend.acquire(&mut renderer)? {
-                app.state.render(&mut renderer, app.backend.target(i));
+            if let Some(i) = app.backend.acquire(renderer)? {
+                app.state.render(renderer, app.backend.target(i));
                 if let Err(e) = app.backend.present(i) {
                     if e.to_string().starts_with("modeset failed") {
                         return Err(e);
                     }
+                    // Expected while switching VT: logind has already revoked DRM master.
                     log!("present failed: {e}");
                 }
             }
@@ -398,16 +586,31 @@ fn run(nested: bool, session: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn run(mut ctx: Ctx) -> io::Result<()> {
+    loop {
+        run_loop(&mut ctx)?;
+        if !ctx.app.upgrade {
+            return Ok(());
+        }
+        ctx = upgrade(ctx)?;
+    }
+}
+
 fn main() {
+    server::install_sigbus_handler();
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("msg") => ipc::client(&args[2..]),
         Some("outputs") => backend::describe_outputs().map(|s| print!("{s}")),
-        Some("--nested") => run(true, false),
-        Some("--drm") => run(false, false),
+        Some("--resume") => match args.get(2).and_then(|f| f.parse().ok()) {
+            Some(fd) => resume(fd).and_then(run),
+            None => Err(io::Error::other("--resume needs the state fd")),
+        },
+        Some("--nested") => fresh(true, false).and_then(run),
+        Some("--drm") => fresh(false, false).and_then(run),
         // The real session: also exports the environment to systemd and D-Bus.
-        Some("--session") => run(false, true),
-        None => run(std::env::var_os("WAYLAND_DISPLAY").is_some(), false),
+        Some("--session") => fresh(false, true).and_then(run),
+        None => fresh(std::env::var_os("WAYLAND_DISPLAY").is_some(), false).and_then(run),
         Some(other) => Err(io::Error::other(format!("unknown argument {other}; use msg, outputs, --nested, --drm or --session"))),
     };
     if let Err(e) = result {

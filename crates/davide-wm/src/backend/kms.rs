@@ -28,6 +28,8 @@ pub struct Output {
 struct ScanBuffer {
     target: Target,
     fb: u32,
+    /// GEM handle of the imported buffer on the KMS fd.
+    handle: u32,
 }
 
 pub struct Kms {
@@ -42,6 +44,33 @@ pub struct Kms {
     pending: Option<usize>,
     modeset: bool,
     mode_blob: Option<u32>,
+    /// Framebuffers left by the process before a live upgrade, freed after
+    /// the first page flip of this one.
+    stale: Vec<(u32, u32)>,
+}
+
+/// What survives a live upgrade.
+pub struct Saved {
+    pub fd: OwnedFd,
+    pub output: Option<Output>,
+    pub mode_blob: Option<u32>,
+    pub stale: Vec<(u32, u32)>,
+}
+
+state::persist_struct!(Saved { fd, output, mode_blob, stale });
+
+impl state::Persist for Output {
+    fn save(&self, e: &mut state::Enc) {
+        let mode: [u8; std::mem::size_of::<ModeInfo>()] = unsafe { std::mem::transmute(self.mode) };
+        (self.connector, self.crtc, self.plane, self.name.clone()).save(e);
+        state::save_bytes(&mode, e);
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        let (connector, crtc, plane, name) = state::Persist::load(d)?;
+        let bytes = state::load_bytes(d)?;
+        let bytes: [u8; std::mem::size_of::<ModeInfo>()] = bytes.try_into().map_err(|_| state::Error("bad mode".into()))?;
+        Ok(Output { connector, crtc, plane, mode: unsafe { std::mem::transmute::<[u8; std::mem::size_of::<ModeInfo>()], ModeInfo>(bytes) }, name })
+    }
 }
 
 fn vec_ptr<T>(v: &mut [T]) -> u64 {
@@ -90,6 +119,7 @@ impl Kms {
             pending: None,
             modeset: true,
             mode_blob: None,
+            stale: Vec::new(),
         };
         for c in &crtcs {
             kms.load_props(*c, drm::OBJECT_CRTC)?;
@@ -237,23 +267,39 @@ impl Kms {
         Ok(b.blob_id)
     }
 
-    fn add_fb(&self, t: &Target) -> io::Result<u32> {
+    /// Imports a buffer allocated on the render node and wraps it in a framebuffer.
+    fn add_fb(&self, t: &Target) -> io::Result<(u32, u32)> {
+        let dmabuf = t.export_fd().map_err(io::Error::other)?;
+        let mut prime = drm::PrimeHandle { fd: dmabuf.as_raw_fd(), ..Default::default() };
+        ioctl(self.fd.as_raw_fd(), drm::IOCTL_PRIME_FD_TO_HANDLE, &mut prime)?;
         let mut cmd = drm::FbCmd2 { width: t.width as u32, height: t.height as u32, pixel_format: t.format, ..Default::default() };
-        cmd.handles[0] = t.handle();
+        cmd.handles[0] = prime.handle;
         cmd.pitches[0] = t.stride;
         cmd.offsets[0] = t.offset;
         if t.modifier != render::MOD_INVALID {
             cmd.flags = drm::MODE_FB_MODIFIERS;
             cmd.modifier[0] = t.modifier;
         }
-        ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_ADDFB2, &mut cmd)?;
-        Ok(cmd.fb_id)
+        if let Err(e) = ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_ADDFB2, &mut cmd) {
+            self.free_fb(0, prime.handle);
+            return Err(e);
+        }
+        Ok((cmd.fb_id, prime.handle))
+    }
+
+    fn free_fb(&self, fb: u32, handle: u32) {
+        let raw = self.fd.as_raw_fd();
+        if fb != 0 {
+            let mut fb = fb;
+            let _ = ioctl(raw, drm::IOCTL_MODE_RMFB, &mut fb);
+        }
+        let mut close = drm::GemClose { handle, pad: 0 };
+        let _ = ioctl(raw, drm::IOCTL_GEM_CLOSE, &mut close);
     }
 
     fn drop_buffers(&mut self, r: &mut Renderer) {
-        for b in self.buffers.drain(..) {
-            let mut fb = b.fb;
-            let _ = ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_RMFB, &mut fb);
+        for b in std::mem::take(&mut self.buffers) {
+            self.free_fb(b.fb, b.handle);
             r.destroy_target(b.target);
         }
         self.front = None;
@@ -267,8 +313,8 @@ impl Kms {
             self.drop_buffers(r);
             for _ in 0..2 {
                 let target = r.create_target(size.0, size.1, sys::gbm::BO_USE_SCANOUT).map_err(io::Error::other)?;
-                let fb = self.add_fb(&target)?;
-                self.buffers.push(ScanBuffer { target, fb });
+                let (fb, handle) = self.add_fb(&target)?;
+                self.buffers.push(ScanBuffer { target, fb, handle });
             }
         }
         log!(
@@ -396,8 +442,31 @@ impl Kms {
             if let Some(p) = self.pending.take() {
                 self.front = Some(p);
             }
+            for (fb, handle) in std::mem::take(&mut self.stale) {
+                self.free_fb(fb, handle);
+            }
         }
         flipped
+    }
+
+    /// Hands the device over to the next process; the current framebuffers
+    /// stay on screen until it presents its first frame.
+    pub fn save(mut self) -> Saved {
+        let mut stale = std::mem::take(&mut self.stale);
+        stale.extend(self.buffers.iter().map(|b| (b.fb, b.handle)));
+        // The targets live on the render node, which closes with the process.
+        self.buffers.clear();
+        Saved { fd: self.fd, output: self.output, mode_blob: self.mode_blob, stale }
+    }
+
+    pub fn restore(saved: Saved, r: &mut Renderer) -> io::Result<Kms> {
+        let mut kms = Kms::new(saved.fd)?;
+        kms.mode_blob = saved.mode_blob;
+        kms.stale = saved.stale;
+        if let Some(o) = saved.output {
+            kms.set_output(o, r)?;
+        }
+        Ok(kms)
     }
 
     /// Prints connectors and modes (works without DRM master).

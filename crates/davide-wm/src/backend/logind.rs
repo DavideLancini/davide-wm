@@ -27,6 +27,8 @@ pub struct Logind {
     seat: String,
 }
 
+state::persist_struct!(Logind { bus, session, seat });
+
 fn err(e: dbus::Error) -> io::Error {
     io::Error::other(e.to_string())
 }

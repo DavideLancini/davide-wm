@@ -29,6 +29,19 @@ impl Ipc {
     }
 }
 
+impl state::Persist for Ipc {
+    fn save(&self, e: &mut state::Enc) {
+        state::save_fd(&self.listener, e);
+        self.path.to_string_lossy().into_owned().save(e);
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        use state::Persist;
+        let listener = UnixListener::from(std::os::fd::OwnedFd::load(d)?);
+        let path: String = Persist::load(d)?;
+        Ok(Ipc { listener, path: path.into() })
+    }
+}
+
 impl Drop for Ipc {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -41,6 +54,7 @@ pub enum Command {
     Close,
     Windows,
     FocusApp(String),
+    Upgrade,
     Exit,
 }
 
@@ -68,8 +82,9 @@ fn parse(line: &str) -> Result<Command, String> {
         "close" => Ok(Command::Close),
         "windows" => Ok(Command::Windows),
         "focus-app" if !arg.is_empty() => Ok(Command::FocusApp(arg.to_string())),
+        "upgrade" => Ok(Command::Upgrade),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, exit".into()),
     }
 }
 

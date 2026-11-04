@@ -254,3 +254,6 @@ pub fn focus_changed(s: &mut State, c: ClientId) {
     offer_to_client(s, c, Which::Clipboard);
     offer_to_client(s, c, Which::Primary);
 }
+
+state::persist_struct!(Selection { source, mimes, generation });
+state::persist_struct!(Selections { clipboard, primary, mimes });

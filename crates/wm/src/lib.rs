@@ -238,6 +238,80 @@ pub fn neighbor<T: Copy + PartialEq>(layout: &[(T, Rect)], from: T, dir: Directi
         .map(|(t, _)| *t)
 }
 
+use state::{persist_struct, Dec, Enc, Persist};
+
+persist_struct!(Rect { x, y, w, h });
+
+impl Persist for WsId {
+    fn save(&self, e: &mut Enc) {
+        match self {
+            WsId::Num(n) => (0u8, *n).save(e),
+            WsId::Chat => (1u8, 0u32).save(e),
+            WsId::Special => (2u8, 0u32).save(e),
+        }
+    }
+    fn load(d: &mut Dec) -> state::Result<Self> {
+        Ok(match <(u8, u32)>::load(d)? {
+            (0, n) => WsId::Num(n),
+            (1, _) => WsId::Chat,
+            _ => WsId::Special,
+        })
+    }
+}
+
+impl Persist for FsMode {
+    fn save(&self, e: &mut Enc) {
+        (*self == FsMode::Fullscreen).save(e)
+    }
+    fn load(d: &mut Dec) -> state::Result<Self> {
+        Ok(if bool::load(d)? { FsMode::Fullscreen } else { FsMode::Maximized })
+    }
+}
+
+impl<T: Persist> Persist for Node<T> {
+    fn save(&self, e: &mut Enc) {
+        match self {
+            Node::Leaf(t) => {
+                0u8.save(e);
+                t.save(e);
+            }
+            Node::Split { ratio, a, b } => {
+                1u8.save(e);
+                ratio.save(e);
+                a.save(e);
+                b.save(e);
+            }
+        }
+    }
+    fn load(d: &mut Dec) -> state::Result<Self> {
+        Ok(match u8::load(d)? {
+            0 => Node::Leaf(T::load(d)?),
+            _ => Node::Split { ratio: f32::load(d)?, a: Persist::load(d)?, b: Persist::load(d)? },
+        })
+    }
+}
+
+impl<T: Persist> Persist for Dwindle<T> {
+    fn save(&self, e: &mut Enc) {
+        self.root.save(e);
+        self.last.save(e);
+    }
+    fn load(d: &mut Dec) -> state::Result<Self> {
+        Ok(Dwindle { root: Persist::load(d)?, last: Persist::load(d)? })
+    }
+}
+
+impl<T: Persist> Persist for Workspace<T> {
+    fn save(&self, e: &mut Enc) {
+        self.tiling.save(e);
+        self.focus.save(e);
+        self.fullscreen.save(e);
+    }
+    fn load(d: &mut Dec) -> state::Result<Self> {
+        Ok(Workspace { tiling: Persist::load(d)?, focus: Persist::load(d)?, fullscreen: Persist::load(d)? })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

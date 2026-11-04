@@ -588,6 +588,18 @@ impl AsRawFd for Bus {
     }
 }
 
+/// Queued messages are not kept: the session is quiet while upgrading.
+impl state::Persist for Bus {
+    fn save(&self, e: &mut state::Enc) {
+        self.conn.save(e);
+        self.serial.save(e);
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        use state::Persist;
+        Ok(Bus { conn: Persist::load(d)?, serial: Persist::load(d)?, queue: VecDeque::new() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

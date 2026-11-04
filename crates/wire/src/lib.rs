@@ -445,6 +445,26 @@ impl Connection {
     }
 }
 
+impl state::Persist for Connection {
+    fn save(&self, e: &mut state::Enc) {
+        self.fd.save(e);
+        state::save_bytes(&self.inbuf, e);
+        self.infds.save(e);
+        state::save_bytes(&self.outbuf, e);
+        self.outfds.save(e);
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        use state::Persist;
+        Ok(Connection {
+            fd: Persist::load(d)?,
+            inbuf: state::load_bytes(d)?,
+            infds: Persist::load(d)?,
+            outbuf: state::load_bytes(d)?,
+            outfds: Persist::load(d)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

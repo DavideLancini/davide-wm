@@ -134,6 +134,8 @@ void main() {
 }
 ";
 
+const PACK_ALIGNMENT: gl::GLenum = 0x0D05;
+
 const UNIT_SQUARE: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
 unsafe fn compile(kind: gl::GLenum, src: &str) -> Result<gl::GLuint, Error> {
@@ -503,6 +505,40 @@ impl Renderer {
         }
     }
 
+    /// Reads a texture back as RGBA (for the live upgrade).
+    pub fn read_texture(&mut self, tex: &Texture) -> Vec<u8> {
+        let mut out = vec![0u8; (tex.width * tex.height * 4) as usize];
+        unsafe {
+            let mut fbo = 0;
+            gl::glGenFramebuffers(1, &mut fbo);
+            gl::glBindFramebuffer(gl::FRAMEBUFFER, fbo);
+            gl::glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex.id, 0);
+            if gl::glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE {
+                gl::glPixelStorei(PACK_ALIGNMENT, 4);
+                gl::glReadPixels(0, 0, tex.width, tex.height, gl::RGBA, gl::UNSIGNED_BYTE, out.as_mut_ptr().cast());
+            }
+            gl::glBindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::glDeleteFramebuffers(1, &fbo);
+        }
+        out
+    }
+
+    /// Uploads RGBA pixels without mipmaps.
+    pub fn upload_rgba(&mut self, width: i32, height: i32, rgba: &[u8]) -> Texture {
+        unsafe {
+            let mut id = 0;
+            gl::glGenTextures(1, &mut id);
+            gl::glBindTexture(gl::TEXTURE_2D, id);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+            gl::glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
+            gl::glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA as i32, width, height, 0, gl::RGBA, gl::UNSIGNED_BYTE, rgba.as_ptr().cast());
+            Texture { id, width, height }
+        }
+    }
+
     pub fn destroy_texture(&mut self, tex: Texture) {
         unsafe { gl::glDeleteTextures(1, &tex.id) };
     }
@@ -518,3 +554,5 @@ impl Drop for Renderer {
         }
     }
 }
+
+state::persist_struct!(Plane { fd, offset, stride });

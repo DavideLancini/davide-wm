@@ -189,6 +189,23 @@ pub struct GetCap {
     pub value: u64,
 }
 
+#[repr(C)]
+#[derive(Default)]
+pub struct PrimeHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct GemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+pub const IOCTL_GEM_CLOSE: u64 = iow(0x09, std::mem::size_of::<GemClose>());
+pub const IOCTL_PRIME_FD_TO_HANDLE: u64 = iowr(0x2e, std::mem::size_of::<PrimeHandle>());
 pub const IOCTL_GET_CAP: u64 = iowr(0x0c, std::mem::size_of::<GetCap>());
 pub const IOCTL_SET_CLIENT_CAP: u64 = iow(0x0d, std::mem::size_of::<SetClientCap>());
 pub const IOCTL_MODE_GETRESOURCES: u64 = iowr(0xA0, std::mem::size_of::<CardRes>());

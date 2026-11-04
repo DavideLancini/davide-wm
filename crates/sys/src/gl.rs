@@ -54,6 +54,8 @@ extern "C" {
     pub fn glDeleteFramebuffers(n: GLsizei, ids: *const GLuint);
     pub fn glBindFramebuffer(target: GLenum, id: GLuint);
     pub fn glFramebufferRenderbuffer(target: GLenum, attachment: GLenum, rbtarget: GLenum, rb: GLuint);
+    pub fn glFramebufferTexture2D(target: GLenum, attachment: GLenum, textarget: GLenum, tex: GLuint, level: GLint);
+    pub fn glReadPixels(x: GLint, y: GLint, w: GLsizei, h: GLsizei, format: GLenum, kind: GLenum, data: *mut c_void);
     pub fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
     pub fn glGenRenderbuffers(n: GLsizei, ids: *mut GLuint);
     pub fn glDeleteRenderbuffers(n: GLsizei, ids: *const GLuint);

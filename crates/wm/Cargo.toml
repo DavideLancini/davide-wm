@@ -4,3 +4,6 @@ description = "Window management logic independent from Wayland: dwindle tiling 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+state.workspace = true

@@ -25,6 +25,15 @@ pub enum Event {
     Lid(bool),
 }
 
+pub struct Saved {
+    kms: kms::Saved,
+    logind: logind::Logind,
+    card: (u32, u32),
+    active: bool,
+}
+
+state::persist_struct!(Saved { kms, logind, card, active });
+
 pub struct Drm {
     // Dropped first: libinput releases its devices through logind.
     input: input::Input,
@@ -45,6 +54,18 @@ pub fn find_card() -> io::Result<String> {
     cards.sort();
     let boot = cards.iter().find(|c| std::fs::read_to_string(format!("/sys/class/drm/{c}/device/boot_vga")).is_ok_and(|v| v.trim() == "1"));
     boot.or(cards.first()).map(|c| format!("/dev/dri/{c}")).ok_or_else(|| io::Error::other("no DRM card"))
+}
+
+/// The render node of a card: GPU memory allocated there is freed when the
+/// process exits, which matters for the live upgrade (the KMS fd survives it).
+fn render_node(card: &str) -> io::Result<String> {
+    let name = card.rsplit('/').next().unwrap_or(card);
+    std::fs::read_dir(format!("/sys/class/drm/{name}/device/drm"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("renderD"))
+        .map(|n| format!("/dev/dri/{n}"))
+        .ok_or_else(|| io::Error::other(format!("no render node for {card}")))
 }
 
 fn uevent_socket() -> io::Result<OwnedFd> {
@@ -82,11 +103,26 @@ impl Drm {
         let card = find_card()?;
         log!("using {card}");
         let fd = logind.take_device(&card)?;
-        let renderer = Renderer::from_fd(fd.try_clone()?).map_err(io::Error::other)?;
+        let renderer = Renderer::new(&render_node(&card)?).map_err(io::Error::other)?;
         let kms = kms::Kms::new(fd)?;
         let input = input::Input::new(&mut *logind)?;
         let drm = Drm { input, kms, logind, uevent: uevent_socket()?, card: logind::device_numbers(&card)?, active: true };
         Ok((drm, renderer))
+    }
+
+    /// Releases the input devices and hands the rest over for a live upgrade.
+    pub fn save(self) -> Saved {
+        drop(self.input);
+        Saved { kms: self.kms.save(), logind: *self.logind, card: self.card, active: self.active }
+    }
+
+    pub fn restore(saved: Saved) -> io::Result<(Drm, Renderer)> {
+        let card = find_card()?;
+        let mut renderer = Renderer::new(&render_node(&card)?).map_err(io::Error::other)?;
+        let kms = kms::Kms::restore(saved.kms, &mut renderer)?;
+        let mut logind = Box::new(saved.logind);
+        let input = input::Input::new(&mut *logind)?;
+        Ok((Drm { input, kms, logind, uevent: uevent_socket()?, card: saved.card, active: saved.active }, renderer))
     }
 
     pub fn fds(&self) -> [RawFd; 4] {

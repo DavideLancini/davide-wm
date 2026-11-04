@@ -31,6 +31,22 @@ struct Ids {
     keyboard: u32,
 }
 
+state::persist_struct!(Ids { compositor, wm_base, dmabuf, seat, surface, xdg_surface, toplevel, pointer, keyboard });
+
+/// What survives a live upgrade: the host connection and our objects on it.
+pub struct Saved {
+    conn: Connection,
+    objects: Vec<(u32, String)>,
+    next_id: u32,
+    ids: Ids,
+    globals: Vec<(u32, String, u32)>,
+    frame_cb: Option<u32>,
+    size: (i32, i32),
+    pending_size: (i32, i32),
+}
+
+state::persist_struct!(Saved { conn, objects, next_id, ids, globals, frame_cb, size, pending_size });
+
 pub struct Nested {
     conn: Connection,
     objects: HashMap<u32, &'static Interface>,
@@ -276,6 +292,48 @@ impl Nested {
             return Ok(None);
         }
         Ok(self.buffers.iter().position(|b| !b.busy))
+    }
+
+    /// Drops our buffers on the host (it keeps showing the last frame) and
+    /// hands the connection over.
+    pub fn save(mut self) -> Saved {
+        for b in std::mem::take(&mut self.buffers) {
+            self.conn.send(Msg::new(b.wl_buffer, wl_buffer::req::DESTROY));
+            self.objects.remove(&b.wl_buffer);
+        }
+        let _ = self.conn.flush();
+        Saved {
+            objects: self.objects.iter().map(|(id, i)| (*id, i.name.to_string())).collect(),
+            conn: self.conn,
+            next_id: self.next_id,
+            ids: self.ids,
+            globals: self.globals,
+            frame_cb: self.frame_cb,
+            size: self.size,
+            pending_size: self.pending_size,
+        }
+    }
+
+    pub fn restore(s: Saved) -> io::Result<Nested> {
+        let objects = s
+            .objects
+            .into_iter()
+            .map(|(id, name)| interface_by_name(&name).map(|i| (id, i)).ok_or_else(|| io::Error::other(format!("unknown interface {name}"))))
+            .collect::<io::Result<_>>()?;
+        Ok(Nested {
+            conn: s.conn,
+            objects,
+            next_id: s.next_id,
+            ids: s.ids,
+            globals: s.globals,
+            sync_done: None,
+            frame_cb: s.frame_cb,
+            buffers: Vec::new(),
+            size: s.size,
+            pending_size: s.pending_size,
+            configured: true,
+            events: Vec::new(),
+        })
     }
 
     pub fn target(&self, idx: usize) -> &Target {

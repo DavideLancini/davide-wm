@@ -59,6 +59,8 @@ pub enum Action {
     ToggleSpecial,
     ToggleMaximize,
     SwitchVt(u32),
+    /// Live upgrade to the binary on disk (README, ADR-014).
+    Upgrade,
     Exit,
 }
 
@@ -69,7 +71,8 @@ pub struct Bind {
     pub action: Action,
 }
 
-pub const TERMINAL: &str = "footclient";
+/// Falls back to a standalone foot when the server is not up yet.
+pub const TERMINAL: &str = "footclient || foot";
 const BROWSER: &str = "chromium --disable-sync";
 
 /// Every key binding. Built at startup from the tables below.
@@ -98,6 +101,7 @@ pub fn binds() -> Vec<Bind> {
         b(MAIN, keys::Q, Action::CloseWindow),
         b(MAIN, keys::R, Action::ToggleSpecial),
         b(MAIN | SHIFT, keys::F, Action::ToggleMaximize),
+        b(MAIN | SHIFT, keys::C, Action::Upgrade),
         b(MAIN | SHIFT, keys::E, Action::Exit),
     ];
     for (key, dir) in [(keys::LEFT, Direction::Left), (keys::RIGHT, Direction::Right), (keys::UP, Direction::Up), (keys::DOWN, Direction::Down)] {

@@ -18,6 +18,7 @@ dependencies = [
  "jpeg",
  "libc",
  "render",
+ "state",
  "sys",
  "wire",
  "wm",
@@ -28,6 +29,7 @@ name = "dbus"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "state",
  "wire",
 ]
 
@@ -46,7 +48,15 @@ name = "render"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "state",
  "sys",
+]
+
+[[package]]
+name = "state"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -61,8 +71,12 @@ name = "wire"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "state",
 ]
 
 [[package]]
 name = "wm"
 version = "0.1.0"
+dependencies = [
+ "state",
+]

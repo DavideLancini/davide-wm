@@ -86,6 +86,7 @@ pub fn compositor(s: &mut State, c: ClientId, version: u32, op: u16, args: Args)
                     SKey { client: c, id },
                     Surface {
                         pending: Pending::default(),
+                        cached: None,
                         upload: None,
                         content: Content::None,
                         size: (0, 0),
@@ -134,7 +135,50 @@ pub fn surface(s: &mut State, c: ClientId, id: u32, op: u16, args: Args) {
 
 fn commit(s: &mut State, key: SKey) {
     let Some(sf) = s.surfaces.get_mut(&key) else { return };
-    if let Some(b) = sf.pending.buffer.take() {
+    let mut p = std::mem::take(&mut sf.pending);
+    if synced(s, key) {
+        let sf = s.surfaces.get_mut(&key).unwrap();
+        let cached = sf.cached.get_or_insert_with(Pending::default);
+        if p.buffer.is_some() {
+            cached.buffer = p.buffer;
+        }
+        cached.frames.append(&mut p.frames);
+        if p.geometry.is_some() {
+            cached.geometry = p.geometry;
+        }
+        return;
+    }
+    apply(s, key, p);
+    apply_children(s, key);
+}
+
+/// True when the surface is a subsurface whose state waits for its parent.
+fn synced(s: &State, mut key: SKey) -> bool {
+    loop {
+        match s.surfaces.get(&key).map(|sf| &sf.role) {
+            Some(Role::Subsurface { sync: true, .. }) => return true,
+            Some(Role::Subsurface { parent, .. }) => key.id = *parent,
+            _ => return false,
+        }
+    }
+}
+
+/// Applies the cached state of synchronised children after their parent's commit.
+fn apply_children(s: &mut State, key: SKey) {
+    let Some(sf) = s.surfaces.get(&key) else { return };
+    let children: Vec<u32> = sf.below.iter().chain(&sf.above).copied().collect();
+    for id in children {
+        let child = SKey { client: key.client, id };
+        if let Some(p) = s.surfaces.get_mut(&child).and_then(|c| c.cached.take()) {
+            apply(s, child, p);
+        }
+        apply_children(s, child);
+    }
+}
+
+fn apply(s: &mut State, key: SKey, mut p: Pending) {
+    let Some(sf) = s.surfaces.get_mut(&key) else { return };
+    if let Some(b) = p.buffer.take() {
         match b.and_then(|id| s.buffers.get(&SKey { client: key.client, id }).map(|buf| (id, buf))) {
             Some((id, buf)) => {
                 sf.upload = Some(id);
@@ -153,9 +197,9 @@ fn commit(s: &mut State, key: SKey) {
         }
     }
     let sf = s.surfaces.get_mut(&key).unwrap();
-    sf.frames.append(&mut sf.pending.frames);
+    sf.frames.append(&mut p.frames);
     if let Some(x) = sf.xdg.as_mut() {
-        if let Some(g) = sf.pending.geometry.take() {
+        if let Some(g) = p.geometry.take() {
             x.geometry = Some(g);
         }
     }
@@ -177,7 +221,7 @@ pub fn subcompositor(s: &mut State, c: ClientId, version: u32, op: u16, args: Ar
         return;
     }
     if s.new_object(c, id, &wl_subsurface::INTERFACE, version, Kind::Subsurface { surface }) {
-        s.surfaces.get_mut(&key).unwrap().role = Role::Subsurface { parent, x: 0, y: 0 };
+        s.surfaces.get_mut(&key).unwrap().role = Role::Subsurface { parent, x: 0, y: 0, sync: true };
         s.surfaces.get_mut(&SKey { client: c, id: parent }).unwrap().above.push(surface);
     }
 }
@@ -200,6 +244,18 @@ pub fn subsurface(s: &mut State, c: ClientId, surface: u32, op: u16, args: Args)
             if let Some(Role::Subsurface { x, y, .. }) = s.surfaces.get_mut(&key).map(|sf| &mut sf.role) {
                 *x = args.int(0);
                 *y = args.int(1);
+            }
+        }
+        wl_subsurface::req::SET_SYNC | wl_subsurface::req::SET_DESYNC => {
+            let desync = op == wl_subsurface::req::SET_DESYNC;
+            if let Some(Role::Subsurface { sync, .. }) = s.surfaces.get_mut(&key).map(|sf| &mut sf.role) {
+                *sync = !desync;
+            }
+            if desync && !synced(s, key) {
+                if let Some(p) = s.surfaces.get_mut(&key).and_then(|sf| sf.cached.take()) {
+                    apply(s, key, p);
+                }
+                apply_children(s, key);
             }
         }
         wl_subsurface::req::PLACE_ABOVE | wl_subsurface::req::PLACE_BELOW => {
