@@ -169,7 +169,7 @@ pub const OUTPUT_MODES: &[(&str, i32, i32, u32)] = &[("eDP-1", 2160, 1440, 60), 
 /// connected one in this list, else any connected one.
 pub const OUTPUT_PRIORITY: &[&str] = &["eDP-1"];
 
-/// Programs started once with the DRM backend, to make the session known
+/// Programs started once with `--session`, to make the session known
 /// to systemd and D-Bus activated services.
 pub const SESSION_AUTOSTART: &[&str] = &[
     "dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DAVIDE_WM_SOCKET XDG_SESSION_TYPE && systemctl --user start davide-wm-session.target",

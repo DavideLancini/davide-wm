@@ -237,7 +237,7 @@ impl App {
     }
 }
 
-fn run(nested: bool) -> io::Result<()> {
+fn run(nested: bool, session: bool) -> io::Result<()> {
     let signals = event_loop::signal_fd()?;
     server::install_sigbus_handler();
     let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
@@ -288,6 +288,8 @@ fn run(nested: bool) -> io::Result<()> {
         }
         app.state.pointer.x = (app.state.output.width / 2) as f64;
         app.state.pointer.y = (app.state.output.height / 2) as f64;
+    }
+    if session {
         for line in config::SESSION_AUTOSTART {
             app.spawn(line);
         }
@@ -398,10 +400,12 @@ fn main() {
     let result = match args.get(1).map(String::as_str) {
         Some("msg") => ipc::client(&args[2..]),
         Some("outputs") => backend::describe_outputs().map(|s| print!("{s}")),
-        Some("--nested") => run(true),
-        Some("--drm") => run(false),
-        None => run(std::env::var_os("WAYLAND_DISPLAY").is_some()),
-        Some(other) => Err(io::Error::other(format!("unknown argument {other}; use msg, outputs, --nested or --drm"))),
+        Some("--nested") => run(true, false),
+        Some("--drm") => run(false, false),
+        // The real session: also exports the environment to systemd and D-Bus.
+        Some("--session") => run(false, true),
+        None => run(std::env::var_os("WAYLAND_DISPLAY").is_some(), false),
+        Some(other) => Err(io::Error::other(format!("unknown argument {other}; use msg, outputs, --nested, --drm or --session"))),
     };
     if let Err(e) = result {
         log!("fatal: {e}");

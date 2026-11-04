@@ -291,7 +291,7 @@ davide-wm/
 | Environment | Infrastructure | Notes |
 |-------------|----------------|-------|
 | dev | nested backend inside the running Hyprland session (`cargo run -p davide-wm`, then `WAYLAND_DISPLAY=<socket printed at startup> foot`); headless backend for automated tests later | Main modifier is Alt when nested (Super belongs to Hyprland): Alt+T terminal, Alt+Q close, Alt+arrows focus, Alt+Shift+E exit. No risk to the working session; DRM tests on a second TTY. |
-| prod | the laptop, started from a TTY login (`davide-wm`, DRM backend: Super is the main modifier) | Hyprland stays as fallback until switch-over. Ctrl+Alt+F1…F12 switch VT, Ctrl+Alt+Backspace exits. `davide-wm outputs` lists connectors and the one that would be driven. |
+| prod | the laptop, started from a TTY login (`davide-wm` to try it, `davide-wm --session` as the real session: exports the environment to systemd/D-Bus and starts `davide-wm-session.target`; Super is the main modifier) | Hyprland stays as fallback until switch-over. Ctrl+Alt+F1…F12 switch VT, Ctrl+Alt+Backspace exits. `davide-wm outputs` lists connectors and the one that would be driven. |
 
 - **Build/CI-CD:** `cargo build --release` (opt-level, LTO, strip, panic handling decided in ADR-006); `run.sh` installs the binary to `~/7Scripts/davide-wm` and the portal/unit files from `dist/`. No CI.
 - **Configuration & secrets:** configuration compiled in (`crates/config/`). Spotify client credentials are currently compiled into topbar (known debt, sec. 11); the refresh token stays in `~/.local/state/topbar/spotify-token` until moved to `~/.local/state/davide-wm/`.
