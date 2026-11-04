@@ -916,9 +916,15 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 /// handed back to the previous binary.
 const BLOB_FORMAT: u32 = 4;
 
+/// Per instance: a nested test instance must not replace the copy kept by
+/// the session on the TTY. The pid survives the execs of an upgrade.
 fn prev_binary() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("davide-wm-prev"))
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join(format!("davide-wm-prev-{}", std::process::id())))
 }
+
+/// Set across the exec into the previous binary: if that cannot restore the
+/// state either, falling back again would loop forever.
+const FALLBACK_ENV: &str = "DAVIDE_WM_FALLBACK";
 
 /// Keeps a copy of the running binary, to fall back to if a newer one
 /// cannot restore the state.
@@ -1041,11 +1047,19 @@ fn resume(fd: i32) -> io::Result<Ctx> {
     f.rewind()?;
     let mut blob = Vec::new();
     f.read_to_end(&mut blob)?;
+    let fallen_back = std::env::var_os(FALLBACK_ENV).is_some();
+    std::env::remove_var(FALLBACK_ENV);
     match decode(&blob) {
-        Ok(ctx) => Ok(ctx),
+        Ok(ctx) => {
+            if !fallen_back {
+                keep_previous_binary();
+            }
+            Ok(ctx)
+        }
         Err(e) => {
             log!("cannot restore the state: {e}");
-            let Some(prev) = prev_binary().filter(|p| p.exists()) else { return Err(e) };
+            let Some(prev) = prev_binary().filter(|p| p.exists() && !fallen_back) else { return Err(e) };
+            std::env::set_var(FALLBACK_ENV, "1");
             log!("falling back to {}", prev.display());
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -1245,6 +1259,9 @@ fn main() {
         None => fresh(std::env::var_os("WAYLAND_DISPLAY").is_some(), false).and_then(run),
         Some(other) => Err(io::Error::other(format!("unknown argument {other}; use msg, outputs, --nested, --drm or --session"))),
     };
+    if let Some(prev) = prev_binary().filter(|_| !matches!(args.get(1).map(String::as_str), Some("msg" | "outputs"))) {
+        let _ = std::fs::remove_file(prev);
+    }
     if let Err(e) = result {
         log!("fatal: {e}");
         std::process::exit(1);
