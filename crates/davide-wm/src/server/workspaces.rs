@@ -36,7 +36,9 @@ pub fn remove_window(s: &mut State, key: SKey) {
     }
     s.urgent.remove(&key);
     if s.focus == Some(key) {
-        s.focus = None;
+        // The client must see the leave: foot keeps repeating a held key
+        // for a window that no longer exists otherwise, and crashes.
+        seat::set_focus(s, None);
         refocus(s);
     }
     s.relayout();
