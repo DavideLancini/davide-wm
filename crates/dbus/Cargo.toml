@@ -1,0 +1,10 @@
+[package]
+name = "dbus"
+description = "Minimal D-Bus client: SASL EXTERNAL, marshalling, calls, signals, fd passing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+wire.workspace = true

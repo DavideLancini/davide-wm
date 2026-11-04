@@ -5,5 +5,7 @@
 
 pub mod egl;
 pub mod gbm;
+pub mod drm;
 pub mod gl;
+pub mod input;
 pub mod xkb;

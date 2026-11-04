@@ -381,6 +381,24 @@ impl Connection {
         self.outfds.extend(msg.fds);
     }
 
+    /// Buffered input, for protocols other than Wayland that reuse this socket code.
+    pub fn input(&self) -> &[u8] {
+        &self.inbuf
+    }
+
+    pub fn consume(&mut self, n: usize) {
+        self.inbuf.drain(..n.min(self.inbuf.len()));
+    }
+
+    pub fn take_fd(&mut self) -> Option<OwnedFd> {
+        self.infds.pop_front()
+    }
+
+    pub fn send_raw(&mut self, bytes: &[u8], fds: Vec<OwnedFd>) {
+        self.outbuf.extend_from_slice(bytes);
+        self.outfds.extend(fds);
+    }
+
     pub fn has_pending_output(&self) -> bool {
         !self.outbuf.is_empty()
     }

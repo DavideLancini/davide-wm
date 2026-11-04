@@ -10,15 +10,7 @@ use std::path::PathBuf;
 use render::{Renderer, Target};
 use wire::*;
 
-pub enum Event {
-    Resize(i32, i32),
-    Close,
-    PointerMotion(f64, f64),
-    PointerButton(u32, bool),
-    PointerAxis(u32, f64),
-    Key(u32, bool),
-    KeyboardLeave,
-}
+use super::Event;
 
 struct HostBuffer {
     target: Target,

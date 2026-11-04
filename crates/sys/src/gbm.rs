@@ -20,4 +20,6 @@ extern "C" {
     pub fn gbm_bo_get_stride(bo: *mut gbm_bo) -> u32;
     pub fn gbm_bo_get_offset(bo: *mut gbm_bo, plane: i32) -> u32;
     pub fn gbm_bo_get_modifier(bo: *mut gbm_bo) -> u64;
+    /// Returns `union gbm_bo_handle`; the GEM handle is in the low 32 bits.
+    pub fn gbm_bo_get_handle(bo: *mut gbm_bo) -> u64;
 }

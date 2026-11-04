@@ -44,8 +44,8 @@ pub mod keys {
     pub const AUDIO_MIC_MUTE: u32 = 0x1008ffb2;
     pub const MON_BRIGHTNESS_UP: u32 = 0x1008ff02;
     pub const MON_BRIGHTNESS_DOWN: u32 = 0x1008ff03;
-    /// `XF86Switch_VT_1`; VT n is this plus n - 1.
-    pub const SWITCH_VT_1: u32 = 0x1008fe01;
+    /// F1; Fn is this plus n - 1.
+    pub const F1: u32 = 0xffbe;
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -120,8 +120,10 @@ pub fn binds() -> Vec<Bind> {
         }
     }
     for n in 1..=12 {
-        v.push(b(CTRL | ALT, keys::SWITCH_VT_1 + n - 1, Action::SwitchVt(n)));
+        v.push(b(CTRL | ALT, keys::F1 + n - 1, Action::SwitchVt(n)));
     }
+    // Emergency exit, independent of the main modifier.
+    v.push(b(CTRL | ALT, keys::BACKSPACE, Action::Exit));
     v
 }
 
@@ -159,6 +161,19 @@ pub const WALLPAPER_MIN_SIZE: (usize, usize) = (2560, 1600);
 pub const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 /// Dims the workspace below the special one.
 pub const SPECIAL_DIM: [f32; 4] = [0.0, 0.0, 0.0, 0.4];
+
+/// Preferred modes by connector name: (width, height, refresh in Hz).
+/// Other outputs use their preferred mode.
+pub const OUTPUT_MODES: &[(&str, i32, i32, u32)] = &[("eDP-1", 2160, 1440, 60), ("DP-1", 2560, 1440, 120)];
+/// Until multi-monitor support (M4) a single output is driven: the first
+/// connected one in this list, else any connected one.
+pub const OUTPUT_PRIORITY: &[&str] = &["eDP-1"];
+
+/// Programs started once with the DRM backend, to make the session known
+/// to systemd and D-Bus activated services.
+pub const SESSION_AUTOSTART: &[&str] = &[
+    "dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DAVIDE_WM_SOCKET XDG_SESSION_TYPE && systemctl --user start davide-wm-session.target",
+];
 
 /// DRM render node used by the nested backend.
 pub const RENDER_NODE: &str = "/dev/dri/renderD128";

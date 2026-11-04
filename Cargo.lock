@@ -14,12 +14,21 @@ name = "davide-wm"
 version = "0.1.0"
 dependencies = [
  "config",
+ "dbus",
  "jpeg",
  "libc",
  "render",
  "sys",
  "wire",
  "wm",
+]
+
+[[package]]
+name = "dbus"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "wire",
 ]
 
 [[package]]

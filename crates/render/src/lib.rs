@@ -3,7 +3,7 @@
 
 use std::ffi::CStr;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::null_mut;
 
@@ -39,6 +39,11 @@ pub struct Target {
 }
 
 impl Target {
+    /// GEM handle of the buffer on the device the renderer was created on.
+    pub fn handle(&self) -> u32 {
+        unsafe { gbm::gbm_bo_get_handle(self.bo) as u32 }
+    }
+
     /// A new dmabuf fd for the buffer.
     pub fn export_fd(&self) -> Result<OwnedFd, Error> {
         let fd = unsafe { gbm::gbm_bo_get_fd(self.bo) };
@@ -84,7 +89,7 @@ struct Program {
 }
 
 pub struct Renderer {
-    _node: File,
+    _node: OwnedFd,
     gbm: *mut gbm::gbm_device,
     display: egl::EGLDisplay,
     context: egl::EGLContext,
@@ -179,6 +184,11 @@ impl Renderer {
     /// GLES 3 context on it.
     pub fn new(node: &str) -> Result<Renderer, Error> {
         let file = OpenOptions::new().read(true).write(true).open(node).map_err(|e| Error(format!("open {node}: {e}")))?;
+        Renderer::from_fd(OwnedFd::from(file))
+    }
+
+    /// Uses an already open DRM device (e.g. the card fd from logind).
+    pub fn from_fd(file: OwnedFd) -> Result<Renderer, Error> {
         unsafe {
             let dev = gbm::gbm_create_device(file.as_raw_fd());
             if dev.is_null() {

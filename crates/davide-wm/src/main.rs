@@ -2,10 +2,10 @@ macro_rules! log {
     ($($t:tt)*) => { eprintln!("davide-wm: {}", format_args!($($t)*)) };
 }
 
+mod backend;
 mod event_loop;
 mod ipc;
 mod keyboard;
-mod nested;
 mod server;
 mod worker;
 
@@ -19,7 +19,8 @@ use std::process::{Command, Stdio};
 
 use config::{mods, Action};
 use event_loop::{Epoll, HANGUP, READABLE};
-use render::Renderer;
+use backend::{nested::Nested, Drm, Event};
+use render::{Renderer, Target};
 use server::{seat, workspaces, ClientId, State};
 
 const TOKEN_LISTENER: u64 = 1;
@@ -27,6 +28,10 @@ const TOKEN_HOST: u64 = 2;
 const TOKEN_SIGNAL: u64 = 3;
 const TOKEN_IPC: u64 = 4;
 const TOKEN_WORKER: u64 = 5;
+const TOKEN_KMS: u64 = 6;
+const TOKEN_INPUT: u64 = 7;
+const TOKEN_LOGIND: u64 = 8;
+const TOKEN_UEVENT: u64 = 9;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -67,7 +72,39 @@ impl Drop for Socket {
     }
 }
 
+enum Backend {
+    Nested(Nested),
+    Drm(Drm),
+}
+
+impl Backend {
+    fn acquire(&mut self, r: &mut Renderer) -> io::Result<Option<usize>> {
+        match self {
+            Backend::Nested(n) => n.acquire(r),
+            Backend::Drm(d) => Ok(d.acquire()),
+        }
+    }
+
+    fn target(&self, idx: usize) -> &Target {
+        match self {
+            Backend::Nested(n) => n.target(idx),
+            Backend::Drm(d) => d.target(idx),
+        }
+    }
+
+    fn present(&mut self, idx: usize) -> io::Result<()> {
+        match self {
+            Backend::Nested(n) => {
+                n.present(idx);
+                Ok(())
+            }
+            Backend::Drm(d) => d.present(idx),
+        }
+    }
+}
+
 struct App {
+    backend: Backend,
     state: State,
     socket: Socket,
     ipc: ipc::Ipc,
@@ -134,8 +171,11 @@ impl App {
             Action::MoveToWorkspace(ws) => workspaces::move_to(s, ws),
             Action::ToggleSpecial => workspaces::toggle_special(s),
             Action::ToggleMaximize => workspaces::toggle_maximize(s),
-            // VT switching needs the DRM backend.
-            Action::SwitchVt(_) => {}
+            Action::SwitchVt(vt) => {
+                if let Backend::Drm(d) = &mut self.backend {
+                    d.switch_vt(vt);
+                }
+            }
             Action::Exit => self.running = false,
         }
     }
@@ -174,29 +214,50 @@ impl App {
         "ok\n".into()
     }
 
-    fn backend_event(&mut self, e: nested::Event) {
+    fn backend_event(&mut self, e: Event) {
         match e {
-            nested::Event::Resize(w, h) => self.state.set_output_size(w, h),
-            nested::Event::Close => self.running = false,
-            nested::Event::PointerMotion(x, y) => seat::pointer_motion(&mut self.state, x, y),
-            nested::Event::PointerButton(b, p) => seat::pointer_button(&mut self.state, b, p),
-            nested::Event::PointerAxis(a, v) => seat::pointer_axis(&mut self.state, a, v),
-            nested::Event::Key(k, p) => self.key(k, p),
-            nested::Event::KeyboardLeave => {
+            Event::Resize(w, h) => self.state.set_output_size(w, h),
+            Event::OutputName(name) => self.state.output.name = name,
+            Event::Close => self.running = false,
+            Event::PointerMotion(x, y) => seat::pointer_motion(&mut self.state, x, y),
+            Event::PointerMotionRelative(dx, dy) => {
+                let (x, y) = (self.state.pointer.x + dx, self.state.pointer.y + dy);
+                seat::pointer_motion(&mut self.state, x, y);
+            }
+            Event::PointerButton(b, p) => seat::pointer_button(&mut self.state, b, p),
+            Event::PointerAxis(a, v) => seat::pointer_axis(&mut self.state, a, v),
+            Event::Key(k, p) => self.key(k, p),
+            Event::KeyboardLeave => {
                 self.state.keyboard.reset();
                 self.swallowed.clear();
             }
+            // Lid handling (blank, lid-action) arrives with M4.
+            Event::Lid(closed) => log!("lid {}", if closed { "closed" } else { "open" }),
         }
     }
 }
 
-fn run() -> io::Result<()> {
+fn run(nested: bool) -> io::Result<()> {
     let signals = event_loop::signal_fd()?;
     server::install_sigbus_handler();
-    let mut renderer = Renderer::new(config::RENDER_NODE).map_err(io::Error::other)?;
-    let mut host = nested::Nested::connect()?;
     let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
-    let (w, h) = host.size;
+    let ep = Epoll::new()?;
+    let (mut renderer, backend, main_mod) = if nested {
+        let renderer = Renderer::new(config::RENDER_NODE).map_err(io::Error::other)?;
+        let host = Nested::connect()?;
+        ep.add(host.raw_fd(), TOKEN_HOST)?;
+        (renderer, Backend::Nested(host), mods::ALT)
+    } else {
+        let (drm, renderer) = Drm::open()?;
+        for (fd, token) in drm.fds().into_iter().zip([TOKEN_KMS, TOKEN_INPUT, TOKEN_LOGIND, TOKEN_UEVENT]) {
+            ep.add(fd, token)?;
+        }
+        (renderer, Backend::Drm(drm), mods::SUPER)
+    };
+    let (w, h) = match &backend {
+        Backend::Nested(n) => n.size,
+        Backend::Drm(_) => config::NESTED_SIZE,
+    };
     let output = server::Output { name: "NESTED-1".into(), width: w, height: h };
     let socket = Socket::bind()?;
     let ipc = ipc::Ipc::bind(&socket.name)?;
@@ -214,20 +275,29 @@ fn run() -> io::Result<()> {
         });
     }
 
-    let ep = Epoll::new()?;
     ep.add(socket.listener.as_raw_fd(), TOKEN_LISTENER)?;
-    ep.add(host.raw_fd(), TOKEN_HOST)?;
     ep.add(signals.as_raw_fd(), TOKEN_SIGNAL)?;
     ep.add(ipc.listener.as_raw_fd(), TOKEN_IPC)?;
     ep.add(worker.raw_fd(), TOKEN_WORKER)?;
 
     let state = State::new(keyboard, output, renderer.dmabuf_formats());
-    let mut app = App { state, socket, ipc, binds: config::binds(), main_mod: mods::ALT, swallowed: Vec::new(), running: true };
+    let mut app = App { backend, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), running: true };
+    if let Backend::Drm(d) = &mut app.backend {
+        for e in d.setup_output(&mut renderer)? {
+            app.backend_event(e);
+        }
+        app.state.pointer.x = (app.state.output.width / 2) as f64;
+        app.state.pointer.y = (app.state.output.height / 2) as f64;
+        for line in config::SESSION_AUTOSTART {
+            app.spawn(line);
+        }
+    }
     for line in config::AUTOSTART {
         app.spawn(line);
     }
     while app.running {
         for (token, events) in ep.wait(-1)? {
+            let mut backend_events = Vec::new();
             match token {
                 TOKEN_LISTENER => loop {
                     match app.socket.listener.accept() {
@@ -266,15 +336,22 @@ fn run() -> io::Result<()> {
                         }
                     }
                 }
-                TOKEN_HOST => {
-                    for e in host.dispatch()? {
-                        app.backend_event(e);
-                    }
-                }
                 TOKEN_SIGNAL => {
                     log!("signal received, exiting");
                     app.running = false;
                 }
+                TOKEN_HOST | TOKEN_KMS | TOKEN_INPUT | TOKEN_LOGIND | TOKEN_UEVENT => match (&mut app.backend, token) {
+                    (Backend::Nested(n), _) => backend_events = n.dispatch()?,
+                    (Backend::Drm(d), TOKEN_KMS) => {
+                        d.dispatch_kms();
+                    }
+                    (Backend::Drm(d), TOKEN_INPUT) => backend_events = d.dispatch_input(),
+                    (Backend::Drm(d), TOKEN_LOGIND) => {
+                        backend_events = d.dispatch_logind()?;
+                        app.state.needs_redraw = true;
+                    }
+                    (Backend::Drm(d), _) => backend_events = d.dispatch_uevent(&mut renderer)?,
+                },
                 t => {
                     let id = (t - TOKEN_CLIENT) as ClientId;
                     if events & READABLE != 0 {
@@ -286,6 +363,9 @@ fn run() -> io::Result<()> {
                     }
                 }
             }
+            for e in backend_events {
+                app.backend_event(e);
+            }
         }
         for id in app.state.dead_clients() {
             if let Some(c) = app.state.clients.get(&id) {
@@ -294,12 +374,16 @@ fn run() -> io::Result<()> {
             app.state.remove_client(id);
         }
         if app.state.needs_redraw {
-            if let Some(i) = host.acquire(&mut renderer)? {
-                app.state.render(&mut renderer, host.target(i));
-                host.present(i);
+            if let Some(i) = app.backend.acquire(&mut renderer)? {
+                app.state.render(&mut renderer, app.backend.target(i));
+                if let Err(e) = app.backend.present(i) {
+                    log!("present failed: {e}");
+                }
             }
         }
-        host.flush()?;
+        if let Backend::Nested(n) = &mut app.backend {
+            n.flush()?;
+        }
         for (id, pending) in app.state.flush_clients() {
             if let Some(c) = app.state.clients.get(&id) {
                 ep.modify(c.conn.raw_fd(), TOKEN_CLIENT + id as u64, pending)?;
@@ -313,7 +397,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("msg") => ipc::client(&args[2..]),
-        _ => run(),
+        Some("outputs") => backend::describe_outputs().map(|s| print!("{s}")),
+        Some("--nested") => run(true),
+        Some("--drm") => run(false),
+        None => run(std::env::var_os("WAYLAND_DISPLAY").is_some()),
+        Some(other) => Err(io::Error::other(format!("unknown argument {other}; use msg, outputs, --nested or --drm"))),
     };
     if let Err(e) = result {
         log!("fatal: {e}");

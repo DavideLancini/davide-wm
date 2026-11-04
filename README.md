@@ -38,11 +38,11 @@
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
 > Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
-> Status: **M1 in progress** — nested: workspaces, keybinds, clipboard, dmabuf, wallpaper, IPC done; DRM/TTY backend next.
+> Status: **M1 in progress** — nested mode complete; DRM/TTY backend written (logind, atomic KMS, libinput), first real-hardware test pending.
 
 | Field | Value |
 |---|---|
-| Doc version | 0.4 |
+| Doc version | 0.5 |
 | Last updated | 2026-11-04 |
 | Owner | Davide Lancini |
 | Project status | development |
@@ -166,7 +166,7 @@
 - **How it meets the quality goals (sec. 1.2):** single process and in-memory state remove IPC, forks and polling (footprint, responsiveness); the non-blocking rule and per-feature panic isolation protect the session (reliability); every replaced daemon is one package less (minimal requirements); explicit modules with no framework and compile-time config keep it readable (maintainability).
 - **Milestones (each one usable before the next starts):**
   - **M0 — Nested skeleton (done 2026-11-04):** nested backend (dmabuf to the host), own wire protocol, `wl_compositor`/`wl_subcompositor`/`wl_shm`/`wl_seat`/`wl_output`/`xdg_wm_base` (toplevels, basic popups)/xdg-decoration (always server-side)/`wl_data_device_manager` stub, GLES composition, dwindle tiling, keyboard (xkb `it`) and pointer, keybinds, spawn `foot`.
-  - **M1 — Daily-driver core on a TTY:** *done in nested mode (2026-11-04):* workspaces 1–41 + `chat` + special `resize`, keybind parity with `hyprland.lua`, move/swap windows, maximize/fullscreen, window rules, clipboard + primary selection + ext-data-control, xdg-activation and system bell (urgency), idle-inhibit, linux-dmabuf import, SIGBUS guard, IPC socket, compiled-in wallpaper. *Remaining:* logind session, DRM/KMS atomic, libinput, hotplug, VT switching, hardware cursor, damage tracking, synchronised subsurfaces.
+  - **M1 — Daily-driver core on a TTY:** *done in nested mode (2026-11-04):* workspaces 1–41 + `chat` + special `resize`, keybind parity with `hyprland.lua`, move/swap windows, maximize/fullscreen, window rules, clipboard + primary selection + ext-data-control, xdg-activation and system bell (urgency), idle-inhibit, linux-dmabuf import, SIGBUS guard, IPC socket, compiled-in wallpaper. *Written, to test on a TTY:* logind session (own D-Bus), atomic KMS with raw ioctls, libinput (flat accel, tap, natural scroll on touchpads), DRM hotplug via netlink uevents, VT switching, Ctrl+Alt+Backspace emergency exit. *Remaining:* hardware cursor, damage tracking, synchronised subsurfaces. One output at a time until M4 (eDP-1 first).
   - **M1b — Live upgrade:** in-place re-exec with state and fd handover (ADR-014), so every later milestone is deployed without closing windows. State is designed for handover from M0 on.
   - **M2 — Bar:** port `topbar` (rendering into a compositor-owned surface, workspace state read directly).
   - **M3 — Launcher:** port `super` with the tap-Super bind handled internally.
@@ -189,13 +189,13 @@ Cargo workspace (ADR-015): one library crate per building block under `crates/`,
 
 | Building block | Responsibility | Path |
 |----------------|----------------|------|
-| Binary / event loop | startup, epoll loop, signals, socket, keybind dispatch, spawning; later backend selection, crash handling, worker threads, live upgrade | `crates/davide-wm/src/main.rs`, `event_loop.rs`, `keyboard.rs` |
+| Binary / event loop | startup, backend selection (`--nested`/`--drm`, default by `WAYLAND_DISPLAY`), epoll loop, signals, socket, keybind dispatch, spawning, `outputs` debug command; later crash handling, live upgrade | `crates/davide-wm/src/main.rs`, `event_loop.rs`, `keyboard.rs`, `worker.rs` |
 | Wire protocol | message codec, connections with fd passing, interface tables and opcode constants generated at build time from `protocols/*.xml` | `crates/wire/` |
 | System FFI | hand-written bindings: EGL, GLES, GBM, xkbcommon | `crates/sys/` |
 | JPEG decoder | baseline JPEG (Huffman, any subsampling, restart markers) for the compiled-in wallpaper; box-filter halving | `crates/jpeg/` |
 | Config | all settings as `const`s: keybinds, colors, keyboard layout, render node; later window and monitor rules, fonts, paths | `crates/config/` |
 | State / handover *(planned)* | serialisable state types, fd table, versioned upgrade blob | `crates/state/` |
-| Backends | `nested` done (`crates/davide-wm/src/nested.rs`); `drm` (KMS, GBM, logind session, libinput, uevents) and `headless` *(planned)* | `crates/backend/` *(planned)* |
+| Backends | `nested` (client of the host compositor) and `drm`: `logind.rs` (session, TakeDevice, VT switch), `kms.rs` (atomic modesetting, scanout buffers, page flips), `input.rs` (libinput via logind); `headless` *(planned)* | `crates/davide-wm/src/backend/` |
 | Renderer | EGL on GBM (surfaceless GLES 3 context), render targets exported as dmabufs, shm texture upload, solid/textured quads, scissor clip; later dmabuf import, damage, scanout planes, text | `crates/render/` |
 | Wayland server | clients and object maps, globals, protocol handlers (core, seat/output/focus, xdg-shell), surface tree, rendering of the scene | `crates/davide-wm/src/server/` |
 | Window manager | dwindle tree, directional neighbours, `Rect`; later workspaces, rules, fullscreen/maximize, urgency | `crates/wm/` |
@@ -206,7 +206,7 @@ Cargo workspace (ADR-015): one library crate per building block under `crates/`,
 | Notifications | D-Bus notification server, popups, panel | `crates/notifications/` |
 | XWM | Xwayland process + X11 window management *(planned)* | `crates/xwayland/` |
 | Screen cast / screenshots | portal backend, PipeWire streams, screenshot taker *(planned)* | `crates/screencast/` |
-| D-Bus | own minimal client/server (SASL EXTERNAL, marshalling, names, signals) *(planned)* | `crates/dbus/` |
+| D-Bus | own minimal client: SASL EXTERNAL, little-endian marshalling of every type, calls with timeouts, signals, fd passing; server side (names, method handling) *(planned for M5)* | `crates/dbus/` |
 | IPC | Unix socket commands, `davide-wm msg` CLI | `crates/davide-wm/src/ipc.rs` |
 | Process exec | detached spawn (`setsid`, close fds), helpers with timeouts *(planned)* | `crates/exec/` |
 
@@ -222,7 +222,7 @@ davide-wm/
     │       ├── main.rs         # startup, socket, epoll loop, keybinds, spawn
     │       ├── event_loop.rs   # epoll + signalfd
     │       ├── keyboard.rs     # xkb keymap/state, keymap memfd
-    │       ├── nested.rs       # nested backend (client of the host compositor)
+    │       ├── backend/        # mod.rs (events, Drm), nested.rs, logind.rs, kms.rs, input.rs
     │       ├── ipc.rs          # command socket and `davide-wm msg`
     │       ├── worker.rs       # background jobs (thread + eventfd)
     │       └── server/         # mod.rs (state, clients, render), compositor.rs (core, shm, SIGBUS guard), seat.rs,
@@ -230,11 +230,12 @@ davide-wm/
     ├── wire/               # build.rs generates interface tables from protocols/
     ├── sys/                # egl.rs, gl.rs, gbm.rs, xkb.rs
     ├── render/
+    ├── dbus/
     ├── jpeg/
     ├── wm/
     └── config/
 ```
-Planned additions: `run.sh`, `assets/`, `dist/`, `tools/` and the crates marked *(planned)* in sec. 5.1.
+`dist/davide-wm-session.target` binds the session to `graphical-session.target` (install it in `~/.config/systemd/user/`). Planned additions: `run.sh`, `assets/`, `tools/` and the crates marked *(planned)* in sec. 5.1.
 
 ### 5.3 Level 2 — detail of the relevant building blocks
 *Expand only the blocks that are not obvious. (Repeat for each one.)*
@@ -290,7 +291,7 @@ Planned additions: `run.sh`, `assets/`, `dist/`, `tools/` and the crates marked 
 | Environment | Infrastructure | Notes |
 |-------------|----------------|-------|
 | dev | nested backend inside the running Hyprland session (`cargo run -p davide-wm`, then `WAYLAND_DISPLAY=<socket printed at startup> foot`); headless backend for automated tests later | Main modifier is Alt when nested (Super belongs to Hyprland): Alt+T terminal, Alt+Q close, Alt+arrows focus, Alt+Shift+E exit. No risk to the working session; DRM tests on a second TTY. |
-| prod | the laptop, started from a TTY login (`davide-wm`), DRM backend | Hyprland stays as fallback until switch-over. |
+| prod | the laptop, started from a TTY login (`davide-wm`, DRM backend: Super is the main modifier) | Hyprland stays as fallback until switch-over. Ctrl+Alt+F1…F12 switch VT, Ctrl+Alt+Backspace exits. `davide-wm outputs` lists connectors and the one that would be driven. |
 
 - **Build/CI-CD:** `cargo build --release` (opt-level, LTO, strip, panic handling decided in ADR-006); `run.sh` installs the binary to `~/7Scripts/davide-wm` and the portal/unit files from `dist/`. No CI.
 - **Configuration & secrets:** configuration compiled in (`crates/config/`). Spotify client credentials are currently compiled into topbar (known debt, sec. 11); the refresh token stays in `~/.local/state/topbar/spotify-token` until moved to `~/.local/state/davide-wm/`.
@@ -318,7 +319,7 @@ Planned additions: `run.sh`, `assets/`, `dist/`, `tools/` and the crates marked 
 |---|----------|--------|------|-------------------|
 | 1 | Write the compositor from scratch (no smithay, no wlroots) | accepted | 2026-11-04 | Full control and understanding, same raw-bindings approach as topbar/super; accepted cost: much larger effort. |
 | 2 | GLES2 renderer with direct scanout | proposed | 2026-11-04 | GPU clients send dmabufs; software compositing of 2160x1440 + 2560x1440@120 would cost too much CPU. |
-| 3 | logind over own D-Bus instead of libseat | proposed | 2026-11-04 | One dependency less; D-Bus code is needed anyway. |
+| 3 | logind over own D-Bus instead of libseat | accepted | 2026-11-04 | One dependency less; D-Bus code is needed anyway. Calls are synchronous with a 500 ms timeout because libinput asks for device fds from inside its own calls. |
 | 4 | Compile-time configuration in `crates/config/` | proposed | 2026-11-04 | Same as topbar ADR-001 and super; zero parsing, zero runtime errors from config. |
 | 5 | Absorb topbar, super and dawn helpers as in-process modules | accepted | 2026-11-04 | Removes IPC, polling, forks and version breakage. |
 | 6 | Single-threaded main loop + worker threads for blocking work | proposed | 2026-11-04 | Simple ownership of state; a blocked main loop freezes the screen. |
@@ -340,6 +341,8 @@ Planned additions: `run.sh`, `assets/`, `dist/`, `tools/` and the crates marked 
 | 22 | Client buffers are uploaded at render time, then released | accepted | 2026-11-04 | Protocol handling never touches GL; only the render step needs the renderer. |
 | 23 | One wallpaper, compiled into the binary, decoded at startup on a worker thread | accepted | 2026-11-04 | The owner only ever uses `/wallpapers/1.jpg`. `build.rs` embeds the file named in `config::WALLPAPER` (not committed to the repo); own baseline JPEG decoder, halved while it still covers 2560x1600, drawn with mipmaps and cropped to cover each output. Slideshow dropped. |
 | 24 | Activation requests mark windows urgent instead of focusing them | accepted | 2026-11-04 | Same as Hyprland's default; urgency feeds the bar's red workspaces (M2). |
+| 25 | KMS through raw kernel ioctls, no libdrm | accepted | 2026-11-04 | A dozen ioctls with stable uapi structs; same reasoning as ADR-020. |
+| 26 | One output at a time until M4 | accepted | 2026-11-04 | All workspaces live on eDP-1 today; real multi-monitor rules need the `dawn`/monitor-manager inventory planned for M4. Order: `config::OUTPUT_PRIORITY`, then any connected output. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
