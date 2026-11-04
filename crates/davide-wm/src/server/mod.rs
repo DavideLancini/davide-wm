@@ -222,6 +222,21 @@ pub struct BarSurface {
     pub sent: Option<(Vec<bar::WsEntry>, Vec<bar::Client>)>,
 }
 
+pub struct LauncherView {
+    pub launcher: launcher::Launcher,
+    pub tex: Option<Texture>,
+    pub dirty: bool,
+    /// Focus to give back when it closes.
+    pub prev_focus: Option<SKey>,
+}
+
+impl LauncherView {
+    pub fn rect(&self, output: &Output) -> Rect {
+        let (w, h) = (launcher::WIDTH as i32, launcher::HEIGHT as i32);
+        Rect::new((output.width - w) / 2, (output.height - h) / 2, w, h)
+    }
+}
+
 pub struct State {
     pub clients: HashMap<ClientId, Client>,
     next_client: ClientId,
@@ -251,6 +266,8 @@ pub struct State {
     /// Workspaces marked by a desktop notification, until visited.
     pub urgent_ws: HashSet<WsId>,
     pub bar: BarSurface,
+    /// The launcher while it is open; it has the keyboard to itself.
+    pub launcher: Option<LauncherView>,
     serial: u32,
     start: Instant,
     pub needs_redraw: bool,
@@ -288,6 +305,7 @@ impl State {
             wallpaper: None,
             urgent_ws: HashSet::new(),
             bar: BarSurface { visible: true, ..Default::default() },
+            launcher: None,
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
@@ -571,6 +589,31 @@ impl State {
         self.needs_redraw = true;
     }
 
+    pub fn open_launcher(&mut self) {
+        match launcher::Launcher::open() {
+            Ok(l) => {
+                let prev_focus = self.focus;
+                seat::set_focus(self, None);
+                self.launcher = Some(LauncherView { launcher: l, tex: None, dirty: true, prev_focus });
+                self.needs_redraw = true;
+            }
+            Err(e) => log!("launcher: {e}"),
+        }
+    }
+
+    pub fn close_launcher(&mut self) {
+        let Some(l) = self.launcher.take() else { return };
+        if let Some(t) = l.tex {
+            self.dead_textures.push(t);
+        }
+        let back = l.prev_focus.filter(|k| self.window_ws.get(k) == Some(&workspaces::focused_ws(self)));
+        match back {
+            Some(k) => seat::set_focus(self, Some(k)),
+            None => workspaces::refocus(self),
+        }
+        self.needs_redraw = true;
+    }
+
     /// Asks a toplevel to close.
     pub fn close_window(&mut self, key: SKey) {
         if let Some(XdgRole::Toplevel { obj, .. }) = self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
@@ -750,6 +793,18 @@ impl State {
             if let Some(origin) = self.window_origin(key) {
                 let o = self.surface_origin(key, origin);
                 self.draw_tree(r, key, o);
+            }
+        }
+        if let Some(l) = &mut self.launcher {
+            if l.dirty {
+                l.dirty = false;
+                let pixels = l.launcher.render();
+                let (w, h) = (launcher::WIDTH as i32, launcher::HEIGHT as i32);
+                l.tex = Some(r.upload(l.tex.take(), w, h, w * 4, &pixels));
+            }
+            let rect = l.rect(&self.output);
+            if let Some(t) = &l.tex {
+                r.draw(t, Quad { x: rect.x as f32, y: rect.y as f32, w: rect.w as f32, h: rect.h as f32 }, true);
             }
         }
         seat::draw_cursor(self, r);

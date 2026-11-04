@@ -130,6 +130,9 @@ struct App {
     main_mod: u32,
     /// Keys that triggered a binding: their release is not forwarded.
     swallowed: Vec<u32>,
+    /// The main modifier key went down with nothing else: its release
+    /// toggles the launcher (tap-Super).
+    tap: Option<u32>,
     running: bool,
     upgrade: bool,
     /// Exports the environment to systemd (`--session`).
@@ -150,6 +153,8 @@ impl App {
             cmd.pre_exec(|| {
                 libc::setsid();
                 event_loop::reset_signals_in_child();
+                // Nothing of ours leaks into programs, whatever forgot CLOEXEC.
+                libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
                 Ok(())
             });
         }
@@ -160,6 +165,40 @@ impl App {
 
     fn key(&mut self, keycode: u32, pressed: bool) {
         let changed = self.state.keyboard.update(keycode, pressed);
+        let base = self.state.keyboard.base_sym(keycode);
+        let main_keys: &[u32] = if self.main_mod == mods::SUPER { &[0xffeb, 0xffec] } else { &[0xffe9] };
+        let is_main = base.is_some_and(|b| main_keys.contains(&b));
+        if pressed {
+            self.tap = (is_main && self.state.keyboard.pressed().len() == 1).then_some(keycode);
+        } else if self.tap.take() == Some(keycode) {
+            if self.state.launcher.is_some() {
+                self.state.close_launcher();
+            } else {
+                self.state.open_launcher();
+            }
+            seat::key(&mut self.state, keycode, pressed, changed);
+            return;
+        }
+        if self.state.launcher.is_some() {
+            if pressed {
+                let sym = self.state.keyboard.sym(keycode);
+                let text = self.state.keyboard.text(keycode);
+                let view = self.state.launcher.as_mut().unwrap();
+                match view.launcher.key(sym, text) {
+                    launcher::Outcome::Nothing => {}
+                    launcher::Outcome::Redraw => {
+                        view.dirty = true;
+                        self.state.needs_redraw = true;
+                    }
+                    launcher::Outcome::Close => self.state.close_launcher(),
+                    launcher::Outcome::Launch(cmd) => {
+                        self.state.close_launcher();
+                        self.spawn(&cmd);
+                    }
+                }
+            }
+            return;
+        }
         if pressed {
             let active = self.state.keyboard.bind_mods();
             let sym = self.state.keyboard.base_sym(keycode);
@@ -235,6 +274,10 @@ impl App {
             }
             ipc::Command::Upgrade => self.upgrade = true,
             ipc::Command::Pointer(x, y) => self.backend_event(Event::PointerMotion(x, y)),
+            ipc::Command::Key(code) => {
+                self.backend_event(Event::Key(code, true));
+                self.backend_event(Event::Key(code, false));
+            }
             ipc::Command::Click => {
                 self.backend_event(Event::PointerButton(0x110, true));
                 self.backend_event(Event::PointerButton(0x110, false));
@@ -304,6 +347,30 @@ impl App {
     }
 
     fn backend_event(&mut self, e: Event) {
+        if self.state.launcher.is_some() {
+            match e {
+                Event::PointerMotion(..) | Event::PointerMotionRelative(..) => {
+                    let (x, y) = match e {
+                        Event::PointerMotion(x, y) => (x, y),
+                        Event::PointerMotionRelative(dx, dy) => (self.state.pointer.x + dx, self.state.pointer.y + dy),
+                        _ => unreachable!(),
+                    };
+                    self.state.pointer.x = x.clamp(0.0, (self.state.output.width - 1) as f64);
+                    self.state.pointer.y = y.clamp(0.0, (self.state.output.height - 1) as f64);
+                    self.state.needs_redraw = true;
+                    return;
+                }
+                Event::PointerButton(_, true) => {
+                    let rect = self.state.launcher.as_ref().unwrap().rect(&self.state.output);
+                    if !rect.contains(self.state.pointer.x, self.state.pointer.y) {
+                        self.state.close_launcher();
+                    }
+                    return;
+                }
+                Event::PointerButton(..) | Event::PointerAxis(..) => return,
+                _ => {}
+            }
+        }
         match e {
             Event::Resize(w, h) => self.state.set_output_size(w, h),
             Event::OutputName(name) => self.state.output.name = name,
@@ -346,7 +413,7 @@ struct Ctx {
 }
 
 fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_mod: u32, session: bool) -> App {
-    App { backend, bar: None, bar_width: 0, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), running: true, upgrade: false, session }
+    App { backend, bar: None, bar_width: 0, state, socket, ipc, binds: config::binds(), main_mod, swallowed: Vec::new(), tap: None, running: true, upgrade: false, session }
 }
 
 /// Registers every fd with a fresh epoll and starts background jobs.

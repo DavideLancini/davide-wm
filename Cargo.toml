@@ -17,6 +17,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 config = { path = "crates/config" }
 dbus = { path = "crates/dbus" }
 jpeg = { path = "crates/jpeg" }
+launcher = { path = "crates/launcher" }
 render = { path = "crates/render" }
 state = { path = "crates/state" }
 sys = { path = "crates/sys" }

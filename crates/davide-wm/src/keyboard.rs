@@ -113,6 +113,16 @@ impl Keyboard {
         out
     }
 
+    /// Keysym with the current modifiers applied (Shift gives `E`).
+    pub fn sym(&self, keycode: u32) -> u32 {
+        unsafe { xkb::xkb_state_key_get_one_sym(self.state, keycode + XKB_OFFSET) }
+    }
+
+    /// The character the key types with the current modifiers, if any.
+    pub fn text(&self, keycode: u32) -> Option<char> {
+        char::from_u32(unsafe { xkb::xkb_state_key_get_utf32(self.state, keycode + XKB_OFFSET) }).filter(|c| *c != '\0')
+    }
+
     /// Keysym of the key at layout 0, level 0 (ignores Shift).
     pub fn base_sym(&self, keycode: u32) -> Option<u32> {
         let mut syms: *const u32 = null();

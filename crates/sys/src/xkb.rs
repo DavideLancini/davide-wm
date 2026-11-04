@@ -48,4 +48,6 @@ extern "C" {
     pub fn xkb_state_update_key(st: *mut xkb_state, key: xkb_keycode_t, direction: i32) -> i32;
     pub fn xkb_state_serialize_mods(st: *mut xkb_state, components: i32) -> xkb_mod_mask_t;
     pub fn xkb_state_serialize_layout(st: *mut xkb_state, components: i32) -> xkb_layout_index_t;
+    pub fn xkb_state_key_get_one_sym(st: *mut xkb_state, key: xkb_keycode_t) -> xkb_keysym_t;
+    pub fn xkb_state_key_get_utf32(st: *mut xkb_state, key: xkb_keycode_t) -> u32;
 }

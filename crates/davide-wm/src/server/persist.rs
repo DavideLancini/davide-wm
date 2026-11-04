@@ -339,6 +339,7 @@ impl State {
             wallpaper,
             urgent_ws,
             bar,
+            launcher: _,
             serial,
             start,
             needs_redraw: _,

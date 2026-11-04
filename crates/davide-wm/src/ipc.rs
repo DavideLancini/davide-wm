@@ -58,6 +58,8 @@ pub enum Command {
     /// Test helpers: move the pointer, click the left button, report the focus.
     Pointer(f64, f64),
     Click,
+    /// Press and release an evdev key code.
+    Key(u32),
     Focused,
     Exit,
 }
@@ -95,9 +97,10 @@ fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "click" => Ok(Command::Click),
+        "key" => arg.parse().map(Command::Key).map_err(|_| "key <evdev code>".into()),
         "focused" => Ok(Command::Focused),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, focused, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>, focused, exit".into()),
     }
 }
 

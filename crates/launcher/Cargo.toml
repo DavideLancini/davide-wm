@@ -1,0 +1,9 @@
+[package]
+name = "launcher"
+description = "Application launcher ported from super: desktop entries, bookmarks, calculator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fontdue.workspace = true

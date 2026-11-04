@@ -38,11 +38,11 @@
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
 > Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
-> Status: **M2 done** — bar in-process; runs on the TTY (DRM) and nested; live upgrade works nested (DRM upgrade untested). Next: M3 (launcher).
+> Status: **M3 done** — bar and launcher in-process; runs on the TTY (DRM) and nested; live upgrade works nested (DRM upgrade untested). Next: M4 (monitors, after the `dawn` inventory).
 
 | Field | Value |
 |---|---|
-| Doc version | 0.7 |
+| Doc version | 0.8 |
 | Last updated | 2026-11-04 |
 | Owner | Davide Lancini |
 | Project status | development |
@@ -169,7 +169,7 @@
   - **M1 — Daily-driver core on a TTY:** *done in nested mode (2026-11-04):* workspaces 1–41 + `chat` + special `resize`, keybind parity with `hyprland.lua`, move/swap windows, maximize/fullscreen, window rules, clipboard + primary selection + ext-data-control, xdg-activation and system bell (urgency), idle-inhibit, linux-dmabuf import, SIGBUS guard, IPC socket, compiled-in wallpaper. *Tested on the TTY (2026-11-04):* logind session (own D-Bus), atomic KMS with raw ioctls, libinput (flat accel, tap, natural scroll on touchpads), DRM hotplug via netlink uevents, VT switching, Ctrl+Alt+Backspace emergency exit. *Remaining:* hardware cursor, damage tracking, done since: synchronised subsurfaces. One output at a time until M4 (eDP-1 first).
   - **M1b — Live upgrade (done 2026-11-04, tested nested; DRM path untested):** `davide-wm msg upgrade`, Super+Shift+C or `./run.sh` re-exec the binary on disk with state and fd handover (ADR-014). About 170 ms in a debug build with Chromium and foot open; windows, clipboard, workspaces and the wallpaper survive.
   - **M2 — Bar (done 2026-11-04):** `topbar` ported to `crates/bar`, running on its own thread (ADR-029); the compositor reserves its strip, draws its frames, routes clicks and feeds it workspaces, urgency and windows. Main+Ctrl+Alt+Shift+F12 hides/shows it. Topbar's systemd service is retired at switch-over.
-  - **M3 — Launcher:** port `super` with the tap-Super bind handled internally.
+  - **M3 — Launcher (done 2026-11-04):** `super` ported to `crates/launcher` (desktop entries, `~/2Bookmarks`, `=` calculator). Tapping the main modifier (Super; Alt when nested) toggles it; while open it has the keyboard, Esc or a click outside closes it, Enter launches through the compositor's spawn.
   - **M4 — Monitors:** detailed inventory of `~/0Projects/dawn/crates/` first; then port `monitor-manager`, `blk`, `lid-action`; DPMS, idle blanking (the wallpaper is already done, ADR-023).
   - **M5 — Clipboard history + notifications:** history picker, data-control, notification server with popups/panel.
   - **M6 — Xwayland:** XWM in-process.
@@ -201,7 +201,7 @@ Cargo workspace (ADR-015): one library crate per building block under `crates/`,
 | Window manager | dwindle tree, directional neighbours, `Rect`; later workspaces, rules, fullscreen/maximize, urgency | `crates/wm/` |
 | Outputs | output model, monitor rules, DPMS, idle blanking, blk, lid, headless outputs *(planned)* | `crates/outputs/` |
 | Bar | topbar's widgets, layout and drawing on a dedicated thread with its own epoll loop (`event_loop.rs`, `zones.rs`); talks to the compositor only through `ToBar`/`FromBar` messages and an eventfd | `crates/bar/` |
-| Launcher | ported super (apps, bookmarks, calc) *(planned)* | `crates/launcher/` |
+| Launcher | desktop-entry and bookmark scan, filtering, calculator, drawing of the box (`apps.rs`, `calc.rs`, `draw.rs`); the compositor owns the overlay (`LauncherView` in `crates/davide-wm/src/server/mod.rs`) and the keyboard grab | `crates/launcher/` |
 | Clipboard | selections, persisted history, picker, data-control *(planned)* | `crates/clipboard/` |
 | Notifications | D-Bus notification server, popups, panel | `crates/notifications/` |
 | XWM | Xwayland process + X11 window management *(planned)* | `crates/xwayland/` |
@@ -233,6 +233,7 @@ davide-wm/
     ├── bar/                # ported topbar: modules/, draw.rs, pulse.rs, dbus.rs (own D-Bus client, to merge with crates/dbus), assets/ font
     ├── dbus/
     ├── jpeg/
+    ├── launcher/           # ported super: apps.rs, calc.rs, draw.rs, assets/ font
     ├── wm/
     └── config/
 ```
@@ -243,7 +244,7 @@ davide-wm/
 
 **Bar (`crates/bar/`)** — Ported from `~/0Projects/topbar` with its compositor-independent code almost unchanged (`draw.rs`, `icons.rs`, the font asset, `pulse.rs`, `dbus.rs`, `notify.rs`, `json.rs`, every sysfs/procfs widget). Removed: the layer-shell client, Hyprland IPC, single-instance and signal handling, urgency tracking. The compositor sends `ToBar::Width`/`Workspaces`/`Clients`/`Click`; the bar answers with `FromBar::Frame` (ARGB pixels, uploaded as a texture), `Workspace` (switch), `FocusApp` (Spotify) and `Notified` (a desktop notification came from an app on that workspace, which turns urgent until visited). Blocking work (helpers with timeouts, MEGA, Spotify HTTP) stays on the bar thread; a panic restarts its loop after 1 s.
 
-**Launcher (`crates/launcher/`)** — Reuses `apps.rs`, `calc.rs`, `exec.rs` and the drawing code from `~/0Projects/super/src/`. The overlay becomes a compositor-owned surface with keyboard grab; tap-Super is detected in the keybind layer (Super pressed and released with no other key in between).
+**Launcher (`crates/launcher/`)** — `apps.rs`, `calc.rs` and `draw.rs` come from `~/0Projects/super` almost unchanged; the layer-shell client, singleton and idle watchdog are gone (the compositor always keeps Esc, the tap and a click outside as ways out). It runs on the main thread: scanning entries on open takes a few milliseconds. Spawned programs get every fd above stderr closed (`close_range`, super's ADR-8).
 
 **Outputs (`crates/outputs/`)** — Absorbs `~/0Projects/dawn/crates/` `monitor-manager` (hotplug rules, workspace placement, eDP-1 watchdog, idle blanking from input activity), `blk`/`blackout-core` (black screen per output; the MSI loses signal on DPMS, so it gets a black plane instead of DPMS off), `lid-action`, and `cast` (headless outputs). Idle blanking honours `idle-inhibit`.
 
@@ -349,6 +350,7 @@ davide-wm/
 | 29 | The bar runs on its own thread, not in the main loop | accepted | 2026-11-04 | topbar's sources block (helpers up to 1 s, HTTP up to 3 s) and may panic; a thread keeps the compositor responsive and alive, and the port stays close to topbar. Its state is not part of the live upgrade: the new process starts a fresh bar. |
 | 30 | `fontdue` and `ureq` (rustls) allowed in `crates/bar` | accepted | 2026-11-04 | Inherited from topbar: font rasterising and the Spotify Web API. Pure Rust; to be revisited (own TLS is out of scope). |
 | 31 | Focus follows the mouse | accepted | 2026-11-04 | Like Hyprland's default (`follow_mouse = 1`): the toplevel under the pointer gets the keyboard focus, and a new window splits the window under the pointer. Workspace switches restore the last focused window until the pointer moves. |
+| 32 | Launcher on the main thread, opened by tapping the main modifier | accepted | 2026-11-04 | Unlike the bar it has no blocking sources; keys go straight to it with no thread hop. The tap is detected in the key handler: the modifier pressed and released with no other key in between. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
