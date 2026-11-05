@@ -21,6 +21,9 @@ pub const EVENT_POINTER_SCROLL_WHEEL: u32 = 404;
 pub const EVENT_POINTER_SCROLL_FINGER: u32 = 405;
 pub const EVENT_POINTER_SCROLL_CONTINUOUS: u32 = 406;
 pub const EVENT_SWITCH_TOGGLE: u32 = 900;
+pub const EVENT_GESTURE_SWIPE_BEGIN: u32 = 800;
+pub const EVENT_GESTURE_SWIPE_UPDATE: u32 = 801;
+pub const EVENT_GESTURE_SWIPE_END: u32 = 802;
 
 pub const POINTER_AXIS_SCROLL_VERTICAL: u32 = 0;
 pub const POINTER_AXIS_SCROLL_HORIZONTAL: u32 = 1;
@@ -66,6 +69,11 @@ extern "C" {
     pub fn libinput_event_pointer_get_scroll_value(ev: *mut libinput_event, axis: u32) -> f64;
 
     pub fn libinput_event_get_switch_event(ev: *mut libinput_event) -> *mut libinput_event;
+    pub fn libinput_event_get_gesture_event(ev: *mut libinput_event) -> *mut libinput_event;
+    pub fn libinput_event_gesture_get_finger_count(ev: *mut libinput_event) -> i32;
+    pub fn libinput_event_gesture_get_dx_unaccelerated(ev: *mut libinput_event) -> f64;
+    pub fn libinput_event_gesture_get_dy_unaccelerated(ev: *mut libinput_event) -> f64;
+    pub fn libinput_event_gesture_get_cancelled(ev: *mut libinput_event) -> i32;
     pub fn libinput_event_switch_get_switch(ev: *mut libinput_event) -> u32;
     pub fn libinput_event_switch_get_switch_state(ev: *mut libinput_event) -> u32;
 

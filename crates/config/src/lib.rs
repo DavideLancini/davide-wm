@@ -258,6 +258,10 @@ pub const CPU_AUTO_LEVELS: (usize, usize) = (2, 4);
 /// the third (percent, while discharging).
 pub const BATTERY_THRESHOLDS: (u32, u32, u32) = (15, 5, 3);
 
+/// Touchpad distance (unaccelerated units, about millimetres) a three-finger
+/// swipe needs to switch workspace.
+pub const SWIPE_DISTANCE: f64 = 60.0;
+
 pub const VOLUME_STEP: i32 = 5;
 pub const BRIGHTNESS_STEP: i32 = 5;
 /// How long the volume/brightness indicator stays.

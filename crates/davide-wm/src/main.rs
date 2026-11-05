@@ -1660,6 +1660,14 @@ impl App {
             // Handled in the event loop, which has the renderer.
             Event::Lid(_) => {}
             Event::Lock => self.lock(),
+            Event::Swipe(step) => {
+                // Numbered workspaces only; from chat or special, start at 1.
+                let next = match self.state.active {
+                    wm::WsId::Num(n) => (n as i32 + step).clamp(1, 41) as u32,
+                    _ => 1,
+                };
+                workspaces::switch(&mut self.state, wm::WsId::Num(next));
+            }
             Event::Sleep(true) => {
                 self.lock();
                 self.sleep_after_frame = true;

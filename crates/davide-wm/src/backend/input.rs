@@ -50,6 +50,8 @@ pub struct Input {
     li: *mut li::libinput,
     udev: *mut li::udev,
     _ctx: Box<Ctx>,
+    /// The swipe in progress: fingers and distance so far.
+    swipe: (i32, f64, f64),
 }
 
 impl Input {
@@ -72,7 +74,7 @@ impl Input {
                 li::udev_unref(udev);
                 return Err(io::Error::other("libinput cannot assign seat0"));
             }
-            Ok(Input { li: l, udev, _ctx: ctx })
+            Ok(Input { li: l, udev, _ctx: ctx, swipe: (0, 0.0, 0.0) })
         }
     }
 
@@ -124,6 +126,23 @@ impl Input {
                                 }
                                 out.push(Event::PointerAxis(wl_axis, v));
                             }
+                        }
+                    }
+                    li::EVENT_GESTURE_SWIPE_BEGIN => {
+                        let g = li::libinput_event_get_gesture_event(ev);
+                        self.swipe = (li::libinput_event_gesture_get_finger_count(g), 0.0, 0.0);
+                    }
+                    li::EVENT_GESTURE_SWIPE_UPDATE => {
+                        let g = li::libinput_event_get_gesture_event(ev);
+                        self.swipe.1 += li::libinput_event_gesture_get_dx_unaccelerated(g);
+                        self.swipe.2 += li::libinput_event_gesture_get_dy_unaccelerated(g);
+                    }
+                    li::EVENT_GESTURE_SWIPE_END => {
+                        let g = li::libinput_event_get_gesture_event(ev);
+                        let (fingers, dx, dy) = std::mem::take(&mut self.swipe);
+                        // A deliberate horizontal three-finger swipe.
+                        if li::libinput_event_gesture_get_cancelled(g) == 0 && fingers == 3 && dx.abs() > 2.0 * dy.abs() && dx.abs() > config::SWIPE_DISTANCE {
+                            out.push(Event::Swipe(if dx < 0.0 { 1 } else { -1 }));
                         }
                     }
                     li::EVENT_SWITCH_TOGGLE => {

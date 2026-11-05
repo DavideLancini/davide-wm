@@ -26,6 +26,8 @@ pub enum Event {
     Lid(bool),
     /// logind asks to lock the session.
     Lock,
+    /// Three fingers across the touchpad: +1 is the next workspace.
+    Swipe(i32),
     /// About to suspend (true), or resumed.
     Sleep(bool),
 }
