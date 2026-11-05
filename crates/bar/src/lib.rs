@@ -114,6 +114,8 @@ pub enum FromBar {
     Bluetooth,
     /// The clock: show or hide the calendar.
     Calendar,
+    /// The battery widget: the battery menu.
+    BatteryMenu,
     /// The audio state after a volume key, for the on-screen indicator:
     /// microphone or output, level and mute.
     Audio { mic: bool, level: u32, muted: bool },

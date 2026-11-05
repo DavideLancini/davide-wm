@@ -270,6 +270,7 @@ pub enum Purpose {
     /// Countdown lengths in seconds; 0 stops the timer.
     Timer(Vec<u64>),
     Power,
+    Battery,
     /// Sink names.
     Outputs(Vec<String>),
     /// Adapter power, then the paired devices.

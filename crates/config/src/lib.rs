@@ -249,6 +249,11 @@ pub const LOCK_PAM_SERVICE: &str = "system-local-login";
 /// temperature (kelvin).
 pub const NIGHT_LIGHT: (u32, u32, u32) = (20, 7, 4000);
 
+/// Charge limit when on: start charging below the first, stop at the second.
+pub const CHARGE_LIMIT: (u32, u32) = (75, 80);
+/// Automatic CPU level: on battery, on the charger.
+pub const CPU_AUTO_LEVELS: (usize, usize) = (2, 4);
+
 /// Battery: warn at the first level, warn again at the second, suspend at
 /// the third (percent, while discharging).
 pub const BATTERY_THRESHOLDS: (u32, u32, u32) = (15, 5, 3);

@@ -443,6 +443,7 @@ impl<'a> Loop<'a> {
                 m.audio.toggle_mic();
             }
             Widget::Clock => self.link.send(FromBar::Calendar),
+            Widget::Battery => self.link.send(FromBar::BatteryMenu),
             Widget::BtHeadphones => self.link.send(FromBar::Bluetooth),
             Widget::Spotify => self.link.send(FromBar::FocusApp("spotify".into())),
             // Compositor state: it answers with ToBar::Display.

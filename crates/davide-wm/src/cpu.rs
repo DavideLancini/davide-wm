@@ -29,10 +29,23 @@ fn sudo(args: &[&str]) {
     let _ = Command::new("sudo").arg("-n").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
+/// The level applied last (1–5).
+pub fn current() -> Option<usize> {
+    std::fs::read_to_string(state()).ok().and_then(|t| t.trim().parse().ok()).filter(|n| (1..=5).contains(n))
+}
+
+pub fn label(level: usize) -> &'static str {
+    LEVELS[level.clamp(1, 5) - 1].label
+}
+
 /// Applies the level after the current one (1 after 5); returns its label.
 pub fn cycle() -> String {
-    let current: usize = std::fs::read_to_string(state()).ok().and_then(|t| t.trim().parse().ok()).filter(|n| (1..=5).contains(n)).unwrap_or(0);
-    let next = current % 5 + 1;
+    set(current().unwrap_or(0) % 5 + 1)
+}
+
+/// Applies a level (1–5); returns its label.
+pub fn set(next: usize) -> String {
+    let next = next.clamp(1, 5);
     let l = &LEVELS[next - 1];
     for (command, value) in [0x1304u64, 0x0f04, 0x1104].into_iter().zip(l.policy) {
         sudo(&["sh", "-c", HUAWEI_SCRIPT, "sh", &format!("0x{:016x}", command | (value << 16))]);

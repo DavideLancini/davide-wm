@@ -109,6 +109,82 @@ pub fn bt_power(on: bool) -> Result<String, String> {
     Ok(format!("Bluetooth {}", if on { "acceso" } else { "spento" }))
 }
 
+fn battery_dir() -> Option<std::path::PathBuf> {
+    std::fs::read_dir("/sys/class/power_supply").ok()?.flatten().map(|e| e.path()).find(|p| std::fs::read_to_string(p.join("type")).is_ok_and(|t| t.trim() == "Battery"))
+}
+
+fn read_num(dir: &std::path::Path, f: &str) -> Option<f64> {
+    std::fs::read_to_string(dir.join(f)).ok()?.trim().parse().ok()
+}
+
+/// Whether the charger is plugged in.
+pub fn on_ac() -> bool {
+    std::fs::read_dir("/sys/class/power_supply").into_iter().flatten().flatten().any(|e| {
+        std::fs::read_to_string(e.path().join("type")).is_ok_and(|t| t.trim() == "Mains") && std::fs::read_to_string(e.path().join("online")).is_ok_and(|o| o.trim() == "1")
+    })
+}
+
+/// What the battery menu shows.
+pub struct BatteryInfo {
+    pub level: u32,
+    pub status: String,
+    pub watts: f64,
+    /// Hours to empty (discharging) or to full (charging).
+    pub hours: Option<f64>,
+    pub health: Option<f64>,
+    pub cycles: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+pub fn battery_info() -> Option<BatteryInfo> {
+    let d = battery_dir()?;
+    let level = read_num(&d, "capacity")? as u32;
+    let status = std::fs::read_to_string(d.join("status")).unwrap_or_default().trim().to_string();
+    let (now, full, design) = match (read_num(&d, "energy_now"), read_num(&d, "energy_full"), read_num(&d, "energy_full_design")) {
+        (Some(n), Some(f), dsg) => (Some(n), Some(f), dsg),
+        _ => (read_num(&d, "charge_now"), read_num(&d, "charge_full"), read_num(&d, "charge_full_design")),
+    };
+    let watts = match read_num(&d, "power_now") {
+        Some(p) => p / 1e6,
+        None => read_num(&d, "current_now").unwrap_or(0.0) * read_num(&d, "voltage_now").unwrap_or(0.0) / 1e12,
+    };
+    // Charge-based batteries: the rate in the same unit as charge_now.
+    let rate = read_num(&d, "power_now").or(read_num(&d, "current_now")).filter(|r| *r > 0.0);
+    let hours = match (status.as_str(), now, full, rate) {
+        ("Discharging", Some(n), _, Some(r)) => Some(n / r),
+        ("Charging", Some(n), Some(f), Some(r)) => Some((f - n).max(0.0) / r),
+        _ => None,
+    };
+    Some(BatteryInfo {
+        level,
+        status,
+        watts,
+        hours,
+        health: full.zip(design).filter(|(_, d)| *d > 0.0).map(|(f, d)| f / d * 100.0),
+        cycles: read_num(&d, "cycle_count").map(|c| c as u32),
+        limit: read_num(&d, "charge_control_end_threshold").map(|l| l as u32),
+    })
+}
+
+/// Sets the charge thresholds (root: through `sudo -n`).
+pub fn set_charge_limit(on: bool) -> Result<String, String> {
+    let d = battery_dir().ok_or("no battery")?;
+    let (start, end) = if on { config::CHARGE_LIMIT } else { (0, 100) };
+    // End first: from (0, 100) and back the start stays below the end.
+    for (file, v) in [("charge_control_end_threshold", end), ("charge_control_start_threshold", start)] {
+        let path = d.join(file);
+        let ok = std::process::Command::new("sudo")
+            .args(["-n", "sh", "-c", &format!("echo {v} > {}", path.display())])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok && file.contains("end") {
+            return Err(format!("cannot write {}", path.display()));
+        }
+    }
+    Ok(if on { format!("Limite di carica: {end}%") } else { "Limite di carica: spento".into() })
+}
+
 /// Battery level and whether it is discharging, from sysfs.
 pub fn battery() -> Option<(u32, bool)> {
     let dir = std::fs::read_dir("/sys/class/power_supply").ok()?.flatten().map(|e| e.path()).find(|p| {

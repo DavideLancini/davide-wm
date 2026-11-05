@@ -31,4 +31,5 @@ pub enum Widget {
     Spotify,
     Microphone,
     Clock,
+    Battery,
 }

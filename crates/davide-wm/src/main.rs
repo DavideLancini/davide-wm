@@ -215,6 +215,8 @@ struct App {
     /// Ticks every minute for the battery watch.
     battery_timer: OwnedFd,
     battery: services::BatteryWatch,
+    /// The charger as last seen by the automatic CPU level.
+    ac: Option<bool>,
     night: display::Night,
     /// The multipliers last handed to the backend.
     night_sent: Option<Option<(f32, f32, f32)>>,
@@ -409,6 +411,23 @@ impl App {
         self.state.abandoned.retain(|p| *p != purpose);
         match purpose {
             Purpose::Apps => {}
+            Purpose::Battery => match i {
+                2 => {
+                    let on = services::battery_info().and_then(|b| b.limit).is_some_and(|l| l < 100);
+                    self.jobs.push(Box::new(move || services::set_charge_limit(!on).map(worker::Done::Osd)));
+                }
+                3 => {
+                    set_cpu_auto(true);
+                    self.ac = None;
+                    self.cpu_auto();
+                }
+                n @ 4..=8 => {
+                    set_cpu_auto(false);
+                    let level = n - 3;
+                    self.jobs.push(Box::new(move || Ok(worker::Done::Cpu(cpu::set(level)))));
+                }
+                _ => {}
+            },
             Purpose::Power => match i {
                 0 => self.lock(),
                 1 => self.jobs.push(Box::new(|| services::power(services::Power::Suspend).map(|_| worker::Done::Saved))),
@@ -469,7 +488,7 @@ impl App {
     /// Delete in a picker.
     fn deleted(&mut self, purpose: Purpose, i: usize) {
         match purpose {
-            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) | Purpose::Timer(_) | Purpose::Power | Purpose::Outputs(_) | Purpose::Bluetooth(..) => {}
+            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) | Purpose::Timer(_) | Purpose::Power | Purpose::Battery | Purpose::Outputs(_) | Purpose::Bluetooth(..) => {}
             Purpose::Clipboard(hashes) => {
                 if let Some(j) = self.clip_index(&hashes, i) {
                     self.state.selection.history.entries.remove(j);
@@ -645,9 +664,63 @@ impl App {
         }
     }
 
+    /// The battery menu: state, then the charge limit and the CPU level.
+    fn open_battery(&mut self) {
+        let Some(b) = services::battery_info() else {
+            self.show_osd("Nessuna batteria", None);
+            return;
+        };
+        let status = match b.status.as_str() {
+            "Charging" => "in carica",
+            "Discharging" => "in scarica",
+            "Full" => "carica",
+            "Not charging" => "ferma",
+            other => other,
+        };
+        let time = b.hours.map(|h| format!(" · {}h{:02} {}", h as u32, (h.fract() * 60.0) as u32, if b.status == "Charging" { "alla carica" } else { "rimanenti" })).unwrap_or_default();
+        let mut labels = vec![
+            format!("Batteria {}% · {status} · {:.1} W{time}", b.level, b.watts),
+            format!(
+                "Salute {} · {} cicli",
+                b.health.map(|h| format!("{h:.0}%")).unwrap_or("?".into()),
+                b.cycles.map(|c| c.to_string()).unwrap_or("?".into())
+            ),
+            match b.limit {
+                Some(l) if l < 100 => format!("Limite di carica {l}%: attivo (Invio per caricare al 100%)"),
+                Some(_) => format!("Limite di carica {}%: spento (Invio per attivarlo)", config::CHARGE_LIMIT.1),
+                None => "Limite di carica: non disponibile".into(),
+            },
+        ];
+        let (bat, ac) = config::CPU_AUTO_LEVELS;
+        let auto = cpu_auto();
+        labels.push(format!("CPU automatica (livello {bat} a batteria, {ac} in carica){}", if auto { " · attiva" } else { "" }));
+        let current = cpu::current();
+        for level in 1..=5 {
+            let mark = if !auto && current == Some(level) { " · attuale" } else { "" };
+            labels.push(format!("CPU {}{mark}", cpu::label(level)));
+        }
+        self.state.open_view(launcher::Launcher::picker(labels), Purpose::Battery);
+    }
+
+    /// Automatic CPU level: applied when the charger comes or goes.
+    fn cpu_auto(&mut self) {
+        if !cpu_auto() {
+            return;
+        }
+        let ac = services::on_ac();
+        if self.ac == Some(ac) {
+            return;
+        }
+        self.ac = Some(ac);
+        let (bat, plugged) = config::CPU_AUTO_LEVELS;
+        let level = if ac { plugged } else { bat };
+        self.jobs.push(Box::new(move || Ok(worker::Done::Cpu(cpu::set(level)))));
+    }
+
     /// The battery watch's minute tick.
     fn battery_tick(&mut self) {
         self.night_light();
+        self.cpu_auto();
         let Some((level, discharging)) = services::battery() else { return };
         match self.battery.check(level, discharging) {
             services::BatteryAlert::None => return,
@@ -1128,7 +1201,6 @@ impl App {
             bar::FromBar::ToggleNotifications => self.open_notifications(),
             bar::FromBar::ToggleDnd => self.set_dnd(!notify::dnd()),
             bar::FromBar::Wifi => self.wifi_job = Some(None),
-            bar::FromBar::CpuCycle => self.cpu_job = true,
             bar::FromBar::Brightness(pct) => {
                 if let Some(pct) = brightness::set_panel(pct) {
                     self.ddc = Some(pct);
@@ -1162,6 +1234,11 @@ impl App {
             }
             bar::FromBar::Bluetooth => self.jobs.push(Box::new(|| services::bt_devices().map(|(p, d)| worker::Done::Bluetooth(p, d)))),
             bar::FromBar::Calendar => self.toggle_calendar(),
+            bar::FromBar::BatteryMenu => self.open_battery(),
+            bar::FromBar::CpuCycle => {
+                set_cpu_auto(false);
+                self.cpu_job = true;
+            }
             bar::FromBar::CycleScreensaver => {
                 let mut ss = self.display.screensaver;
                 ss.cycle();
@@ -1639,6 +1716,7 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         jobs: Vec::new(),
         battery_timer: event_loop::timer_fd().expect("timerfd"),
         battery: services::BatteryWatch::default(),
+        ac: None,
         night: display::Night::Auto,
         night_sent: None,
         damage_tracking: true,
@@ -1742,6 +1820,24 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn cpu_auto_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
+    dir.join("davide-wm/cpu-auto")
+}
+
+/// The CPU level follows the charger (a state file, so it survives restarts).
+fn cpu_auto() -> bool {
+    cpu_auto_path().exists()
+}
+
+fn set_cpu_auto(on: bool) {
+    let p = cpu_auto_path();
+    let _ = match on {
+        true => p.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::write(&p, "")),
+        false => std::fs::remove_file(&p),
+    };
 }
 
 /// Writes a screenshot to `$HOME/SCREENSHOT_DIR/Screenshot_<local time>.png`.

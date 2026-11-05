@@ -256,7 +256,7 @@ fn status_widgets(state: &mut State) -> Vec<(String, Target, u32)> {
         (state.bluetooth.text(), Target::Widget(Widget::BtHeadphones), icons::color::BLUETOOTH),
         (icons::with(icons::HEADPHONES, &state.bt_headphones.text()), Target::Widget(Widget::BtHeadphones), icons::color::BT_HEADPHONES),
         (icons::with(icons::BRIGHTNESS, &super::backlight::text()), Target::Widget(Widget::Backlight), icons::color::BACKLIGHT),
-        (icons::with(icons::BATTERY, &state.every.get("battery", 15, super::battery::text)), Target::Widget(Widget::Backlight), state.every.get("battery color", 15, || battery_color().to_string()).parse().unwrap_or(icons::color::BATTERY_DRAINING)),
+        (icons::with(icons::BATTERY, &state.every.get("battery", 15, super::battery::text)), Target::Widget(Widget::Battery), state.every.get("battery color", 15, || battery_color().to_string()).parse().unwrap_or(icons::color::BATTERY_DRAINING)),
         (
             icons::with(icons::BELL, &state.notifications),
             Target::Widget(Widget::Notifications),
