@@ -206,7 +206,7 @@ fn apply(s: &mut State, key: SKey, mut p: Pending) {
             x.geometry = Some(g);
         }
     }
-    s.needs_redraw = true;
+    s.damage_surface(key);
     xdg::commit(s, key);
 }
 

@@ -106,7 +106,8 @@ pub fn pointer(s: &mut State, c: ClientId, op: u16, args: Args) {
         }
         s.pointer.cursor = CursorImage::Surface(key, hx, hy);
     }
-    s.needs_redraw = true;
+    s.cursor_changed = true;
+    s.cursor_image_dirty = true;
 }
 
 fn keyboard_enter(s: &mut State, key: SKey, only: Option<u32>) {
@@ -308,7 +309,7 @@ fn update_pointer(s: &mut State, x: f64, y: f64) {
         }
         pointer_frame(s, k.client);
     }
-    s.needs_redraw = true;
+    s.cursor_changed = true;
 }
 
 pub fn pointer_button(s: &mut State, button: u32, pressed: bool) {

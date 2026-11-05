@@ -248,6 +248,27 @@ impl Drm {
             .collect()
     }
 
+    /// The hardware cursor of the primary head.
+    pub fn cursor_size(&self) -> Option<(u32, u32)> {
+        self.kms.cursor_size(0)
+    }
+
+    pub fn set_cursor_image(&mut self, w: u32, h: u32, argb: &[u8]) {
+        self.kms.set_cursor_image(0, w, h, argb);
+    }
+
+    pub fn set_cursor_pos(&mut self, pos: Option<(i32, i32)>) {
+        self.kms.set_cursor_pos(0, pos);
+    }
+
+    /// Moves the cursor without a frame; false while a flip is pending.
+    pub fn commit_cursor(&mut self) -> io::Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
+        self.kms.commit_cursor(0)
+    }
+
     /// Colour multipliers for every head (night light); applied with the
     /// next frame.
     pub fn set_gamma(&mut self, g: Option<(f32, f32, f32)>) {

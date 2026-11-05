@@ -372,6 +372,11 @@ impl State {
             serial,
             start,
             needs_redraw: _,
+            damage: _,
+            cursor_changed: _,
+            cursor_image_dirty: _,
+            cursor_drawn: _,
+            hw_cursor: _,
             pointer_dirty: _,
             dead_textures: _,
         } = self;

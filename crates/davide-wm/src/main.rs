@@ -218,6 +218,19 @@ struct App {
     night: display::Night,
     /// The multipliers last handed to the backend.
     night_sent: Option<Option<(f32, f32, f32)>>,
+    /// Partial redraws (`davide-wm msg damage off` draws whole frames).
+    damage_tracking: bool,
+    /// Frames drawn on the primary head, and the one each buffer last got.
+    frame_no: u64,
+    buffer_frame: std::collections::HashMap<usize, u64>,
+    /// Recent frames and what they redrew (None: everything).
+    damage_log: std::collections::VecDeque<(u64, Option<wm::Rect>)>,
+    /// Hardware cursor (`davide-wm msg cursor sw` draws it in the scene).
+    hw_cursor_enabled: bool,
+    /// The image on the cursor plane, and whether it fit.
+    cursor_image: Option<(server::CursorImage, bool)>,
+    /// The cursor plane must move without a frame.
+    cursor_moved: bool,
 }
 
 type Job = Box<dyn FnOnce() -> Result<worker::Done, String> + Send>;
@@ -1012,6 +1025,14 @@ impl App {
             ipc::Command::Cast(window) => return self.cast_now(window),
             ipc::Command::CastStop(id) => self.casts.stop(id),
             ipc::Command::Lock => self.lock(),
+            ipc::Command::Damage(on) => {
+                self.damage_tracking = on;
+                self.state.needs_redraw = true;
+            }
+            ipc::Command::HwCursor(on) => {
+                self.hw_cursor_enabled = on;
+                self.state.needs_redraw = true;
+            }
             ipc::Command::Night(arg) => {
                 match arg.as_deref() {
                     None => {}
@@ -1180,6 +1201,7 @@ impl App {
             }
         }
         self.last_frame = None;
+        self.forget_buffers();
         self.state.needs_redraw = true;
     }
 
@@ -1205,6 +1227,7 @@ impl App {
         self.display.set_screensaver(s);
         self.display.black_shown.clear();
         self.last_frame = None;
+        self.forget_buffers();
         self.mirrors_stale.clear();
         self.state.needs_redraw = true;
         self.sync_notices();
@@ -1239,9 +1262,98 @@ impl App {
 
     /// Draws the primary output, copies it to the mirrors, or shows black
     /// while blanked.
+    /// Forgets what the buffers show: the next frames are whole.
+    fn forget_buffers(&mut self) {
+        self.buffer_frame.clear();
+        self.damage_log.clear();
+    }
+
+    /// The area buffer `idx` must redraw to show the scene, given what it
+    /// showed last: None for everything.
+    fn region_for(&mut self, idx: usize, full: bool) -> Option<wm::Rect> {
+        let union = |a: wm::Rect, b: wm::Rect| {
+            let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+            let (x1, y1) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
+            wm::Rect::new(x0, y0, x1 - x0, y1 - y0)
+        };
+        let this = (!full && self.damage_tracking).then(|| self.state.damage.iter().copied().reduce(union)).flatten();
+        self.frame_no += 1;
+        let region = match (this, self.buffer_frame.get(&idx).copied()) {
+            (Some(now), Some(last)) => {
+                let covered = self.damage_log.front().is_some_and(|(f, _)| *f <= last + 1);
+                let missed: Option<Vec<Option<wm::Rect>>> = covered.then(|| self.damage_log.iter().filter(|(f, _)| *f > last).map(|(_, r)| *r).collect());
+                missed.and_then(|m| m.into_iter().try_fold(now, |acc, r| r.map(|r| union(acc, r))))
+            }
+            _ => None,
+        };
+        self.damage_log.push_back((self.frame_no, this));
+        while self.damage_log.len() > 8 {
+            self.damage_log.pop_front();
+        }
+        self.buffer_frame.insert(idx, self.frame_no);
+        region
+    }
+
+    /// Chooses between the cursor plane and drawing the pointer in the
+    /// scene, and turns pointer changes into plane moves or damage.
+    fn update_cursor(&mut self, r: &mut Renderer) {
+        let heads = self.backend.heads().len();
+        let usable = self.hw_cursor_enabled && heads == 1 && self.casts.is_empty() && self.state.drag.is_none() && !self.display.blanked;
+        let mut hw = false;
+        if let (Backend::Drm(d), true) = (&mut self.backend, usable) {
+            if let Some(max) = d.cursor_size() {
+                let image = self.state.pointer.cursor;
+                if self.state.cursor_image_dirty || self.cursor_image.is_none_or(|(i, _)| i != image) {
+                    self.state.upload_pending(r);
+                    let pixels = self.state.cursor_pixels(r, max);
+                    if let Some((w, h, px)) = &pixels {
+                        d.set_cursor_image(*w, *h, px);
+                    }
+                    self.cursor_image = Some((image, pixels.is_some()));
+                    self.state.cursor_image_dirty = false;
+                    self.state.cursor_changed = true;
+                }
+                hw = self.cursor_image.is_some_and(|(_, fits)| fits);
+            }
+        }
+        if hw != self.state.hw_cursor {
+            self.state.hw_cursor = hw;
+            self.state.needs_redraw = true;
+            self.state.cursor_changed = true;
+            if let (false, Backend::Drm(d)) = (hw, &mut self.backend) {
+                d.set_cursor_pos(None);
+                self.cursor_moved = true;
+            }
+        }
+        if !std::mem::take(&mut self.state.cursor_changed) {
+            return;
+        }
+        if hw {
+            let (x, y) = (self.state.pointer.x as i32, self.state.pointer.y as i32);
+            let pos = match self.state.pointer.cursor {
+                server::CursorImage::Hidden => None,
+                server::CursorImage::Default => Some((x, y)),
+                server::CursorImage::Surface(_, hx, hy) => Some((x - hx, y - hy)),
+            };
+            if let Backend::Drm(d) = &mut self.backend {
+                d.set_cursor_pos(pos);
+            }
+            self.cursor_moved = true;
+        } else {
+            if let Some(old) = self.state.cursor_drawn {
+                self.state.damage(old);
+            }
+            if let Some(new) = self.state.cursor_rect() {
+                self.state.damage(new);
+            }
+        }
+    }
+
     fn render(&mut self, r: &mut Renderer) -> io::Result<()> {
         let heads = self.backend.heads().len();
+        self.update_cursor(r);
         if self.display.blanked {
+            self.forget_buffers();
             for h in 0..heads {
                 if self.display.black_shown.contains(&h) {
                     continue;
@@ -1255,9 +1367,12 @@ impl App {
             }
             return Ok(());
         }
-        if self.state.needs_redraw {
+        if self.state.needs_redraw || !self.state.damage.is_empty() {
             if let Some(i) = self.backend.acquire(0, r)? {
-                self.state.render(r, self.backend.target(0, i));
+                let full = self.state.needs_redraw;
+                let region = self.region_for(i, full);
+                self.state.render_damaged(r, self.backend.target(0, i), region);
+                self.cursor_moved = false;
                 if !self.casts.is_empty() {
                     self.casts.frames(&mut self.state, r, self.backend.target(0, i));
                 }
@@ -1277,6 +1392,18 @@ impl App {
                 }
                 self.casts.catch_up = true;
                 self.state.needs_redraw = true;
+            }
+        } else if self.cursor_moved {
+            if let Backend::Drm(d) = &mut self.backend {
+                match d.commit_cursor() {
+                    Ok(true) => self.cursor_moved = false,
+                    // A flip is pending: again after it.
+                    Ok(false) => {}
+                    Err(e) => {
+                        log!("cursor: {e}");
+                        self.cursor_moved = false;
+                    }
+                }
             }
         }
         let Some(src) = self.last_frame else { return Ok(()) };
@@ -1475,6 +1602,13 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         battery: services::BatteryWatch::default(),
         night: display::Night::Auto,
         night_sent: None,
+        damage_tracking: true,
+        frame_no: 0,
+        buffer_frame: std::collections::HashMap::new(),
+        damage_log: std::collections::VecDeque::new(),
+        hw_cursor_enabled: true,
+        cursor_image: None,
+        cursor_moved: false,
     }
 }
 

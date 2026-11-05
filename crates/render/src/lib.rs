@@ -102,6 +102,8 @@ pub struct Renderer {
     solid: Program,
     textured: Program,
     viewport: (i32, i32),
+    /// The damaged area of this frame: drawing never leaves it.
+    region: Option<Quad>,
 }
 
 const VERTEX: &str = "#version 100
@@ -243,6 +245,7 @@ impl Renderer {
                 solid,
                 textured,
                 viewport: (1, 1),
+                region: None,
             })
         }
     }
@@ -322,7 +325,24 @@ impl Renderer {
     }
 
     pub fn begin(&mut self, t: &Target, clear: [f32; 4]) {
+        self.begin_region(t, clear, None);
+    }
+
+    /// Starts a frame that only redraws `region` (the rest of the buffer
+    /// keeps what it showed); None redraws everything.
+    pub fn begin_region(&mut self, t: &Target, clear: [f32; 4], region: Option<Quad>) {
         self.viewport = (t.width, t.height);
+        self.region = region;
+        if region.is_some() {
+            unsafe {
+                gl::glBindFramebuffer(gl::FRAMEBUFFER, t.fbo);
+                gl::glViewport(0, 0, t.width, t.height);
+                gl::glClearColor(clear[0], clear[1], clear[2], clear[3]);
+            }
+            self.clip(None);
+            unsafe { gl::glClear(gl::COLOR_BUFFER_BIT) };
+            return;
+        }
         unsafe {
             gl::glBindFramebuffer(gl::FRAMEBUFFER, t.fbo);
             gl::glViewport(0, 0, t.width, t.height);
@@ -353,6 +373,14 @@ impl Renderer {
 
     /// Restricts drawing to `clip` until the next call; `None` removes it.
     pub fn clip(&mut self, clip: Option<Quad>) {
+        let clip = match (clip, self.region) {
+            (Some(a), Some(b)) => {
+                let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+                let (x1, y1) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));
+                Some(Quad { x: x0, y: y0, w: (x1 - x0).max(0.0), h: (y1 - y0).max(0.0) })
+            }
+            (a, b) => a.or(b),
+        };
         unsafe {
             match clip {
                 None => gl::glDisable(gl::SCISSOR_TEST),

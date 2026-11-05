@@ -33,8 +33,23 @@ struct ScanBuffer {
     handle: u32,
 }
 
+/// The cursor plane of a head and its dumb buffer, mapped for writing.
+struct Cursor {
+    plane: u32,
+    fb: u32,
+    handle: u32,
+    map: *mut u8,
+    len: usize,
+    pitch: u32,
+    size: (u32, u32),
+}
+
 struct Head {
     output: Output,
+    cursor: Option<Cursor>,
+    /// Where the cursor should be (None: hidden) and what the CRTC has.
+    cursor_want: Option<(i32, i32)>,
+    cursor_sent: Option<Option<(i32, i32)>>,
     buffers: Vec<ScanBuffer>,
     front: Option<usize>,
     pending: Option<usize>,
@@ -295,6 +310,81 @@ impl Kms {
         ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_ATOMIC, &mut a)
     }
 
+    /// A free cursor plane for `crtc` with a mapped ARGB buffer.
+    fn cursor_for(&self, crtc: u32) -> io::Result<Option<Cursor>> {
+        let raw = self.fd.as_raw_fd();
+        let Some(index) = self.crtcs.iter().position(|c| *c == crtc) else { return Ok(None) };
+        let taken: Vec<u32> = self.heads.iter().filter_map(|h| h.cursor.as_ref().map(|c| c.plane)).collect();
+        let Some(plane) = self.planes.iter().find(|(p, pc, kind)| pc & (1 << index) != 0 && *kind == drm::PLANE_TYPE_CURSOR && !taken.contains(p)).map(|(p, ..)| *p) else {
+            return Ok(None);
+        };
+        let cap = |c| {
+            let mut g = drm::GetCap { capability: c, value: 0 };
+            ioctl(raw, drm::IOCTL_GET_CAP, &mut g).map(|_| g.value as u32).unwrap_or(64).max(1)
+        };
+        let size = (cap(drm::CAP_CURSOR_WIDTH), cap(drm::CAP_CURSOR_HEIGHT));
+        let mut dumb = drm::CreateDumb { width: size.0, height: size.1, bpp: 32, ..Default::default() };
+        ioctl(raw, drm::IOCTL_MODE_CREATE_DUMB, &mut dumb)?;
+        let mut cmd = drm::FbCmd2 { width: size.0, height: size.1, pixel_format: drm::FORMAT_ARGB8888, ..Default::default() };
+        cmd.handles[0] = dumb.handle;
+        cmd.pitches[0] = dumb.pitch;
+        if let Err(e) = ioctl(raw, drm::IOCTL_MODE_ADDFB2, &mut cmd) {
+            self.free_fb(0, dumb.handle);
+            return Err(e);
+        }
+        let mut map = drm::MapDumb { handle: dumb.handle, ..Default::default() };
+        ioctl(raw, drm::IOCTL_MODE_MAP_DUMB, &mut map)?;
+        let len = dumb.size as usize;
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, raw, map.offset as libc::off_t) };
+        if ptr == libc::MAP_FAILED {
+            self.free_fb(cmd.fb_id, dumb.handle);
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, len) };
+        Ok(Some(Cursor { plane, fb: cmd.fb_id, handle: dumb.handle, map: ptr.cast(), len, pitch: dumb.pitch, size }))
+    }
+
+    /// Size of the hardware cursor of `head`, if it has one.
+    pub fn cursor_size(&self, head: usize) -> Option<(u32, u32)> {
+        self.heads.get(head)?.cursor.as_ref().map(|c| c.size)
+    }
+
+    /// Writes the cursor image: ARGB8888 (bytes B, G, R, A, premultiplied),
+    /// `w`x`h` at most the cursor size; the rest is cleared.
+    pub fn set_cursor_image(&mut self, head: usize, w: u32, h: u32, argb: &[u8]) {
+        let Some(c) = self.heads.get_mut(head).and_then(|h| h.cursor.as_mut()) else { return };
+        unsafe { std::ptr::write_bytes(c.map, 0, c.len) };
+        for row in 0..h.min(c.size.1) {
+            let n = (w.min(c.size.0) * 4) as usize;
+            let src = &argb[(row * w * 4) as usize..][..n];
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), c.map.add((row * c.pitch) as usize), n) };
+        }
+        // The plane may show the old image until the next commit.
+        if let Some(h) = self.heads.get_mut(head) {
+            h.cursor_sent = None;
+        }
+    }
+
+    /// Where the cursor's top-left goes (None hides it), from the next commit.
+    pub fn set_cursor_pos(&mut self, head: usize, pos: Option<(i32, i32)>) {
+        if let Some(h) = self.heads.get_mut(head) {
+            h.cursor_want = pos;
+        }
+    }
+
+    /// Moves the cursor without a new frame: the shown buffer again, with the
+    /// cursor plane updated. False while a flip is pending (try again after).
+    pub fn commit_cursor(&mut self, head: usize) -> io::Result<bool> {
+        let Some(h) = self.heads.get(head) else { return Ok(true) };
+        if h.cursor_sent == Some(h.cursor_want) {
+            return Ok(true);
+        }
+        match (h.pending, h.front, h.modeset) {
+            (None, Some(front), false) => self.present(head, front).map(|_| true),
+            _ => Ok(false),
+        }
+    }
+
     fn create_blob_bytes(&self, data: &[u8]) -> io::Result<u32> {
         let mut b = drm::CreateBlob { data: data.as_ptr() as u64, length: data.len() as u32, blob_id: 0 };
         ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_CREATEPROPBLOB, &mut b)?;
@@ -345,6 +435,13 @@ impl Kms {
         if let Some(blob) = h.mode_blob {
             self.destroy_blob(blob);
         }
+        if let Some(blob) = h.gamma_blob {
+            self.destroy_blob(blob);
+        }
+        if let Some(c) = h.cursor.take() {
+            unsafe { libc::munmap(c.map.cast(), c.len) };
+            self.free_fb(c.fb, c.handle);
+        }
     }
 
     fn destroy_blob(&self, blob: u32) {
@@ -381,7 +478,21 @@ impl Kms {
                 buffers.push(ScanBuffer { target, fb, handle });
             }
             log!("output {} ({}): {}x{}@{:.2}", o.name, o.model, size.0, size.1, o.mode.refresh_mhz() as f64 / 1000.0);
-            self.heads.push(Head { output: o, buffers, front: None, pending: None, modeset: true, mode_blob: None, on: true, gamma_sent: None, gamma_blob: None });
+            let cursor = self.cursor_for(o.crtc).inspect_err(|e| log!("no hardware cursor on {}: {e}", o.name)).ok().flatten();
+            self.heads.push(Head {
+                output: o,
+                cursor,
+                cursor_want: None,
+                cursor_sent: None,
+                buffers,
+                front: None,
+                pending: None,
+                modeset: true,
+                mode_blob: None,
+                on: true,
+                gamma_sent: None,
+                gamma_blob: None,
+            });
         }
         for h in old {
             log!("output {} released", h.output.name);
@@ -457,6 +568,25 @@ impl Kms {
                 ("CRTC_H", h_px),
             ],
         )];
+        if let Some(c) = h.cursor.as_ref().filter(|_| h.cursor_sent != Some(h.cursor_want) || h.modeset) {
+            let props = match h.cursor_want {
+                Some((x, y)) => vec![
+                    ("FB_ID", c.fb as u64),
+                    ("CRTC_ID", o.crtc as u64),
+                    ("SRC_X", 0),
+                    ("SRC_Y", 0),
+                    ("SRC_W", (c.size.0 as u64) << 16),
+                    ("SRC_H", (c.size.1 as u64) << 16),
+                    ("CRTC_X", x as i64 as u64),
+                    ("CRTC_Y", y as i64 as u64),
+                    ("CRTC_W", c.size.0 as u64),
+                    ("CRTC_H", c.size.1 as u64),
+                ],
+                None => vec![("FB_ID", 0), ("CRTC_ID", 0)],
+            };
+            objs.push((c.plane, props));
+        }
+        let cursor_now = h.cursor.as_ref().map(|_| h.cursor_want);
         let mut flags = drm::MODE_PAGE_FLIP_EVENT;
         // The night light rides along with the next frame of each head.
         let want = self.gamma.unwrap_or((1.0, 1.0, 1.0));
@@ -510,6 +640,9 @@ impl Kms {
             }
         }
         let h = &mut self.heads[head];
+        if let Some(c) = cursor_now {
+            h.cursor_sent = Some(c);
+        }
         h.modeset = false;
         h.pending = Some(idx);
         Ok(())

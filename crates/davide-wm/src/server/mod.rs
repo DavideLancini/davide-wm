@@ -457,7 +457,18 @@ pub struct State {
     pub xwm: Option<xwm::Xwm>,
     serial: u32,
     start: Instant,
+    /// The whole output must be drawn again.
     pub needs_redraw: bool,
+    /// Areas to draw again when `needs_redraw` is not set.
+    pub damage: Vec<Rect>,
+    /// The pointer moved or changed image.
+    pub cursor_changed: bool,
+    /// The cursor surface committed: the hardware cursor needs its image again.
+    pub cursor_image_dirty: bool,
+    /// Where the software cursor was drawn last.
+    pub cursor_drawn: Option<Rect>,
+    /// The cursor is on its own plane: the scene does not draw it.
+    pub hw_cursor: bool,
     /// The layout changed: the surface under the pointer may be another one.
     pub pointer_dirty: bool,
     dead_textures: Vec<Texture>,
@@ -510,6 +521,11 @@ impl State {
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
+            damage: Vec::new(),
+            cursor_changed: false,
+            cursor_image_dirty: false,
+            cursor_drawn: None,
+            hw_cursor: false,
             pointer_dirty: false,
             dead_textures: Vec::new(),
         };
@@ -989,7 +1005,9 @@ impl State {
     pub fn set_bar_frame(&mut self, r: &mut Renderer, width: u32, height: u32, pixels: &[u8]) {
         let old = self.bar.tex.take();
         self.bar.tex = Some(r.upload(old, width as i32, height as i32, width as i32 * 4, pixels));
-        self.needs_redraw = true;
+        if self.bar.visible {
+            self.damage(Rect::new(0, 0, width as i32, height as i32));
+        }
     }
 
     /// What the bar shows about workspaces and windows.
@@ -1124,7 +1142,100 @@ impl State {
         r.draw_cropped(t, src, Quad { x: 0.0, y: 0.0, w: ow, h: oh });
     }
 
+    pub fn damage(&mut self, r: Rect) {
+        if r.w > 0 && r.h > 0 {
+            self.damage.push(r);
+        }
+    }
+
+    /// Where the pointer's image is, if any.
+    pub fn cursor_rect(&self) -> Option<Rect> {
+        let (x, y) = (self.pointer.x as i32, self.pointer.y as i32);
+        match self.pointer.cursor {
+            CursorImage::Hidden => None,
+            CursorImage::Default => Some(Rect::new(x, y, 10, 10)),
+            CursorImage::Surface(k, hx, hy) => self.surfaces.get(&k).map(|s| Rect::new(x - hx, y - hy, s.size.0.max(1), s.size.1.max(1))),
+        }
+    }
+
+    /// A surface committed: the area of its window (or popup) on screen
+    /// needs drawing; nothing when it is not shown.
+    pub fn damage_surface(&mut self, key: SKey) {
+        let mut root = key;
+        while let Some(Role::Subsurface { parent, .. }) = self.surfaces.get(&root).map(|s| &s.role) {
+            root.id = *parent;
+        }
+        match self.surfaces.get(&root).map(|s| &s.role) {
+            Some(Role::Cursor) => {
+                self.cursor_changed = true;
+                self.cursor_image_dirty = true;
+                return;
+            }
+            Some(Role::DndIcon) => {
+                self.needs_redraw = true;
+                return;
+            }
+            None => return,
+            _ => {}
+        }
+        if let Some((_, r)) = self.layout.iter().find(|(k, _)| *k == root) {
+            self.damage(*r);
+            return;
+        }
+        let size = self.surfaces.get(&root).map(|s| s.size).unwrap_or((0, 0));
+        if let Some(XdgRole::Popup { .. }) = self.surfaces.get(&root).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
+            if let Some(origin) = self.window_origin(root) {
+                let (x, y) = self.surface_origin(root, origin);
+                self.damage(Rect::new(x, y, size.0, size.1));
+            }
+            return;
+        }
+        if let Some((_, (x, y))) = xwm::floating(self).into_iter().find(|(k, _)| *k == root) {
+            self.damage(Rect::new(x, y, size.0, size.1));
+        }
+    }
+
+    /// Uploads committed buffers (the hardware cursor reads its image).
+    pub fn upload_pending(&mut self, r: &mut Renderer) {
+        self.upload_buffers(r);
+    }
+
+    /// The pointer's image for a cursor plane of at most `max`: width,
+    /// height and ARGB8888 bytes (B, G, R, A). None when it does not fit.
+    pub fn cursor_pixels(&self, r: &mut Renderer, max: (u32, u32)) -> Option<(u32, u32, Vec<u8>)> {
+        match self.pointer.cursor {
+            CursorImage::Hidden => Some((1, 1, vec![0; 4])),
+            CursorImage::Default => {
+                let px = (0..100).flat_map(|i| {
+                    let (x, y) = (i % 10, i / 10);
+                    let border = x == 0 || y == 0 || x == 9 || y == 9;
+                    if border { [0, 0, 0, 255] } else { [255, 255, 255, 255] }
+                });
+                Some((10, 10, px.collect()))
+            }
+            CursorImage::Surface(k, ..) => {
+                let t = self.texture(k)?;
+                let (w, h) = (t.width as u32, t.height as u32);
+                if w > max.0 || h > max.1 {
+                    return None;
+                }
+                let mut px = r.read_texture(t);
+                for p in px.as_chunks_mut::<4>().0 {
+                    p.swap(0, 2);
+                }
+                Some((w, h, px))
+            }
+        }
+    }
+
     pub fn render(&mut self, r: &mut Renderer, target: &Target) {
+        self.render_damaged(r, target, None);
+    }
+
+    /// Draws the scene; with `region` only that area is drawn again (the
+    /// rest of `target` must already show the current scene).
+    pub fn render_damaged(&mut self, r: &mut Renderer, target: &Target, region: Option<Rect>) {
+        self.damage.clear();
         for t in self.dead_textures.drain(..) {
             r.destroy_texture(t);
         }
@@ -1137,7 +1248,8 @@ impl State {
             return;
         }
         self.upload_buffers(r);
-        r.begin(target, config::BACKGROUND);
+        let quad = |q: Rect| Quad { x: q.x as f32, y: q.y as f32, w: q.w as f32, h: q.h as f32 };
+        r.begin_region(target, config::BACKGROUND, region.map(quad));
         self.draw_background(r);
         if let Some(t) = self.bar.tex.as_ref().filter(|_| self.bar.visible) {
             r.draw(t, Quad { x: 0.0, y: 0.0, w: t.width as f32, h: t.height as f32 }, true);
@@ -1189,8 +1301,10 @@ impl State {
         }
         dnd::draw_icon(self, r);
         self.draw_shot(r);
-        if !self.hide_cursor {
+        self.cursor_drawn = None;
+        if !self.hide_cursor && !self.hw_cursor {
             seat::draw_cursor(self, r);
+            self.cursor_drawn = self.cursor_rect();
         }
         r.finish();
         let time = self.time_ms();

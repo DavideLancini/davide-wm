@@ -199,6 +199,26 @@ pub struct PrimeHandle {
 
 #[repr(C)]
 #[derive(Default)]
+pub struct CreateDumb {
+    pub height: u32,
+    pub width: u32,
+    pub bpp: u32,
+    pub flags: u32,
+    pub handle: u32,
+    pub pitch: u32,
+    pub size: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct MapDumb {
+    pub handle: u32,
+    pub pad: u32,
+    pub offset: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
 pub struct GemClose {
     pub handle: u32,
     pub pad: u32,
@@ -215,6 +235,8 @@ pub const IOCTL_MODE_GETPROPERTY: u64 = iowr(0xAA, std::mem::size_of::<GetProper
 pub const IOCTL_MODE_RMFB: u64 = iowr(0xAF, std::mem::size_of::<u32>());
 pub const IOCTL_MODE_GETPLANERESOURCES: u64 = iowr(0xB5, std::mem::size_of::<GetPlaneRes>());
 pub const IOCTL_MODE_GETPLANE: u64 = iowr(0xB6, std::mem::size_of::<GetPlane>());
+pub const IOCTL_MODE_CREATE_DUMB: u64 = iowr(0xB2, std::mem::size_of::<CreateDumb>());
+pub const IOCTL_MODE_MAP_DUMB: u64 = iowr(0xB3, std::mem::size_of::<MapDumb>());
 pub const IOCTL_MODE_ADDFB2: u64 = iowr(0xB8, std::mem::size_of::<FbCmd2>());
 pub const IOCTL_MODE_OBJ_GETPROPERTIES: u64 = iowr(0xB9, std::mem::size_of::<ObjGetProperties>());
 pub const IOCTL_MODE_ATOMIC: u64 = iowr(0xBC, std::mem::size_of::<Atomic>());
@@ -224,6 +246,10 @@ pub const IOCTL_MODE_DESTROYPROPBLOB: u64 = iowr(0xBE, std::mem::size_of::<Destr
 pub const CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 pub const CLIENT_CAP_ATOMIC: u64 = 3;
 pub const CAP_ADDFB2_MODIFIERS: u64 = 0x10;
+pub const CAP_CURSOR_WIDTH: u64 = 0x8;
+pub const CAP_CURSOR_HEIGHT: u64 = 0x9;
+/// 'AR24'.
+pub const FORMAT_ARGB8888: u32 = 0x3432_5241;
 
 pub const MODE_CONNECTED: u32 = 1;
 
@@ -232,6 +258,7 @@ pub const OBJECT_CONNECTOR: u32 = 0xc0c0c0c0;
 pub const OBJECT_PLANE: u32 = 0xeeeeeeee;
 
 pub const PLANE_TYPE_PRIMARY: u64 = 1;
+pub const PLANE_TYPE_CURSOR: u64 = 2;
 
 pub const MODE_FB_MODIFIERS: u32 = 1 << 1;
 
