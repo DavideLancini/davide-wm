@@ -233,6 +233,12 @@ pub fn dispatch(s: &mut State) -> io::Result<()> {
     flush(s)
 }
 
+/// Whether an X client has a window: ours (the check and selection
+/// windows) do not count.
+pub fn has_clients(s: &State) -> bool {
+    s.xwm.as_ref().is_some_and(|x| x.windows.keys().any(|w| w & !x.conn.setup.id_mask != x.conn.setup.id_base))
+}
+
 pub fn flush(s: &mut State) -> io::Result<()> {
     match s.xwm.as_mut() {
         Some(x) => x.conn.flush(),

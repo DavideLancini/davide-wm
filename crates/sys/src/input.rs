@@ -14,6 +14,7 @@ pub struct libinput_interface {
 }
 
 pub const EVENT_DEVICE_ADDED: u32 = 1;
+pub const EVENT_DEVICE_REMOVED: u32 = 2;
 pub const EVENT_KEYBOARD_KEY: u32 = 300;
 pub const EVENT_POINTER_MOTION: u32 = 400;
 pub const EVENT_POINTER_BUTTON: u32 = 402;
@@ -85,4 +86,6 @@ extern "C" {
     pub fn libinput_device_config_tap_get_finger_count(dev: *mut libinput_device) -> i32;
     pub fn libinput_device_config_tap_set_enabled(dev: *mut libinput_device, enable: i32) -> u32;
     pub fn libinput_device_get_name(dev: *mut libinput_device) -> *const c_char;
+    pub fn libinput_device_get_id_vendor(dev: *mut libinput_device) -> u32;
+    pub fn libinput_device_get_id_product(dev: *mut libinput_device) -> u32;
 }

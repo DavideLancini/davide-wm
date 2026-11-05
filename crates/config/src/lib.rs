@@ -39,7 +39,7 @@ pub mod keys {
     pub const RIGHT: u32 = 0xff53;
     pub const DOWN: u32 = 0xff54;
     pub const PRINT: u32 = 0xff61;
-    pub const F12: u32 = 0xffc9;
+    pub const F19: u32 = 0xffd0;
     pub const AUDIO_LOWER_VOLUME: u32 = 0x1008ff11;
     pub const AUDIO_MUTE: u32 = 0x1008ff12;
     pub const AUDIO_RAISE_VOLUME: u32 = 0x1008ff13;
@@ -136,7 +136,7 @@ pub fn binds() -> Vec<Bind> {
         b(0, keys::MON_BRIGHTNESS_DOWN, Action::Brightness(-BRIGHTNESS_STEP)),
         b(0, keys::MON_BRIGHTNESS_UP, Action::Brightness(BRIGHTNESS_STEP)),
         b(0, keys::PRINT, Action::Screenshot),
-        b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::ToggleBar),
+        b(0, keys::F19, Action::ToggleBar),
         b(MAIN | SHIFT, keys::P, Action::PowerMenu),
         b(MAIN, keys::A, Action::AudioOutputs),
         b(0, keys::AUDIO_PLAY, Action::Media(Media::PlayPause)),
@@ -198,6 +198,17 @@ pub const RULES: &[Rule] = &[
 pub const AUTOSTART: &[&str] = &["foot --server"];
 
 pub const KEYBOARD_LAYOUT: &str = "it";
+/// A keyboard (USB vendor and product, or `None` for every keyboard
+/// without an entry of its own) and its key swaps, as evdev codes.
+pub type KeyRemap = (Option<(u32, u32)>, &'static [(u32, u32)]);
+
+/// Keys swapped before the keymap.
+pub const KEY_REMAP: &[KeyRemap] = &[
+    // Samsung: the key left of 1 and the one left of Z are swapped.
+    (Some((0x04e8, 0x7021)), &[(86, 41), (41, 86)]),
+    // Caps Lock becomes F19, which toggles the bar.
+    (None, &[(58, 189)]),
+];
 pub const REPEAT_RATE: i32 = 25;
 pub const REPEAT_DELAY: i32 = 600;
 

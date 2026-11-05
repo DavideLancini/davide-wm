@@ -57,6 +57,7 @@ const TOKEN_PORTAL: u64 = 18;
 const TOKEN_OSD: u64 = 19;
 const TOKEN_AGENTS: u64 = 20;
 const TOKEN_BATTERY: u64 = 21;
+const TOKEN_XWAYLAND_LISTEN: u64 = 22;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -1853,23 +1854,46 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
 }
 
 impl App {
-    fn start_xwayland(&mut self) {
-        match xwayland::spawn() {
-            Ok(sp) => {
-                let id = self.state.add_client(sp.wayland);
-                self.state.xwayland = Some(id);
-                self.xwayland = Some(sp.xwayland);
-            }
-            Err(e) => log!("cannot start Xwayland: {e}"),
+    fn claim_x_display(&mut self) {
+        match xwayland::Xwayland::claim() {
+            Ok(x) => self.xwayland = Some(x),
+            Err(e) => log!("no X display: {e}"),
         }
     }
 
-    /// Watches Xwayland's fds: its exit, its readiness, the WM connection.
+    /// A first X client knocks: starts Xwayland on the display's sockets.
+    fn start_xwayland(&mut self, ep: &Epoll) -> io::Result<()> {
+        let Some(x) = &mut self.xwayland else { return Ok(()) };
+        for fd in x.listen_fds() {
+            ep.delete(fd);
+        }
+        match x.start() {
+            Ok(wayland) => {
+                let id = self.state.add_client(wayland);
+                self.state.xwayland = Some(id);
+                ep.add(self.state.clients[&id].conn.raw_fd(), TOKEN_CLIENT + id as u64)?;
+            }
+            Err(e) => {
+                log!("cannot start Xwayland: {e}");
+                self.xwayland = None;
+                std::env::remove_var("DISPLAY");
+            }
+        }
+        self.watch_xwayland(ep)
+    }
+
+    /// Watches the X display: its sockets while Xwayland is not running,
+    /// else Xwayland's exit, its readiness and the WM connection.
     fn watch_xwayland(&self, ep: &Epoll) -> io::Result<()> {
         if let Some(x) = &self.xwayland {
-            ep.add(x.pidfd.as_raw_fd(), TOKEN_XWAYLAND_EXIT)?;
-            if let Some((ready, _)) = &x.pending {
-                ep.add(ready.as_raw_fd(), TOKEN_XWAYLAND_READY)?;
+            for fd in x.listen_fds() {
+                ep.add(fd, TOKEN_XWAYLAND_LISTEN)?;
+            }
+            if let Some(p) = &x.process {
+                ep.add(p.pidfd.as_raw_fd(), TOKEN_XWAYLAND_EXIT)?;
+                if let Some((ready, _)) = &p.pending {
+                    ep.add(ready.as_raw_fd(), TOKEN_XWAYLAND_READY)?;
+                }
             }
         }
         if let Some(x) = &self.state.xwm {
@@ -1879,7 +1903,7 @@ impl App {
     }
 
     fn xwayland_ready(&mut self, ep: &Epoll) -> io::Result<()> {
-        let Some(wm) = self.xwayland.as_mut().and_then(|x| x.ready()) else { return Ok(()) };
+        let Some(wm) = self.xwayland.as_mut().and_then(|x| x.process.as_mut()).and_then(|p| p.ready()) else { return Ok(()) };
         match xwm::start(&mut self.state, wm) {
             Ok(()) => {
                 ep.add(self.state.xwm.as_ref().unwrap().conn.raw_fd(), TOKEN_XWM)?;
@@ -1924,24 +1948,45 @@ impl App {
         xwm::stop(&mut self.state);
     }
 
+    /// Stops Xwayland after two checks in a row without X windows; the
+    /// next client starts it again.
+    fn xwayland_idle_check(&mut self) {
+        let busy = xwm::has_clients(&self.state);
+        let ready = self.state.xwm.is_some();
+        let Some(p) = self.xwayland.as_mut().and_then(|x| x.process.as_mut()) else { return };
+        if busy || !ready {
+            p.idle = false;
+        } else if p.idle {
+            log!("no X windows left: stopping Xwayland");
+            p.stop();
+        } else {
+            p.idle = true;
+        }
+    }
+
+    /// Xwayland quit, idle or crashed: listen again for the next client,
+    /// unless it died right after starting.
     fn xwayland_exited(&mut self, ep: &Epoll) -> io::Result<()> {
-        let Some(x) = self.xwayland.take() else { return Ok(()) };
+        let Some(p) = self.xwayland.as_mut().and_then(|x| x.process.take()) else { return Ok(()) };
         log!("Xwayland exited");
         self.xwm_stop(ep);
-        ep.delete(x.pidfd.as_raw_fd());
-        let again = x.lived();
-        drop(x);
-        if again {
-            self.start_xwayland();
-            if let Some(id) = self.state.xwayland {
-                ep.add(self.state.clients[&id].conn.raw_fd(), TOKEN_CLIENT + id as u64)?;
-            }
-            self.watch_xwayland(ep)?;
-            if let Some(x) = &self.xwayland {
-                std::env::set_var("DISPLAY", format!(":{}", x.display));
+        ep.delete(p.pidfd.as_raw_fd());
+        if !p.lived() {
+            log!("Xwayland died right after starting: no X display");
+            self.xwayland = None;
+            std::env::remove_var("DISPLAY");
+            return Ok(());
+        }
+        drop(p);
+        if !self.xwayland.as_ref().is_some_and(|x| x.can_listen()) {
+            self.xwayland = None;
+            self.claim_x_display();
+            match &self.xwayland {
+                Some(x) => std::env::set_var("DISPLAY", format!(":{}", x.display)),
+                None => std::env::remove_var("DISPLAY"),
             }
         }
-        Ok(())
+        self.watch_xwayland(ep)
     }
 }
 
@@ -2111,7 +2156,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
         app.state.pointer.y = (app.state.output.height / 2) as f64;
     }
     app.outputs_changed();
-    app.start_xwayland();
+    app.claim_x_display();
     if session {
         for line in config::SESSION_AUTOSTART {
             app.spawn(line);
@@ -2125,7 +2170,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 8;
+const BLOB_FORMAT: u32 = 9;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -2193,7 +2238,7 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let format = u32::load(&mut d).map_err(err)?;
     // Version 7 differs only by the input regions it lacks.
     server::persist::FORMAT.store(format, std::sync::atomic::Ordering::Relaxed);
-    if format != BLOB_FORMAT && format != 7 {
+    if !(7..=BLOB_FORMAT).contains(&format) {
         return Err(io::Error::other(format!("state blob format {format}, this binary reads {BLOB_FORMAT}")));
     }
     let (session, main_mod, exe): (bool, u32, String) = Persist::load(&mut d).map_err(err)?;
@@ -2425,6 +2470,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 TOKEN_BATTERY => {
                     event_loop::read_timer(&app.battery_timer);
                     app.battery_tick();
+                    app.xwayland_idle_check();
                 }
                 TOKEN_OSD => {
                     event_loop::read_timer(&app.osd_timer);
@@ -2437,6 +2483,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 }
                 TOKEN_XWAYLAND_READY => app.xwayland_ready(ep)?,
                 TOKEN_XWAYLAND_EXIT => app.xwayland_exited(ep)?,
+                TOKEN_XWAYLAND_LISTEN => app.start_xwayland(ep)?,
                 TOKEN_XWM => app.xwm_dispatch(ep),
                 TOKEN_SIGNAL => {
                     log!("signal received, exiting");

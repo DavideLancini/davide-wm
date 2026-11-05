@@ -52,6 +52,8 @@ pub struct Input {
     _ctx: Box<Ctx>,
     /// The swipe in progress: fingers and distance so far.
     swipe: (i32, f64, f64),
+    /// Each keyboard's key swaps, from `config::KEY_REMAP`.
+    remaps: HashMap<*mut li::libinput_device, &'static [(u32, u32)]>,
 }
 
 impl Input {
@@ -74,7 +76,7 @@ impl Input {
                 li::udev_unref(udev);
                 return Err(io::Error::other("libinput cannot assign seat0"));
             }
-            Ok(Input { li: l, udev, _ctx: ctx, swipe: (0, 0.0, 0.0) })
+            Ok(Input { li: l, udev, _ctx: ctx, swipe: (0, 0.0, 0.0), remaps: HashMap::new() })
         }
     }
 
@@ -100,11 +102,24 @@ impl Input {
                     break;
                 }
                 match li::libinput_event_get_type(ev) {
-                    li::EVENT_DEVICE_ADDED => configure(li::libinput_event_get_device(ev)),
+                    li::EVENT_DEVICE_ADDED => {
+                        let dev = li::libinput_event_get_device(ev);
+                        configure(dev);
+                        if let Some(remap) = remap_for(dev) {
+                            self.remaps.insert(dev, remap);
+                        }
+                    }
+                    li::EVENT_DEVICE_REMOVED => {
+                        self.remaps.remove(&li::libinput_event_get_device(ev));
+                    }
                     li::EVENT_KEYBOARD_KEY => {
                         let k = li::libinput_event_get_keyboard_event(ev);
                         let pressed = li::libinput_event_keyboard_get_key_state(k) == li::KEY_STATE_PRESSED;
-                        out.push(Event::Key(li::libinput_event_keyboard_get_key(k), pressed));
+                        let mut key = li::libinput_event_keyboard_get_key(k);
+                        if let Some(remap) = self.remaps.get(&li::libinput_event_get_device(ev)) {
+                            key = remap.iter().find(|(from, _)| *from == key).map_or(key, |(_, to)| *to);
+                        }
+                        out.push(Event::Key(key, pressed));
                     }
                     li::EVENT_POINTER_MOTION => {
                         let p = li::libinput_event_get_pointer_event(ev);
@@ -174,6 +189,12 @@ unsafe fn configure(dev: *mut li::libinput_device) {
             li::libinput_device_config_scroll_set_natural_scroll_enabled(dev, 1);
         }
     }
+}
+
+unsafe fn remap_for(dev: *mut li::libinput_device) -> Option<&'static [(u32, u32)]> {
+    let id = (li::libinput_device_get_id_vendor(dev), li::libinput_device_get_id_product(dev));
+    let remaps = config::KEY_REMAP;
+    remaps.iter().find(|(d, _)| *d == Some(id)).or(remaps.iter().find(|(d, _)| d.is_none())).map(|(_, r)| *r)
 }
 
 impl Drop for Input {
