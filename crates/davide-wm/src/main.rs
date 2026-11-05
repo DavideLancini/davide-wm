@@ -932,7 +932,7 @@ impl App {
         match started {
             Ok(id) => {
                 if request != 0 {
-                    self.portal.picked(request, id, matches!(choice, CastChoice::Window(_)));
+                    self.portal.picked(request, id, matches!(choice, CastChoice::Window(_)), encode_choice(choice));
                 }
                 Some(id)
             }
@@ -973,7 +973,19 @@ impl App {
 
     fn portal_action(&mut self, a: portal::Action) {
         match a {
-            portal::Action::PickSource { request, types } => self.open_cast_picker(request, types),
+            portal::Action::PickSource { request, types, reuse } => {
+                // The same choice again (a restore token, or a second session
+                // right after the first): no second picker.
+                match reuse.and_then(|r| decode_choice(&r)).filter(|c| match c {
+                    CastChoice::Output => types & portal::MONITOR != 0,
+                    CastChoice::Window(k) => types & portal::WINDOW != 0 && self.state.window_ws.contains_key(k),
+                }) {
+                    Some(c) => {
+                        self.start_cast(request, c);
+                    }
+                    None => self.open_cast_picker(request, types),
+                }
+            }
             portal::Action::CancelPick { request } => {
                 let open = |p: &Purpose| matches!(p, Purpose::Cast(r, _) if *r == request);
                 if self.state.launcher.as_ref().is_some_and(|l| open(&l.purpose)) {
@@ -1949,6 +1961,24 @@ fn set_cpu_auto(on: bool) {
         true => p.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::write(&p, "")),
         false => std::fs::remove_file(&p),
     };
+}
+
+/// A cast source as text, for the portal's restore data.
+fn encode_choice(c: CastChoice) -> String {
+    match c {
+        CastChoice::Output => "output".into(),
+        CastChoice::Window(k) => format!("window:{}:{}", k.client, k.id),
+    }
+}
+
+fn decode_choice(s: &str) -> Option<CastChoice> {
+    if s == "output" {
+        return Some(CastChoice::Output);
+    }
+    let mut it = s.strip_prefix("window:")?.split(':');
+    let client = it.next()?.parse().ok()?;
+    let id = it.next()?.parse().ok()?;
+    Some(CastChoice::Window(server::SKey { client, id }))
 }
 
 /// Writes a screenshot to `$HOME/SCREENSHOT_DIR/Screenshot_<local time>.png`.

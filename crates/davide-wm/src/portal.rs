@@ -28,23 +28,38 @@ const FAILED: u32 = 2;
 struct Session {
     types: u32,
     cast: Option<u32>,
+    app_id: String,
+    /// The app asked to remember the choice (persist_mode 1 or 2).
+    persist: u32,
+    /// A choice to reuse: from the app's restore token.
+    restore: Option<String>,
 }
+
+/// How long a choice is reused for the same app without asking again:
+/// Chromium opens a second session right after its own picker.
+const REUSE_SECS: u64 = 20;
+/// Vendor tag of our restore data.
+const VENDOR: &str = "davide-wm";
 
 enum Pending {
     /// ScreenCast.Start: waits for a pick, then for the stream's node.
-    Start { call: Message, handle: String, session: String, cast: Option<u32>, source_type: u32 },
+    Start { call: Message, handle: String, session: String, cast: Option<u32>, source_type: u32, choice: String },
     Shot { call: Message, handle: String },
 }
 
 /// What the compositor has to do for the portal.
 pub enum Action {
-    PickSource { request: u32, types: u32 },
+    /// Ask the user, unless `reuse` (a choice as `CastChoice` encodes it)
+    /// still makes sense.
+    PickSource { request: u32, types: u32, reuse: Option<String> },
     CancelPick { request: u32 },
     StopCast(u32),
     Screenshot { request: u32, interactive: bool },
 }
 
 pub struct Portal {
+    /// The last choice: app, choice, when.
+    last: Option<(String, String, std::time::Instant)>,
     bus: Option<Bus>,
     sessions: HashMap<String, Session>,
     pending: HashMap<u32, Pending>,
@@ -111,7 +126,7 @@ impl Portal {
                 None
             }
         };
-        Portal { bus, sessions: HashMap::new(), pending: HashMap::new(), next: 0 }
+        Portal { last: None, bus, sessions: HashMap::new(), pending: HashMap::new(), next: 0 }
     }
 
     pub fn bus_fd(&self) -> Option<RawFd> {
@@ -167,25 +182,33 @@ impl Portal {
         } else if m.is_call("org.freedesktop.DBus.Introspectable", "Introspect") {
             self.send(m.reply(vec![Value::Str(INTROSPECTION.into())]));
         } else if m.is_call(SCREENCAST, "CreateSession") {
-            self.sessions.insert(path(b.get(1)), Session { types: MONITOR, cast: None });
+            let app_id = b.get(2).and_then(Value::as_str).unwrap_or("").to_string();
+            self.sessions.insert(path(b.get(1)), Session { types: MONITOR, cast: None, app_id, persist: 0, restore: None });
             self.send(m.reply(vec![Value::U32(SUCCESS), empty()]));
         } else if m.is_call(SCREENCAST, "SelectSources") {
             let types = option(b.get(3), "types").and_then(Value::as_u32).filter(|t| t & (MONITOR | WINDOW) != 0).unwrap_or(MONITOR);
+            let persist = option(b.get(3), "persist_mode").and_then(Value::as_u32).unwrap_or(0);
+            // (vendor, version, data): only ours is understood.
+            let restore = match option(b.get(3), "restore_data") {
+                Some(Value::Struct(f)) if f.first().and_then(Value::as_str) == Some(VENDOR) => f.get(2).and_then(|v| v.as_str()).map(str::to_string),
+                _ => None,
+            };
             if let Some(s) = self.sessions.get_mut(&path(b.get(1))) {
-                s.types = types;
+                (s.types, s.persist, s.restore) = (types, persist, restore);
             }
             self.send(m.reply(vec![Value::U32(SUCCESS), empty()]));
         } else if m.is_call(SCREENCAST, "Start") {
             let session = path(b.get(1));
-            let Some(types) = self.sessions.get(&session).map(|s| s.types) else {
+            let Some((types, app_id, restore)) = self.sessions.get(&session).map(|s| (s.types, s.app_id.clone(), s.restore.clone())) else {
                 self.send(m.reply(vec![Value::U32(FAILED), empty()]));
                 return;
             };
+            let recent = self.last.as_ref().filter(|(app, _, at)| *app == app_id && at.elapsed().as_secs() < REUSE_SECS).map(|(_, c, _)| c.clone());
             self.next += 1;
             let request = self.next;
             let handle = path(b.first());
-            self.pending.insert(request, Pending::Start { call: m, handle, session, cast: None, source_type: MONITOR });
-            actions.push(Action::PickSource { request, types });
+            self.pending.insert(request, Pending::Start { call: m, handle, session, cast: None, source_type: MONITOR, choice: String::new() });
+            actions.push(Action::PickSource { request, types, reuse: restore.or(recent) });
         } else if m.is_call(SCREENSHOT, "Screenshot") {
             let interactive = option(b.get(3), "interactive").and_then(Value::as_bool).unwrap_or(false);
             self.next += 1;
@@ -225,10 +248,11 @@ impl Portal {
 
     /// The user chose a source and its cast started; the answer waits for
     /// the stream's node.
-    pub fn picked(&mut self, request: u32, cast_id: u32, window: bool) {
-        if let Some(Pending::Start { cast, source_type, session, .. }) = self.pending.get_mut(&request) {
+    pub fn picked(&mut self, request: u32, cast_id: u32, window: bool, encoded: String) {
+        if let Some(Pending::Start { cast, source_type, session, choice, .. }) = self.pending.get_mut(&request) {
             *cast = Some(cast_id);
             *source_type = if window { WINDOW } else { MONITOR };
+            *choice = encoded;
             if let Some(s) = self.sessions.get_mut(session) {
                 s.cast = Some(cast_id);
             }
@@ -243,14 +267,23 @@ impl Portal {
     pub fn cast_ready(&mut self, cast_id: u32, node: u32, size: (i32, i32)) {
         let found = self.pending.iter().find(|(_, p)| matches!(p, Pending::Start { cast: Some(c), .. } if *c == cast_id)).map(|(k, _)| *k);
         let Some(request) = found else { return };
-        let Some(Pending::Start { source_type, .. }) = self.pending.get(&request) else { return };
+        let Some(Pending::Start { source_type, choice, session, .. }) = self.pending.get(&request) else { return };
+        let (choice, session) = (choice.clone(), session.clone());
         let props = dict(vec![
             ("position", Value::Struct(vec![Value::I32(0), Value::I32(0)])),
             ("size", Value::Struct(vec![Value::I32(size.0), Value::I32(size.1)])),
             ("source_type", Value::U32(*source_type)),
         ]);
         let streams = Value::Array("(ua{sv})".into(), vec![Value::Struct(vec![Value::U32(node), props])]);
-        let results = vec![("streams", streams)];
+        let mut results = vec![("streams", streams)];
+        if let Some(s) = self.sessions.get(&session) {
+            self.last = Some((s.app_id.clone(), choice.clone(), std::time::Instant::now()));
+            if s.persist > 0 {
+                let data = Value::Struct(vec![Value::Str(VENDOR.into()), Value::U32(1), Value::Variant(Box::new(Value::Str(choice)))]);
+                results.push(("persist_mode", Value::U32(s.persist)));
+                results.push(("restore_data", data));
+            }
+        }
         let Some(p) = self.pending.remove(&request) else { return };
         if let Pending::Start { call, .. } = p {
             self.send(call.reply(vec![Value::U32(SUCCESS), dict(results)]));
