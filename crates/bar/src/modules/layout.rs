@@ -47,8 +47,31 @@ fn assemble(parts: Vec<(String, Target, u32)>) -> Zone {
 
 /// Module state that must persist between refreshes: sampling baselines, live
 /// connections and cached helper output.
+/// Readings kept for a while: sensors that move slowly are not read on every
+/// tick, and a value that did not change does not redraw the bar.
+#[derive(Default)]
+pub struct Every {
+    cache: std::collections::HashMap<&'static str, (String, std::time::Instant)>,
+}
+
+impl Every {
+    fn get(&mut self, key: &'static str, secs: u64, read: impl FnOnce() -> String) -> String {
+        let now = std::time::Instant::now();
+        match self.cache.get(key) {
+            Some((v, at)) if now.duration_since(*at).as_secs() < secs => v.clone(),
+            _ => {
+                let v = read();
+                self.cache.insert(key, (v.clone(), now));
+                v
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct State {
+    /// Throttled readings.
+    pub every: Every,
     pub cpu: super::cpu::Cpu,
     pub audio: super::pulseaudio::Audio,
     pub bluetooth: super::bluetooth::Bluetooth,
@@ -74,6 +97,7 @@ impl State {
     /// render re-reads them. Cheap: these helpers only run when asked.
     pub fn invalidate_cached(&mut self) {
         self.bt_headphones.invalidate();
+        self.every.cache.clear();
     }
 }
 
@@ -185,8 +209,8 @@ fn battery_color() -> u32 {
 
 /// CPU usage and frequency in one widget: they describe the same thing and
 /// share a click action, so splitting them cost a second icon and a gap.
-fn cpu_text(state: &mut State) -> String {
-    let usage = state.cpu.text();
+fn cpu_text(cpu: &mut super::cpu::Cpu) -> String {
+    let usage = cpu.text();
     let freq = super::cpu_freq::text();
     match (usage.is_empty(), freq.is_empty()) {
         (true, true) => String::new(),
@@ -213,9 +237,12 @@ fn cpu_color() -> u32 {
 fn status_widgets(state: &mut State) -> Vec<(String, Target, u32)> {
     vec![
         (icons::CAMERA.to_string(), Target::Widget(Widget::Screenshot), icons::color::SCREENSHOT),
-        (icons::with(icons::TEMP, &super::temp::text()), Target::Widget(Widget::CpuFreq), icons::color::TEMP),
-        (icons::with(icons::MEMORY, &super::memory::text()), Target::Widget(Widget::CpuFreq), icons::color::MEMORY),
-        (cpu_text(state), Target::Widget(Widget::CpuFreq), cpu_color()),
+        (icons::with(icons::TEMP, &state.every.get("temp", 3, super::temp::text)), Target::Widget(Widget::CpuFreq), icons::color::TEMP),
+        (icons::with(icons::MEMORY, &state.every.get("memory", 5, super::memory::text)), Target::Widget(Widget::CpuFreq), icons::color::MEMORY),
+        ({
+            let State { every, cpu, .. } = state;
+            every.get("cpu", 2, || cpu_text(cpu))
+        }, Target::Widget(Widget::CpuFreq), cpu_color()),
         // Icon only: the sync state is carried by the colour, so there is no
         // text competing with it.
         (icons::CLOUD.to_string(), Target::Widget(Widget::CpuFreq), state.mega.color()),
@@ -223,11 +250,11 @@ fn status_widgets(state: &mut State) -> Vec<(String, Target, u32)> {
         // shows, so the click lands where the eye already is.
         (state.audio.sink_text(), Target::Widget(Widget::Volume), sink_color(state)),
         (state.audio.source_text(), Target::Widget(Widget::Microphone), source_color(state)),
-        (icons::with(icons::WIFI, &super::network::text()), Target::Widget(Widget::Network), icons::color::NETWORK),
+        (icons::with(icons::WIFI, &state.every.get("network", 5, super::network::text)), Target::Widget(Widget::Network), icons::color::NETWORK),
         (state.bluetooth.text(), Target::Widget(Widget::BtHeadphones), icons::color::BLUETOOTH),
         (icons::with(icons::HEADPHONES, &state.bt_headphones.text()), Target::Widget(Widget::BtHeadphones), icons::color::BT_HEADPHONES),
         (icons::with(icons::BRIGHTNESS, &super::backlight::text()), Target::Widget(Widget::Backlight), icons::color::BACKLIGHT),
-        (icons::with(icons::BATTERY, &super::battery::text()), Target::Widget(Widget::Backlight), battery_color()),
+        (icons::with(icons::BATTERY, &state.every.get("battery", 15, super::battery::text)), Target::Widget(Widget::Backlight), state.every.get("battery color", 15, || battery_color().to_string()).parse().unwrap_or(icons::color::BATTERY_DRAINING)),
         (icons::with(icons::BELL, &state.notifications), Target::Widget(Widget::Notifications), icons::color::NOTIFICATIONS),
         (icons::BLANK.to_string(), Target::Widget(Widget::Blk), icons::color::BLK),
         (icons::with(icons::MOON, &state.screensaver), Target::Widget(Widget::Screensaver), icons::color::SCREENSAVER),

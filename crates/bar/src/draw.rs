@@ -260,6 +260,20 @@ pub fn right_anchor(font: &Font, width: u32, text: &str) -> i32 {
     (width as i32 - settings::PAD - zone_width(font, text)).max(settings::PAD)
 }
 
+thread_local! {
+    /// Rasterised glyphs: the bar draws the same few dozen characters every
+    /// frame, and rasterising them was most of a frame's cost.
+    static GLYPHS: std::cell::RefCell<std::collections::HashMap<char, (fontdue::Metrics, Vec<u8>)>> = Default::default();
+}
+
+fn glyph<R>(font: &Font, c: char, f: impl FnOnce(&fontdue::Metrics, &[u8]) -> R) -> R {
+    GLYPHS.with(|g| {
+        let mut g = g.borrow_mut();
+        let (m, b) = g.entry(c).or_insert_with(|| font.rasterize(c, settings::FONT_SIZE));
+        f(m, b)
+    })
+}
+
 /// Draws one line of text with its glyph bottoms placed relative to `base`.
 #[allow(clippy::too_many_arguments)]
 fn draw_line(
@@ -282,32 +296,31 @@ fn draw_line(
         if c.is_control() {
             continue; // separators carry structure, not pixels
         }
-        let (metrics, bitmap) = font.rasterize(c, settings::FONT_SIZE);
-        // ymin is the bitmap's bottom edge relative to the baseline (negative
-        // for descenders), so the bitmap's top row sits here:
-        let top = base - metrics.ymin - metrics.height as i32;
-
-        if metrics.width > 0 {
-            for (i, &coverage) in bitmap.iter().enumerate() {
-                if coverage == 0 {
-                    continue;
+        x += glyph(font, c, |metrics, bitmap| {
+            // ymin is the bitmap's bottom edge relative to the baseline
+            // (negative for descenders), so the bitmap's top row sits here:
+            let top = base - metrics.ymin - metrics.height as i32;
+            if metrics.width > 0 {
+                for (i, &coverage) in bitmap.iter().enumerate() {
+                    if coverage == 0 {
+                        continue;
+                    }
+                    let px_x = x + metrics.xmin + (i % metrics.width) as i32;
+                    let px_y = top + (i / metrics.width) as i32;
+                    if px_x < 0 || px_x >= width || px_y < 0 || px_y >= h {
+                        continue;
+                    }
+                    let idx = (px_y as usize * stride) + (px_x as usize) * 4;
+                    let a = coverage as u32;
+                    let blend = |fg: u8, bg: u8| ((fg as u32 * a + bg as u32 * (255 - a)) / 255) as u8;
+                    buf[idx] = blend(fg_b, bg_b);
+                    buf[idx + 1] = blend(fg_g, bg_g);
+                    buf[idx + 2] = blend(fg_r, bg_r);
+                    buf[idx + 3] = 0xFF;
                 }
-                let px_x = x + metrics.xmin + (i % metrics.width) as i32;
-                let px_y = top + (i / metrics.width) as i32;
-                if px_x < 0 || px_x >= width || px_y < 0 || px_y >= h {
-                    continue;
-                }
-                let idx = (px_y as usize * stride) + (px_x as usize) * 4;
-                let a = coverage as u32;
-                let blend = |fg: u8, bg: u8| ((fg as u32 * a + bg as u32 * (255 - a)) / 255) as u8;
-                buf[idx] = blend(fg_b, bg_b);
-                buf[idx + 1] = blend(fg_g, bg_g);
-                buf[idx + 2] = blend(fg_r, bg_r);
-                buf[idx + 3] = 0xFF;
             }
-        }
-
-        x += metrics.advance_width.ceil() as i32;
+            metrics.advance_width.ceil() as i32
+        });
     }
 }
 
