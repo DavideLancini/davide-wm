@@ -1,0 +1,3 @@
+# Built for this machine only: the binary runs where it is compiled.
+[build]
+rustflags = ["-C", "target-cpu=native"]

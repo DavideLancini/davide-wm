@@ -267,7 +267,7 @@ davide-wm/
     ├── pipewire/           # libpipewire FFI: loop in our epoll, video source stream, SPA pods by hand
     └── config/
 ```
-`run.sh` builds the release binary and live-upgrades every running instance. `tools/measure.py [hyprland|davide-wm] [seconds]` measures memory (PSS/RSS) and CPU of either desktop stack. `dist/davide-wm-session.target` binds the session to `graphical-session.target` (install it in `~/.config/systemd/user/`); `dist/davide-wm.portal` and `dist/davide-wm-portals.conf` register the portal backend. Planned additions: `assets/`, `tools/` and the crates marked *(planned)* in sec. 5.1.
+`run.sh` builds the release binary and live-upgrades every running instance. `.cargo/config.toml` builds for this machine's CPU (`target-cpu=native`). `tools/measure.py [hyprland|davide-wm] [seconds]` measures memory (PSS/RSS) and CPU of either desktop stack. `dist/davide-wm-session.target` binds the session to `graphical-session.target` (install it in `~/.config/systemd/user/`); `dist/davide-wm.portal` and `dist/davide-wm-portals.conf` register the portal backend. Planned additions: `assets/`, `tools/` and the crates marked *(planned)* in sec. 5.1.
 
 ### 5.3 Level 2 — detail of the relevant building blocks
 *Expand only the blocks that are not obvious. (Repeat for each one.)*
