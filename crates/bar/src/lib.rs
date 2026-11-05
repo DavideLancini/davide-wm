@@ -68,8 +68,76 @@ pub enum ToBar {
     Timer(Option<u64>),
     /// List the audio outputs (answered with `FromBar::Outputs`).
     ListOutputs,
+    /// Apply an action (if any) and send the mixer state; until
+    /// `MixerClosed`, changes are sent as they happen.
+    Mixer(Option<MixAction>),
+    MixerClosed,
     /// Make this sink the default output.
     SetOutput(String),
+}
+
+/// A sink or a source, as the mixer shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixDevice {
+    pub index: u32,
+    pub name: String,
+    pub description: String,
+    /// Per channel, in percent.
+    pub volume: Vec<u32>,
+    pub muted: bool,
+    /// (name, description, available).
+    pub ports: Vec<(String, String, bool)>,
+    pub active_port: String,
+    /// A source that records what a sink plays.
+    pub monitor: bool,
+    pub card: u32,
+}
+
+/// An application playing or recording.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixStream {
+    pub index: u32,
+    pub app: String,
+    pub media: String,
+    /// The sink or source it uses.
+    pub device: u32,
+    pub volume: Vec<u32>,
+    pub muted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixCard {
+    pub index: u32,
+    pub name: String,
+    pub description: String,
+    /// (name, description, available).
+    pub profiles: Vec<(String, String, bool)>,
+    pub active: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Mixer {
+    pub sinks: Vec<MixDevice>,
+    pub sources: Vec<MixDevice>,
+    pub playback: Vec<MixStream>,
+    pub recording: Vec<MixStream>,
+    pub cards: Vec<MixCard>,
+    pub default_sink: String,
+    pub default_source: String,
+}
+
+/// A change made from the mixer; `output` picks sinks and playback over
+/// sources and recording.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MixAction {
+    DeviceVolume { output: bool, index: u32, volume: Vec<u32> },
+    DeviceMute { output: bool, index: u32, mute: bool },
+    Default { output: bool, name: String },
+    Port { output: bool, index: u32, port: String },
+    StreamVolume { output: bool, index: u32, volume: Vec<u32> },
+    StreamMute { output: bool, index: u32, mute: bool },
+    Move { output: bool, stream: u32, device: u32 },
+    Profile { card: u32, profile: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -110,6 +178,9 @@ pub enum FromBar {
     Screenshot,
     /// Audio outputs: (name, description, default).
     Outputs(Vec<(String, String, bool)>),
+    Mixer(Mixer),
+    /// A click on the volume (true) or microphone widget: open the mixer.
+    OpenMixer(bool),
     /// The Bluetooth widgets: the device list.
     Bluetooth,
     /// The clock: show or hide the calendar.

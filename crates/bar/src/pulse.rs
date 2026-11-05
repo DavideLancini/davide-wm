@@ -39,6 +39,10 @@ pub const CMD_SUBSCRIBE_EVENT: u32 = 66;
 const MASK_SINK: u32 = 0x0001;
 const MASK_SOURCE: u32 = 0x0002;
 const MASK_SERVER: u32 = 0x0020;
+/// Streams and cards, for the mixer.
+const MASK_SINK_INPUT: u32 = 0x0004;
+const MASK_SOURCE_OUTPUT: u32 = 0x0008;
+const MASK_CARD: u32 = 0x0200;
 
 const INVALID_INDEX: u32 = 0xffff_ffff;
 const NORM_VOLUME: u32 = 0x10000; // PA_VOLUME_NORM: 100%
@@ -488,7 +492,7 @@ impl Pulse {
         let req = Writer::default()
             .u32(CMD_SUBSCRIBE)
             .u32(tag)
-            .u32(MASK_SINK | MASK_SOURCE | MASK_SERVER)
+            .u32(MASK_SINK | MASK_SOURCE | MASK_SERVER | MASK_SINK_INPUT | MASK_SOURCE_OUTPUT | MASK_CARD)
             .finish();
         self.request(&req).map(|_| ())
     }
@@ -541,6 +545,294 @@ impl Pulse {
 
     pub fn stream(&self) -> &UnixStream {
         &self.stream
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Mixer: every device, stream and card, and the commands that change them.
+// ---------------------------------------------------------------------------
+
+use crate::{MixAction, MixCard, MixDevice, MixStream, Mixer};
+
+const CMD_GET_SOURCE_INFO_LIST: u32 = 24;
+const CMD_GET_SINK_INPUT_INFO_LIST: u32 = 30;
+const CMD_GET_SOURCE_OUTPUT_INFO_LIST: u32 = 32;
+const CMD_SET_SINK_INPUT_VOLUME: u32 = 37;
+const CMD_SET_SOURCE_VOLUME: u32 = 38;
+const CMD_SET_DEFAULT_SOURCE: u32 = 45;
+const CMD_MOVE_SINK_INPUT: u32 = 67;
+const CMD_MOVE_SOURCE_OUTPUT: u32 = 68;
+const CMD_SET_SINK_INPUT_MUTE: u32 = 69;
+const CMD_GET_CARD_INFO_LIST: u32 = 89;
+const CMD_SET_CARD_PROFILE: u32 = 90;
+const CMD_SET_SINK_PORT: u32 = 96;
+const CMD_SET_SOURCE_PORT: u32 = 97;
+const CMD_SET_SOURCE_OUTPUT_VOLUME: u32 = 98;
+const CMD_SET_SOURCE_OUTPUT_MUTE: u32 = 99;
+
+fn to_raw(percent: u32) -> u32 {
+    ((percent as u64 * NORM_VOLUME as u64 + 50) / 100) as u32
+}
+
+impl Reader<'_> {
+    fn u8(&mut self) -> Option<u8> {
+        (self.tag()? == TAG_U8).then_some(())?;
+        let v = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(v)
+    }
+
+    /// Per-channel volumes in percent.
+    fn cvolume(&mut self) -> Option<Vec<u32>> {
+        (self.tag()? == TAG_CVOLUME).then_some(())?;
+        let n = *self.buf.get(self.pos)? as usize;
+        self.pos += 1;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let raw = u32::from_be_bytes(self.buf.get(self.pos..self.pos + 4)?.try_into().ok()?);
+            self.pos += 4;
+            out.push(to_percent(raw) as u32);
+        }
+        Some(out)
+    }
+
+    /// A proplist as (key, value) pairs; values are taken as text.
+    fn proplist(&mut self) -> Option<Vec<(String, String)>> {
+        (self.tag()? == TAG_PROPLIST).then_some(())?;
+        let mut out = Vec::new();
+        loop {
+            if *self.buf.get(self.pos)? == TAG_STRING_NULL {
+                self.pos += 1;
+                return Some(out);
+            }
+            let key = self.string()?.unwrap_or_default();
+            self.u32()?;
+            (self.tag()? == TAG_ARBITRARY).then_some(())?;
+            let n = u32::from_be_bytes(self.buf.get(self.pos..self.pos + 4)?.try_into().ok()?) as usize;
+            self.pos += 4;
+            let raw = self.buf.get(self.pos..self.pos + n)?;
+            self.pos += n;
+            out.push((key, String::from_utf8_lossy(raw).trim_end_matches('\0').to_string()));
+        }
+    }
+
+    fn opt_string(&mut self) -> Option<String> {
+        Some(self.string()?.unwrap_or_default())
+    }
+}
+
+fn prop<'a>(p: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    p.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// One sink or source record (they share the layout).
+fn device(r: &mut Reader, source: bool) -> Option<MixDevice> {
+    let index = r.u32()?;
+    let name = r.opt_string()?;
+    let description = r.opt_string()?;
+    r.skip()?; // sample spec
+    r.skip()?; // channel map
+    r.u32()?; // owner module
+    let volume = r.cvolume()?;
+    let muted = r.bool()?;
+    let monitor_of = r.u32()?;
+    r.skip()?; // monitor name
+    r.skip()?; // latency
+    r.skip()?; // driver
+    r.skip()?; // flags
+    r.skip()?; // proplist
+    r.skip()?; // configured latency
+    r.skip()?; // base volume
+    r.skip()?; // state
+    r.skip()?; // volume steps
+    let card = r.u32()?;
+    let n = r.u32()?;
+    let mut ports = Vec::new();
+    for _ in 0..n {
+        let pname = r.opt_string()?;
+        let pdesc = r.opt_string()?;
+        r.skip()?; // priority
+        let available = r.u32()?;
+        r.skip()?; // availability group
+        r.skip()?; // type
+        ports.push((pname, pdesc, available != 1));
+    }
+    let active_port = r.opt_string()?;
+    let formats = r.u8()?;
+    for _ in 0..formats {
+        r.skip()?;
+    }
+    Some(MixDevice { index, name, description, volume, muted, ports, active_port, monitor: source && monitor_of != INVALID_INDEX, card })
+}
+
+fn stream_name(p: &[(String, String)], fallback: &str) -> (String, String) {
+    let app = prop(p, "application.name").or(prop(p, "application.process.binary")).unwrap_or(fallback).to_string();
+    let media = prop(p, "media.name").unwrap_or("").to_string();
+    (app, media)
+}
+
+fn playback(r: &mut Reader) -> Option<MixStream> {
+    let index = r.u32()?;
+    let name = r.opt_string()?;
+    r.u32()?; // owner module
+    r.u32()?; // client
+    let device = r.u32()?;
+    r.skip()?;
+    r.skip()?;
+    let volume = r.cvolume()?;
+    r.skip()?; // buffer usec
+    r.skip()?; // sink usec
+    r.skip()?; // resample method
+    r.skip()?; // driver
+    let muted = r.bool()?;
+    let props = r.proplist()?;
+    r.skip()?; // corked
+    r.skip()?; // has volume
+    r.skip()?; // volume writable
+    r.skip()?; // format
+    let (app, media) = stream_name(&props, &name);
+    Some(MixStream { index, app, media, device, volume, muted })
+}
+
+fn recording(r: &mut Reader) -> Option<MixStream> {
+    let index = r.u32()?;
+    let name = r.opt_string()?;
+    r.u32()?;
+    r.u32()?;
+    let device = r.u32()?;
+    r.skip()?;
+    r.skip()?;
+    r.skip()?; // buffer usec
+    r.skip()?; // source usec
+    r.skip()?; // resample method
+    r.skip()?; // driver
+    let props = r.proplist()?;
+    r.skip()?; // corked
+    let volume = r.cvolume()?;
+    let muted = r.bool()?;
+    r.skip()?;
+    r.skip()?;
+    r.skip()?;
+    let (app, media) = stream_name(&props, &name);
+    Some(MixStream { index, app, media, device, volume, muted })
+}
+
+fn card(r: &mut Reader) -> Option<MixCard> {
+    let index = r.u32()?;
+    let name = r.opt_string()?;
+    r.u32()?; // owner module
+    r.skip()?; // driver
+    let n = r.u32()?;
+    let mut profiles = Vec::new();
+    for _ in 0..n {
+        let pname = r.opt_string()?;
+        let pdesc = r.opt_string()?;
+        r.skip()?; // sinks
+        r.skip()?; // sources
+        r.skip()?; // priority
+        let available = r.u32()?;
+        profiles.push((pname, pdesc, available != 0));
+    }
+    let active = r.opt_string()?;
+    let props = r.proplist()?;
+    let ports = r.u32()?;
+    for _ in 0..ports {
+        r.skip()?; // name
+        r.skip()?; // description
+        r.skip()?; // priority
+        r.skip()?; // available
+        r.skip()?; // direction
+        r.skip()?; // proplist
+        let np = r.u32()?;
+        for _ in 0..np {
+            r.skip()?;
+        }
+        r.skip()?; // latency offset
+        r.skip()?; // availability group
+        r.skip()?; // type
+    }
+    let description = prop(&props, "device.description").unwrap_or(&name).to_string();
+    Some(MixCard { index, name, description, profiles, active })
+}
+
+impl Pulse {
+    fn list<T>(&mut self, cmd: u32, mut parse: impl FnMut(&mut Reader) -> Option<T>) -> Option<Vec<T>> {
+        let tag = self.next_tag();
+        let body = self.request(&Writer::default().u32(cmd).u32(tag).finish())?;
+        let mut r = Reader::new(&body);
+        r.u32()?;
+        r.u32()?;
+        let mut out = Vec::new();
+        while r.pos < body.len() {
+            out.push(parse(&mut r)?);
+        }
+        Some(out)
+    }
+
+    fn default_names(&mut self) -> Option<(String, String)> {
+        let tag = self.next_tag();
+        let body = self.request(&Writer::default().u32(CMD_GET_SERVER_INFO).u32(tag).finish())?;
+        let mut r = Reader::new(&body);
+        r.u32()?;
+        r.u32()?;
+        for _ in 0..5 {
+            r.skip()?;
+        }
+        Some((r.opt_string()?, r.opt_string()?))
+    }
+
+    /// Everything the mixer shows.
+    pub fn mixer(&mut self) -> Option<Mixer> {
+        let (default_sink, default_source) = self.default_names()?;
+        Some(Mixer {
+            sinks: self.list(CMD_GET_SINK_INFO_LIST, |r| device(r, false))?,
+            sources: self.list(CMD_GET_SOURCE_INFO_LIST, |r| device(r, true))?,
+            playback: self.list(CMD_GET_SINK_INPUT_INFO_LIST, playback)?,
+            recording: self.list(CMD_GET_SOURCE_OUTPUT_INFO_LIST, recording)?,
+            cards: self.list(CMD_GET_CARD_INFO_LIST, card).unwrap_or_default(),
+            default_sink,
+            default_source,
+        })
+    }
+
+    fn cvolume_writer(w: Writer, volume: &[u32]) -> Vec<u8> {
+        let mut req = w.finish();
+        req.push(TAG_CVOLUME);
+        req.push(volume.len().max(1) as u8);
+        for v in volume.iter().copied().chain(std::iter::repeat(volume.first().copied().unwrap_or(0))).take(volume.len().max(1)) {
+            req.extend_from_slice(&to_raw(v).to_be_bytes());
+        }
+        req
+    }
+
+    /// Applies a mixer action.
+    pub fn mix(&mut self, a: &MixAction) -> Option<()> {
+        let tag = self.next_tag();
+        let w = Writer::default();
+        let req = match a {
+            MixAction::DeviceVolume { output, index, volume } => {
+                Self::cvolume_writer(w.u32(if *output { CMD_SET_SINK_VOLUME } else { CMD_SET_SOURCE_VOLUME }).u32(tag).u32(*index).null_string(), volume)
+            }
+            MixAction::DeviceMute { output, index, mute } => {
+                w.u32(if *output { CMD_SET_SINK_MUTE } else { CMD_SET_SOURCE_MUTE }).u32(tag).u32(*index).null_string().bool(*mute).finish()
+            }
+            MixAction::Default { output, name } => w.u32(if *output { CMD_SET_DEFAULT_SINK } else { CMD_SET_DEFAULT_SOURCE }).u32(tag).string(name).finish(),
+            MixAction::Port { output, index, port } => {
+                w.u32(if *output { CMD_SET_SINK_PORT } else { CMD_SET_SOURCE_PORT }).u32(tag).u32(*index).null_string().string(port).finish()
+            }
+            MixAction::StreamVolume { output, index, volume } => {
+                Self::cvolume_writer(w.u32(if *output { CMD_SET_SINK_INPUT_VOLUME } else { CMD_SET_SOURCE_OUTPUT_VOLUME }).u32(tag).u32(*index), volume)
+            }
+            MixAction::StreamMute { output, index, mute } => {
+                w.u32(if *output { CMD_SET_SINK_INPUT_MUTE } else { CMD_SET_SOURCE_OUTPUT_MUTE }).u32(tag).u32(*index).bool(*mute).finish()
+            }
+            MixAction::Move { output, stream, device } => {
+                w.u32(if *output { CMD_MOVE_SINK_INPUT } else { CMD_MOVE_SOURCE_OUTPUT }).u32(tag).u32(*stream).u32(*device).null_string().finish()
+            }
+            MixAction::Profile { card, profile } => w.u32(CMD_SET_CARD_PROFILE).u32(tag).u32(*card).null_string().string(profile).finish(),
+        };
+        self.request(&req).map(|_| ())
     }
 }
 
@@ -639,6 +931,27 @@ mod tests {
         if let Ok(m) = mute_out {
             let muted = String::from_utf8_lossy(&m.stdout).contains("yes");
             assert_eq!(sink.muted, muted, "mute mismatch vs pactl");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mixer_live {
+    /// Reads the whole mixer from the live server, when there is one.
+    #[test]
+    fn reads_every_list() {
+        let Some(mut p) = super::Pulse::connect() else { return };
+        let m = p.mixer().expect("mixer state");
+        assert!(!m.sinks.is_empty(), "no sinks");
+        for d in m.sinks.iter().chain(&m.sources) {
+            assert!(!d.volume.is_empty(), "{}", d.name);
+        }
+        eprintln!("{} sinks, {} sources, {} playing, {} recording, {} cards; default {}", m.sinks.len(), m.sources.len(), m.playback.len(), m.recording.len(), m.cards.len(), m.default_sink);
+        for c in &m.cards {
+            eprintln!("card {}: {} profiles, active {}", c.description, c.profiles.len(), c.active);
+        }
+        for s in &m.playback {
+            eprintln!("playback {} — {} on {} {:?}", s.app, s.media, s.device, s.volume);
         }
     }
 }

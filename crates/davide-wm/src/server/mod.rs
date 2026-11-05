@@ -453,6 +453,8 @@ pub struct State {
     pub osd: Option<NoticeView>,
     /// The month, shown under the clock.
     pub calendar: Option<NoticeView>,
+    /// A panel in the middle of the screen (the mixer).
+    pub panel: Option<NoticeView>,
     pub shot: Option<ShotView>,
     /// The lock screen: while set, nothing but it is drawn or gets input.
     pub lock: Option<PromptView>,
@@ -523,6 +525,7 @@ impl State {
             notices: Vec::new(),
             osd: None,
             calendar: None,
+            panel: None,
             shot: None,
             lock: None,
             prompt: None,
@@ -893,6 +896,18 @@ impl State {
             let w = launcher::card::OSD_WIDTH as i32;
             let rect = Rect::new((self.output.width - w) / 2, self.output.height - h as i32 - 80, w, h as i32);
             NoticeView { id: 0, rect, pixels: Some(px), tex: None }
+        });
+        self.needs_redraw = true;
+    }
+
+    /// Shows a panel of `width` in the middle of the screen, or hides it.
+    pub fn set_panel(&mut self, width: u32, card: Option<Card>) {
+        if let Some(t) = self.panel.take().and_then(|o| o.tex) {
+            self.dead_textures.push(t);
+        }
+        self.panel = card.map(|(h, px)| {
+            let (w, h) = (width as i32, h as i32);
+            NoticeView { id: 0, rect: Rect::new((self.output.width - w) / 2, (self.output.height - h) / 2, w, h), pixels: Some(px), tex: None }
         });
         self.needs_redraw = true;
     }
@@ -1292,7 +1307,7 @@ impl State {
         for (key, origin) in xwm::floating(self) {
             self.draw_tree(r, key, origin);
         }
-        for n in self.notices.iter_mut().chain(self.osd.as_mut()).chain(self.calendar.as_mut()) {
+        for n in self.notices.iter_mut().chain(self.osd.as_mut()).chain(self.calendar.as_mut()).chain(self.panel.as_mut()) {
             if let Some(px) = n.pixels.take() {
                 n.tex = Some(r.upload(n.tex.take(), n.rect.w, n.rect.h, n.rect.w * 4, &px));
             }

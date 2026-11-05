@@ -158,6 +158,8 @@ struct Loop<'a> {
     height: u32,
     epoll: OwnedFd,
     timer: OwnedFd,
+    /// The compositor shows the mixer: send it changes as they happen.
+    mixer_open: bool,
     zones: Zones,
     /// What each push source is registered with, as (fd, inode).
     watched: [Option<(RawFd, u64)>; SOURCES.len()],
@@ -194,6 +196,7 @@ impl<'a> Loop<'a> {
             height,
             epoll,
             timer,
+            mixer_open: false,
             zones: Zones::default(),
             watched: [None; SOURCES.len()],
             next_mega: Instant::now(),
@@ -296,7 +299,15 @@ impl<'a> Loop<'a> {
     fn drain(&mut self, source: Source) -> bool {
         let m = &mut self.zones.modules;
         match source {
-            Source::Audio => m.audio.drain_events(),
+            Source::Audio => {
+                let changed = m.audio.drain_events();
+                if changed && self.mixer_open {
+                    if let Some(mix) = m.audio.mixer() {
+                        self.link.send(FromBar::Mixer(mix));
+                    }
+                }
+                changed
+            }
             Source::Bluetooth => m.bluetooth.drain_events(),
             Source::Spotify => m.spotify.drain_events(),
         }
@@ -388,6 +399,21 @@ impl<'a> Loop<'a> {
                 m.lid = if lid_inhibited { "LID:ON" } else { "LID:OFF" }.into();
                 true
             }
+            ToBar::Mixer(action) => {
+                self.mixer_open = true;
+                let audio = &mut self.zones.modules.audio;
+                if let Some(a) = action {
+                    audio.mix(&a);
+                }
+                if let Some(m) = audio.mixer() {
+                    self.link.send(FromBar::Mixer(m));
+                }
+                true
+            }
+            ToBar::MixerClosed => {
+                self.mixer_open = false;
+                false
+            }
             ToBar::ListOutputs => {
                 if let Some(list) = self.zones.modules.audio.outputs() {
                     self.link.send(FromBar::Outputs(list));
@@ -431,17 +457,10 @@ impl<'a> Loop<'a> {
             }
             Target::Widget(widget) => widget,
         };
-        let m = &mut self.zones.modules;
         match widget {
-            // The audio toggles go through the PulseAudio connection the bar
-            // already holds, and the bar repaints at once rather than waiting
-            // for the subscription event to come back.
-            Widget::Volume => {
-                m.audio.toggle_sink();
-            }
-            Widget::Microphone => {
-                m.audio.toggle_mic();
-            }
+            // The audio widgets open the compositor's mixer.
+            Widget::Volume => self.link.send(FromBar::OpenMixer(true)),
+            Widget::Microphone => self.link.send(FromBar::OpenMixer(false)),
             Widget::Clock => self.link.send(FromBar::Calendar),
             Widget::Battery => self.link.send(FromBar::BatteryMenu),
             Widget::BtHeadphones => self.link.send(FromBar::Bluetooth),

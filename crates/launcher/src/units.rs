@@ -47,7 +47,7 @@ const UNITS: &[(&[&str], &str, f64)] = &[
     (&["m2"], "area", 1.0),
     (&["km2"], "area", 1e6),
     (&["ha"], "area", 1e4),
-    (&["acre"], "area", 4046.856_422_4),
+    (&["acre"], "area", 4_046.856_422_4),
     (&["ft2"], "area", 0.092_903_04),
     (&["j"], "energy", 1.0),
     (&["kj"], "energy", 1000.0),
@@ -109,7 +109,7 @@ mod tests {
         };
         near("10 km in mi", 6.213_711_922);
         near("100 f to c", 37.777_777_778);
-        near("2 gib in mb", 2147.483_648);
+        near("2 gib in mb", 2_147.483_648);
         near("(1+1) h in min", 120.0);
         near("90 km/h in m/s", 25.0);
         assert!(convert("3 kg in m").is_none());

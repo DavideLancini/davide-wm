@@ -110,6 +110,14 @@ impl Audio {
         self.ensure()?.default_source().map(|d| (d.volume_percent, d.muted))
     }
 
+    pub fn mixer(&mut self) -> Option<crate::Mixer> {
+        self.ensure()?.mixer()
+    }
+
+    pub fn mix(&mut self, a: &crate::MixAction) -> Option<()> {
+        self.ensure()?.mix(a)
+    }
+
     /// The outputs as (name, description, default).
     pub fn outputs(&mut self) -> Option<Vec<(String, String, bool)>> {
         let pulse = self.ensure()?;

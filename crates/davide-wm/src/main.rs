@@ -12,6 +12,7 @@ mod event_loop;
 mod ipc;
 mod keyboard;
 mod lock;
+mod mixer;
 mod notify;
 mod png;
 mod portal;
@@ -233,6 +234,8 @@ struct App {
     cursor_image: Option<(server::CursorImage, bool)>,
     /// The cursor plane must move without a frame.
     cursor_moved: bool,
+    /// The audio mixer while it is open; it has the keyboard.
+    mixer: Option<mixer::MixerUi>,
 }
 
 type Job = Box<dyn FnOnce() -> Result<worker::Done, String> + Send>;
@@ -270,6 +273,17 @@ impl App {
         if self.state.lock.is_some() || self.state.prompt.is_some() {
             self.tap = None;
             self.prompt_key(keycode, pressed);
+            return;
+        }
+        if self.mixer.is_some() {
+            self.tap = None;
+            if pressed {
+                let (sym, text) = (self.state.keyboard.sym(keycode), self.state.keyboard.text(keycode));
+                let out = self.mixer.as_mut().unwrap().key(sym, text);
+                self.mixer_outcome(out);
+            } else {
+                self.swallowed.retain(|k| *k != keycode);
+            }
             return;
         }
         let base = self.state.keyboard.base_sym(keycode);
@@ -380,11 +394,7 @@ impl App {
                 self.state.open_view(launcher::Launcher::picker(labels), Purpose::Power);
             }
             Action::Media(key) => self.jobs.push(Box::new(move || services::media(key).map(|_| worker::Done::Saved))),
-            Action::AudioOutputs => {
-                if let Some(bar) = &self.bar {
-                    bar.send(bar::ToBar::ListOutputs);
-                }
-            }
+            Action::AudioOutputs => self.open_mixer(true),
             Action::Exit => self.running = false,
         }
     }
@@ -510,6 +520,82 @@ impl App {
             },
         }
         self.sync_notices();
+    }
+
+    fn open_mixer(&mut self, output: bool) {
+        self.state.close_launcher();
+        self.mixer = Some(mixer::MixerUi::new(output));
+        seat::set_focus(&mut self.state, None);
+        if let Some(bar) = &self.bar {
+            bar.send(bar::ToBar::Mixer(None));
+        }
+        self.draw_mixer();
+    }
+
+    fn close_mixer(&mut self) {
+        self.mixer = None;
+        self.state.set_panel(launcher::card::MIXER_WIDTH, None);
+        if let Some(bar) = &self.bar {
+            bar.send(bar::ToBar::MixerClosed);
+        }
+        workspaces::refocus(&mut self.state);
+    }
+
+    fn mixer_outcome(&mut self, out: mixer::Outcome) {
+        match out {
+            mixer::Outcome::Nothing => {}
+            mixer::Outcome::Redraw => self.draw_mixer(),
+            mixer::Outcome::Close => self.close_mixer(),
+            mixer::Outcome::Action(a) => {
+                if let Some(bar) = &self.bar {
+                    bar.send(bar::ToBar::Mixer(Some(a)));
+                }
+            }
+        }
+    }
+
+    fn draw_mixer(&mut self) {
+        let Some(ui) = &self.mixer else { return };
+        if self.cards.is_none() {
+            self.cards = launcher::card::Cards::new().inspect_err(|e| log!("{e}")).ok();
+        }
+        let Some(cards) = &self.cards else { return };
+        let mut rows = ui.rows();
+        if ui.data.is_none() {
+            rows.push(launcher::card::MixRow { title: "Lettura dell'audio…".into(), detail: String::new(), volume: None, header: true, marked: false });
+        }
+        let card = cards.mixer(["Uscita", "Ingresso"], if ui.output { 0 } else { 1 }, &rows, ui.selected(), ui.scroll(), mixer::HELP);
+        self.state.set_panel(launcher::card::MIXER_WIDTH, Some(card));
+    }
+
+    /// Pointer input while the mixer is open: the wheel changes the volume,
+    /// a click picks a row, a click outside closes it.
+    fn mixer_pointer(&mut self, e: &Event) -> bool {
+        let Some(rect) = self.state.panel.as_ref().map(|p| p.rect) else { return false };
+        let (x, y) = (self.state.pointer.x, self.state.pointer.y);
+        match *e {
+            Event::PointerAxis(0, v) if rect.contains(x, y) => {
+                if let Some(a) = self.mixer.as_ref().and_then(|ui| ui.wheel(v < 0.0)) {
+                    self.mixer_outcome(mixer::Outcome::Action(a));
+                }
+                true
+            }
+            Event::PointerButton(_, true) if !rect.contains(x, y) => {
+                self.close_mixer();
+                true
+            }
+            Event::PointerButton(_, true) => {
+                let top = rect.y + launcher::card::MIXER_TOP as i32;
+                let n = (y as i32 - top).div_euclid(launcher::card::MIXER_ROW as i32);
+                if n >= 0 && (n as usize) < launcher::card::MIXER_ROWS {
+                    let out = self.mixer.as_mut().unwrap().click(n as usize);
+                    self.mixer_outcome(out);
+                }
+                true
+            }
+            Event::PointerButton(..) | Event::PointerAxis(..) => true,
+            _ => false,
+        }
     }
 
     /// Suspend waits for the lock screen to be drawn (DRM only).
@@ -1240,6 +1326,14 @@ impl App {
             }
             bar::FromBar::Bluetooth => self.jobs.push(Box::new(|| services::bt_devices().map(|(p, d)| worker::Done::Bluetooth(p, d)))),
             bar::FromBar::Calendar => self.toggle_calendar(),
+            bar::FromBar::OpenMixer(output) => self.open_mixer(output),
+            bar::FromBar::Mixer(m) => {
+                if let Some(ui) = &mut self.mixer {
+                    ui.data = Some(m);
+                    ui.settle();
+                    self.draw_mixer();
+                }
+            }
             bar::FromBar::BatteryMenu => self.open_battery(),
             bar::FromBar::CpuCycle => {
                 set_cpu_auto(false);
@@ -1589,6 +1683,9 @@ impl App {
             self.shot_event(e);
             return;
         }
+        if self.mixer.is_some() && self.mixer_pointer(&e) {
+            return;
+        }
         if self.state.launcher.is_some() {
             match e {
                 Event::PointerMotion(..) | Event::PointerMotionRelative(..) => {
@@ -1740,6 +1837,7 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         hw_cursor_enabled: true,
         cursor_image: None,
         cursor_moved: false,
+        mixer: None,
     }
 }
 

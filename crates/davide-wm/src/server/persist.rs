@@ -379,6 +379,7 @@ impl State {
             notices: _,
             osd: _,
             calendar: _,
+            panel: _,
             shot: _,
             lock,
             prompt: _,

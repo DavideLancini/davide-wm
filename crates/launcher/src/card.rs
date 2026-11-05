@@ -191,6 +191,84 @@ impl Cards {
     }
 }
 
+/// The mixer panel.
+pub const MIXER_WIDTH: u32 = 1100;
+/// Rows of the mixer shown at once.
+pub const MIXER_ROWS: usize = 12;
+/// Height of a mixer row (two lines), and of its header row.
+pub const MIXER_ROW: u32 = 2 * LINE + 8;
+pub const MIXER_TOP: u32 = PAD + LINE + 12;
+const BAR_W: u32 = 360;
+const SELECTED: u32 = 0x33_33_33;
+
+/// A line of the mixer: a section title, or a device, stream or card.
+pub struct MixRow {
+    pub title: String,
+    pub detail: String,
+    /// Per-channel volume in percent, muted, the channel being edited.
+    pub volume: Option<(Vec<u32>, bool, Option<usize>)>,
+    pub header: bool,
+    /// The default device.
+    pub marked: bool,
+}
+
+impl Cards {
+    /// The mixer: tabs, then rows from `scroll` (`selected` highlighted),
+    /// then the key help. Returns the height and ARGB pixels.
+    pub fn mixer(&self, tabs: [&str; 2], tab: usize, rows: &[MixRow], selected: usize, scroll: usize, help: &str) -> (u32, Vec<u8>) {
+        let w = MIXER_WIDTH;
+        let h = MIXER_TOP + MIXER_ROW * MIXER_ROWS as u32 + LINE + 2 * PAD;
+        let stride = (w * 4) as usize;
+        let mut buf = vec![0u8; stride * h as usize];
+        fill_rect_opaque(&mut buf, stride, 0, 0, w, h, BORDER);
+        fill_rect_opaque(&mut buf, stride, 1, 1, w - 2, h - 2, 0);
+        let text = |buf: &mut Vec<u8>, x: i32, y: i32, s: &str, c: u32| draw_text(buf, stride, w as i32, h, &self.font, SIZE, x, y, s, c);
+        let mut x = PAD as i32;
+        for (i, t) in tabs.iter().enumerate() {
+            let tw = text_width_at(&self.font, t, SIZE);
+            if i == tab {
+                fill_rect_opaque(&mut buf, stride, x as u32 - 6, PAD - 2, tw as u32 + 12, LINE + 4, SELECTED);
+            }
+            text(&mut buf, x, (PAD + LINE - 6) as i32, t, if i == tab { TITLE } else { BODY });
+            x += tw + 40;
+        }
+        for (n, row) in rows.iter().skip(scroll).take(MIXER_ROWS).enumerate() {
+            let y = MIXER_TOP + n as u32 * MIXER_ROW;
+            if scroll + n == selected {
+                fill_rect_opaque(&mut buf, stride, 2, y, w - 4, MIXER_ROW - 2, SELECTED);
+            }
+            let base = (y + LINE - 2) as i32;
+            if row.header {
+                text(&mut buf, PAD as i32, base + (LINE / 2) as i32, &row.title, CRITICAL);
+                continue;
+            }
+            let title = format!("{}{}", if row.marked { "\u{2022} " } else { "" }, row.title);
+            let right = (w - PAD - BAR_W) as i32;
+            text(&mut buf, PAD as i32, base, &fit(&self.font, &title, right - 20 - PAD as i32), TITLE);
+            text(&mut buf, PAD as i32 + 16, base + LINE as i32, &fit(&self.font, &row.detail, right - 36 - PAD as i32), BODY);
+            if let Some((vol, muted, channel)) = &row.volume {
+                let n = vol.len().max(1) as u32;
+                let bh = ((LINE + 4) / n).clamp(3, 10);
+                for (c, v) in vol.iter().enumerate() {
+                    let by = y + LINE + 4 + c as u32 * (bh + 2);
+                    fill_rect_opaque(&mut buf, stride, right as u32, by, BAR_W, bh, TRACK);
+                    let fill = (BAR_W as f32 * (*v as f32 / 150.0).min(1.0)) as u32;
+                    let color = if *muted { 0x60_60_60 } else if *channel == Some(c) { CRITICAL } else { TITLE };
+                    if fill > 0 {
+                        fill_rect_opaque(&mut buf, stride, right as u32, by, fill, bh, color);
+                    }
+                    // 100 % mark.
+                    fill_rect_opaque(&mut buf, stride, right as u32 + BAR_W * 2 / 3, by, 1, bh, BODY);
+                }
+                let label = if *muted { "muto".to_string() } else { format!("{}%", vol.iter().max().copied().unwrap_or(0)) };
+                text(&mut buf, right, base, &label, if *muted { CRITICAL } else { TITLE });
+            }
+        }
+        text(&mut buf, PAD as i32, (h - PAD - 6) as i32, &fit(&self.font, help, (w - 2 * PAD) as i32), BODY);
+        (h, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +285,12 @@ mod tests {
         assert_eq!(px.len(), (CARD_WIDTH * h * 4) as usize);
         let (h, px) = c.osd("Volume 40%", Some(0.4));
         assert_eq!(px.len(), (OSD_WIDTH * h * 4) as usize);
+        let rows = vec![
+            MixRow { title: "Dispositivi".into(), detail: String::new(), volume: None, header: true, marked: false },
+            MixRow { title: "Altoparlanti".into(), detail: "porta: cuffie".into(), volume: Some((vec![60, 80], false, Some(1))), header: false, marked: true },
+        ];
+        let (h, px) = c.mixer(["Uscita", "Ingresso"], 0, &rows, 1, 0, "Tab cambia");
+        assert_eq!(px.len(), (MIXER_WIDTH * h * 4) as usize);
         let (h, px) = c.calendar(2026, 11, 30, 6, Some(5));
         assert_eq!(px.len(), (CALENDAR_WIDTH * h * 4) as usize);
         let (h, px) = c.prompt("Autenticazione", "Serve la password per montare il disco", 5, "Password errata");
