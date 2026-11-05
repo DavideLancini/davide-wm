@@ -15,7 +15,7 @@ persist_struct!(SKey { client, id });
 persist_struct!(Pending { buffer, frames, geometry });
 persist_struct!(Xdg { obj, role, geometry, configured, mapped });
 persist_struct!(DmabufParams { planes, modifier, used });
-persist_struct!(Positioner { size, anchor_rect, anchor, gravity, offset });
+persist_struct!(Positioner { size, anchor_rect, anchor, gravity, offset, constraint_adjustment });
 persist_struct!(Output { name, width, height });
 persist_struct!(PointerState { x, y, focus, cursor });
 
@@ -70,6 +70,7 @@ impl Persist for Kind {
             Kind::DmabufParams => (41, 0, 0),
             Kind::XwaylandShell => (42, 0, 0),
             Kind::DmabufFeedback => (44, 0, 0),
+            Kind::DragOffer => (45, 0, 0),
             Kind::XwaylandSurface { surface } => (43, surface, 0),
         };
         (tag, a, b).save(e);
@@ -122,6 +123,7 @@ impl Persist for Kind {
             41 => Kind::DmabufParams,
             42 => Kind::XwaylandShell,
             44 => Kind::DmabufFeedback,
+            45 => Kind::DragOffer,
             43 => Kind::XwaylandSurface { surface: a },
             _ => return bad("object kind"),
         })
@@ -151,6 +153,7 @@ impl Persist for Role {
             Role::Subsurface { parent, x, y, sync } => (2u8, parent, x, y, sync).save(e),
             Role::Xdg => (3u8, 0u32, 0i32, 0i32, false).save(e),
             Role::Xwayland => (4u8, 0u32, 0i32, 0i32, false).save(e),
+            Role::DndIcon => (5u8, 0u32, 0i32, 0i32, false).save(e),
         }
     }
     fn load(d: &mut Dec) -> Result<Self> {
@@ -161,6 +164,7 @@ impl Persist for Role {
             2 => Role::Subsurface { parent, x, y, sync },
             3 => Role::Xdg,
             4 => Role::Xwayland,
+            5 => Role::DndIcon,
             _ => return bad("role"),
         })
     }
@@ -170,10 +174,11 @@ impl Persist for XdgRole {
     fn save(&self, e: &mut Enc) {
         match self {
             XdgRole::None => 0u8.save(e),
-            XdgRole::Toplevel { obj, title, app_id, decoration, sent } => {
+            XdgRole::Toplevel { obj, title, app_id, decoration, sent, parent, min, max } => {
                 1u8.save(e);
                 (*obj, title.clone(), app_id.clone(), *decoration).save(e);
                 sent.save(e);
+                (*parent, *min, *max).save(e);
             }
             XdgRole::Popup { obj, parent, geo } => {
                 2u8.save(e);
@@ -186,7 +191,9 @@ impl Persist for XdgRole {
             0 => XdgRole::None,
             1 => {
                 let (obj, title, app_id, decoration) = Persist::load(d)?;
-                XdgRole::Toplevel { obj, title, app_id, decoration, sent: Persist::load(d)? }
+                let sent = Persist::load(d)?;
+                let (parent, min, max) = Persist::load(d)?;
+                XdgRole::Toplevel { obj, title, app_id, decoration, sent, parent, min, max }
             }
             2 => {
                 let (obj, parent, geo) = Persist::load(d)?;
@@ -351,6 +358,8 @@ impl State {
             launcher: _,
             notices: _,
             shot: _,
+            drag: _,
+            dropped: _,
             hide_cursor: _,
             abandoned: _,
             xwayland,

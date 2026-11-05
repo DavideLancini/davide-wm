@@ -42,7 +42,7 @@
 
 | Field | Value |
 |---|---|
-| Doc version | 0.12 |
+| Doc version | 0.13 |
 | Last updated | 2026-11-05 |
 | Owner | Davide Lancini |
 | Project status | development |
@@ -190,6 +190,7 @@
     - *Portal backend (`portal.rs`, ADR-042):* `org.freedesktop.impl.portal.desktop.davidewm` on the session bus; Start opens a picker in the launcher box (whole screen, then every window with its workspace) and answers with the stream's node once PipeWire registered it. Esc or a click outside cancels. Closing the session stops the cast. Restore tokens are not implemented: every share asks again.
     - *Screenshots (ADR-043):* Print freezes the screen (drawn again without the pointer) and shows it dimmed: drag for a region, click for the window under the pointer (highlighted while hovering), Enter for the whole output, Esc or another button to cancel. The PNG (own deflate encoder, on the worker) is saved in `~/Screenshots/` and becomes the clipboard (it also enters the history). The portal's Screenshot uses the same path, interactive or not.
     - *Not done:* dmabuf buffers (frames are copied through the CPU: fine at 30 fps), cursor as metadata, restore tokens, the virtual (headless) output `cast on virtual` needs — `cast` itself (Miracast) stays a separate program and has to take its frames from `davide-wm msg cast` instead of `wf-recorder`. Casts end on a live upgrade (the session gets Closed).
+  - **After M7 (2026-11-05, tested nested with Thunar):** floating windows (ADR-044): xdg dialogs (with a parent, or with equal minimum and maximum size) and X dialogs (`WM_TRANSIENT_FOR`, dialog/utility type, fixed size hints) are centred above the tiles at their own size and raised on focus; popups are kept on the output by flipping, sliding and shrinking as their positioner allows (`xdg_popup.reposition` too); drag and drop between Wayland clients (`start_drag`, offers with actions, drop, finish; the drag icon follows the pointer). Blob format 6.
   - **Switch-over:** install the portal files from `dist/`; remove Hyprland, xdg-desktop-portal-hyprland/-wlr, wf-recorder, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
   - **Afterwards:** keep migrating the remaining `dawn` crates and helper scripts the bar calls (`cpu-cycle`, `brightness`, `set-timer.sh`, `bt-headphones-battery`, ...).
 
@@ -385,6 +386,7 @@ davide-wm/
 | 41 | libpipewire on the compositor's loop, CPU copies | accepted | 2026-11-05 | PipeWire's loop fd sits in the main epoll instead of a `pw_thread_loop`: no locking, callbacks see compositor state. Frames are read back with `glReadPixels` into memfd buffers in RGBx (the byte order GL gives): no modifier negotiation, works with every consumer; dmabuf export can come later if the copies show up in profiles. |
 | 42 | Portal source picker in the launcher box | accepted | 2026-11-05 | No separate dialog program (xdg-desktop-portal-hyprland ships one in Qt): the picker reuses `Launcher::picker`, so typing filters windows. Only one source per session; `multiple` is ignored. |
 | 43 | Screenshots inside the compositor | accepted | 2026-11-05 | Replaces grim, slurp and swappy: the frozen frame is the selector's background, so what is saved is what was on screen when Print was pressed. Saved to `~/Screenshots/` and copied to the clipboard; swappy's annotations are dropped. PNG encoding (own deflate, about 0.25 s for a full 2160x1440 frame in release) runs on the worker. |
+| 44 | Floating dialogs | accepted | 2026-11-05 | Hyprland floated dialogs on its own; tiling them made file pickers and confirmations take half the screen. A workspace keeps its floating windows apart from the dwindle tree, with a position chosen once (centred in the work area) and the size the client picks. Neighbour navigation and swapping stay tile-only. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
@@ -442,7 +444,7 @@ davide-wm/
 | Some current behaviour depends on Hyprland specifics (socket2 consumers, `hyprctl` calls in helper scripts) | Regressions after switch-over | `dawn` inventoried in M4 (monitor-manager, blk, lid tools ported); still to check: the helper scripts the bar calls and `cast` (M7). |
 | Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, `persist_struct!` forces every field to be handled, automatic fallback to `davide-wm-prev`. Still missing: round-trip tests on a headless backend, and a test of the DRM path (logind bus, KMS fd, libinput re-open). |
 | One huge project, always built together | Long builds, harder refactors | Cargo workspace (ADR-015), clear crate boundaries, live upgrade makes deploying cheap. |
-| Remaining simplifications | Visual glitches with some clients | X windows on hidden workspaces keep their X position (harmless: input follows wl_pointer), X dialogs are tiled, no INCR towards X clients. Subsurfaces are always desynchronised, popups have no constraint adjustment or grabs, full redraw every frame, buffer scale 1 only, no drag and drop, fullscreen requests before the first commit are ignored. |
+| Remaining simplifications | Visual glitches with some clients | X windows on hidden workspaces keep their X position (harmless: input follows wl_pointer), no INCR towards X clients. Subsurfaces are always desynchronised, popups have no grabs and resize only by shrinking, full redraw every frame (no damage tracking, cursor drawn by the GPU with the scene), buffer scale 1 only, drag and drop between Wayland clients only (not with X clients), floating windows cannot be moved or resized with the mouse, fullscreen requests before the first commit are ignored. |
 | Open questions | Plan may change | Whether to keep layer-shell for any external client. |
 
 ---

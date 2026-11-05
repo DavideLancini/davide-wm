@@ -986,6 +986,7 @@ impl App {
                 let (x, y) = (self.state.pointer.x + dx, self.state.pointer.y + dy);
                 seat::pointer_motion(&mut self.state, x, y);
             }
+            Event::PointerButton(b, p) if self.state.drag.is_some() => seat::pointer_button(&mut self.state, b, p),
             Event::PointerButton(b, p) if self.state.in_bar(self.state.pointer.y) => {
                 const BTN_LEFT: u32 = 0x110;
                 if b == BTN_LEFT && !p {
@@ -1275,7 +1276,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 5;
+const BLOB_FORMAT: u32 = 6;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.

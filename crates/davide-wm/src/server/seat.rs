@@ -150,6 +150,7 @@ pub fn set_focus(s: &mut State, key: Option<SKey>) {
         s.urgent.remove(&k);
         if let Some(ws) = s.window_ws.get(&k).and_then(|w| s.workspaces.get_mut(w)) {
             ws.focus = Some(k);
+            ws.raise(k);
         }
         keyboard_enter(s, k, None);
         if old_client != Some(k.client) {
@@ -240,6 +241,12 @@ fn pointer_frame(s: &mut State, c: ClientId) {
 /// The pointer moved: the window under it gets the keyboard focus too
 /// (focus follows the mouse, like Hyprland's default).
 pub fn pointer_motion(s: &mut State, x: f64, y: f64) {
+    if s.drag.is_some() {
+        s.pointer.x = x.clamp(0.0, (s.output.width - 1).max(0) as f64);
+        s.pointer.y = y.clamp(0.0, (s.output.height - 1).max(0) as f64);
+        dnd::motion(s);
+        return;
+    }
     update_pointer(s, x, y);
     let top = s.pointer.focus.and_then(|k| toplevel_of(s, k));
     if top.is_some() && top != s.focus {
@@ -251,6 +258,9 @@ pub fn pointer_motion(s: &mut State, x: f64, y: f64) {
 /// switch, new layout) without moving the keyboard focus.
 pub fn refresh_pointer(s: &mut State) {
     s.pointer_dirty = false;
+    if s.drag.is_some() {
+        return;
+    }
     update_pointer(s, s.pointer.x, s.pointer.y);
 }
 
@@ -287,6 +297,12 @@ fn update_pointer(s: &mut State, x: f64, y: f64) {
 }
 
 pub fn pointer_button(s: &mut State, button: u32, pressed: bool) {
+    if s.drag.is_some() {
+        if !pressed {
+            dnd::drop(s);
+        }
+        return;
+    }
     if pressed {
         let top = s.pointer.focus.and_then(|k| toplevel_of(s, k));
         if top.is_some() && top != s.focus {
@@ -304,6 +320,9 @@ pub fn pointer_button(s: &mut State, button: u32, pressed: bool) {
 }
 
 pub fn pointer_axis(s: &mut State, axis: u32, value: f64) {
+    if s.drag.is_some() {
+        return;
+    }
     let Some(k) = s.pointer.focus else { return };
     let time = s.time_ms();
     for (p, _) in s.objects_of(k.client, Kind::Pointer) {

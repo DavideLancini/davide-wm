@@ -74,6 +74,8 @@ atoms!(
     _NET_WM_WINDOW_TYPE_COMBO,
     _NET_WM_WINDOW_TYPE_DND,
     _NET_WM_WINDOW_TYPE_SPLASH,
+    _NET_WM_WINDOW_TYPE_DIALOG,
+    _NET_WM_WINDOW_TYPE_UTILITY,
 );
 
 pub struct XWindow {
@@ -98,6 +100,11 @@ pub struct XWindow {
     input: bool,
     /// A menu, tooltip or the like: never tiled.
     popup: bool,
+    /// A dialog (`WM_TRANSIENT_FOR`, dialog or utility type) or a window
+    /// whose minimum and maximum size are the same: it floats.
+    transient: bool,
+    dialog: bool,
+    fixed: bool,
     /// Wants to start fullscreen (`_NET_WM_STATE` before mapping).
     wants_fullscreen: bool,
     /// What `_NET_WM_STATE` says now.
@@ -105,6 +112,10 @@ pub struct XWindow {
 }
 
 impl XWindow {
+    pub fn floats(&self) -> bool {
+        self.transient || self.dialog || self.fixed
+    }
+
     fn new(override_redirect: bool, geometry: Rect) -> XWindow {
         XWindow {
             override_redirect,
@@ -122,6 +133,9 @@ impl XWindow {
             take_focus: false,
             input: true,
             popup: false,
+            transient: false,
+            dialog: false,
+            fixed: false,
             wants_fullscreen: false,
             fullscreen: false,
         }
@@ -271,10 +285,26 @@ fn event(s: &mut State, ev: Event) -> io::Result<()> {
             if win.shown && !win.managed {
                 s.needs_redraw = true;
                 s.pointer_dirty = true;
+            } else if let Some(key) = key_of(s, window) {
+                s.float_resized(key);
             }
         }
         Event::ConfigureRequest { window, mask: m, x: wx, y, w, h, sibling, stack_mode } => {
-            let Some(win) = x.windows.get(&window) else { return Ok(()) };
+            if !x.windows.contains_key(&window) {
+                return Ok(());
+            }
+            let floating = key_of(s, window).is_some_and(|k| s.is_floating(k));
+            let x = s.xwm.as_mut().unwrap();
+            let win = &x.windows[&window];
+            if floating {
+                // A dialog may pick its size; the place stays ours.
+                let m = m & (x11::config::WIDTH | x11::config::HEIGHT);
+                let values: Vec<u32> = [(x11::config::WIDTH, w as u32), (x11::config::HEIGHT, h as u32)].iter().filter(|(b, _)| m & b != 0).map(|(_, v)| *v).collect();
+                if m != 0 {
+                    x.conn.configure_window(window, m, &values);
+                }
+                return Ok(());
+            }
             match win.sent.filter(|_| win.managed) {
                 // Tiled: the layout decides; tell the client so.
                 Some(r) => {
@@ -335,6 +365,8 @@ fn read_properties(s: &mut State, window: u32, only: Option<u32>) -> io::Result<
         atom::WM_HINTS,
         a._NET_WM_WINDOW_TYPE,
         a._NET_WM_STATE,
+        atom::WM_TRANSIENT_FOR,
+        atom::WM_NORMAL_HINTS,
     ];
     let names: Vec<u32> = match only {
         Some(p) if all.contains(&p) => vec![p],
@@ -382,8 +414,15 @@ fn read_properties(s: &mut State, window: u32, only: Option<u32>) -> io::Result<
                     a._NET_WM_WINDOW_TYPE_DND,
                     a._NET_WM_WINDOW_TYPE_SPLASH,
                 ];
-                // The first type the WM knows wins; all of ours are popups.
+                // The first type the WM knows wins.
                 w.popup = types.first().is_some_and(|t| popups.contains(t));
+                w.dialog = types.first().is_some_and(|t| [a._NET_WM_WINDOW_TYPE_DIALOG, a._NET_WM_WINDOW_TYPE_UTILITY].contains(t));
+            }
+            atom::WM_TRANSIENT_FOR => w.transient = p.map(|p| p.u32s()).is_some_and(|v| v.first().is_some_and(|t| *t != 0)),
+            atom::WM_NORMAL_HINTS => {
+                // flags, x, y, w, h, min w/h, max w/h: PMinSize 16, PMaxSize 32.
+                let h = p.map(|p| p.u32s()).unwrap_or_default();
+                w.fixed = h.len() >= 9 && h[0] & 48 == 48 && h[5] > 0 && h[5] == h[7] && h[6] == h[8];
             }
             n if n == a._NET_WM_STATE => {
                 let fs = p.map(|p| p.u32s()).unwrap_or_default().contains(&a._NET_WM_STATE_FULLSCREEN);
@@ -669,6 +708,9 @@ persist_struct!(XWindow {
     take_focus,
     input,
     popup,
+    transient,
+    dialog,
+    fixed,
     wants_fullscreen,
     fullscreen,
 });

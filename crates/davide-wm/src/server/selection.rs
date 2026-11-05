@@ -37,7 +37,9 @@ pub struct Selections {
     clipboard: Selection,
     primary: Selection,
     /// Mime types offered by each source object.
-    mimes: HashMap<SKey, Vec<String>>,
+    pub mimes: HashMap<SKey, Vec<String>>,
+    /// Drag and drop actions a `wl_data_source` allows.
+    pub dnd_actions: HashMap<SKey, u32>,
     pub history: History,
     /// Pipes the clipboard owner is writing into, with the generation they
     /// belong to; the event loop hands them to the worker.
@@ -98,11 +100,19 @@ pub fn request(s: &mut State, c: ClientId, id: u32, kind: Kind, version: u32, op
                     let mime = args.str(0).unwrap_or_default().to_string();
                     s.selection.mimes.entry(key).or_default().push(mime);
                 }
-                1 => source_gone(s, c, id),
+                1 => {
+                    s.selection.dnd_actions.remove(&key);
+                    super::dnd::source_gone(s, c, id);
+                    source_gone(s, c, id);
+                }
+                2 if kind == Kind::DataSource => {
+                    s.selection.dnd_actions.insert(key, args.uint(0));
+                }
                 _ => {}
             }
         }
         Kind::DataDevice if op == wl_data_device::req::SET_SELECTION => set(s, Which::Clipboard, c, args.obj(0), Kind::DataSource),
+        Kind::DataDevice if op == wl_data_device::req::START_DRAG => super::dnd::start(s, c, args.obj(0), args.obj(1), args.obj(2)),
         Kind::PrimaryDevice if op == zwp_primary_selection_device_v1::req::SET_SELECTION => {
             set(s, Which::Primary, c, args.obj(0), Kind::PrimarySource)
         }
@@ -411,10 +421,11 @@ impl state::Persist for Selections {
         self.clipboard.save(e);
         self.primary.save(e);
         self.mimes.save(e);
+        self.dnd_actions.save(e);
         self.history.save(e);
     }
     fn load(d: &mut state::Dec) -> state::Result<Self> {
         use state::Persist;
-        Ok(Selections { clipboard: Persist::load(d)?, primary: Persist::load(d)?, mimes: Persist::load(d)?, history: Persist::load(d)?, captures: Vec::new() })
+        Ok(Selections { clipboard: Persist::load(d)?, primary: Persist::load(d)?, mimes: Persist::load(d)?, dnd_actions: Persist::load(d)?, history: Persist::load(d)?, captures: Vec::new() })
     }
 }

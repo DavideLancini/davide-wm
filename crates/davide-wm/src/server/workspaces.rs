@@ -20,8 +20,13 @@ pub fn add_window(s: &mut State, key: SKey) {
     let hovered = s.pointer.focus.and_then(|k| seat::toplevel_of(s, k));
     let target = hovered.or(s.focus).filter(|f| s.window_ws.get(f) == Some(&ws_id));
     let fullscreen = s.rule(key).is_some_and(|r| r.fullscreen);
+    let float = s.wants_float(key);
     let ws = s.workspaces.entry(ws_id).or_default();
-    ws.tiling.insert(key, target);
+    if float {
+        ws.floating.push((key, Rect::default()));
+    } else {
+        ws.tiling.insert(key, target);
+    }
     if fullscreen {
         ws.fullscreen = Some((key, FsMode::Fullscreen));
     }
@@ -48,7 +53,7 @@ pub fn remove_window(s: &mut State, key: SKey) {
 pub fn refocus(s: &mut State) {
     let ws_id = focused_ws(s);
     let next = s.workspaces.get(&ws_id).and_then(|ws| {
-        ws.fullscreen.map(|(k, _)| k).or(ws.focus.filter(|f| ws.tiling.contains(*f))).or(ws.tiling.windows().last().copied())
+        ws.fullscreen.map(|(k, _)| k).or(ws.focus.filter(|f| ws.contains(*f))).or(ws.floating.last().map(|(k, _)| *k)).or(ws.tiling.windows().last().copied())
     });
     seat::set_focus(s, next);
 }
@@ -81,12 +86,16 @@ pub fn move_to(s: &mut State, target: WsId) {
     if from == target {
         return;
     }
+    let float = s.workspaces.get(&from).and_then(|ws| ws.floating.iter().find(|(k, _)| *k == key)).map(|(_, r)| *r);
     if let Some(ws) = s.workspaces.get_mut(&from) {
         ws.remove(key);
     }
     let ws = s.workspaces.entry(target).or_default();
     let split = ws.focus;
-    ws.tiling.insert(key, split);
+    match float {
+        Some(r) => ws.floating.push((key, r)),
+        None => ws.tiling.insert(key, split),
+    }
     ws.focus = Some(key);
     s.window_ws.insert(key, target);
     if target == WsId::Special {

@@ -6,6 +6,7 @@
 pub mod clipboard;
 mod compositor;
 mod dmabuf;
+pub mod dnd;
 mod misc;
 mod persist;
 pub mod seat;
@@ -81,6 +82,7 @@ pub enum Kind {
     Dmabuf,
     DmabufParams,
     DmabufFeedback,
+    DragOffer,
     XwaylandShell,
     XwaylandSurface { surface: u32 },
 }
@@ -120,11 +122,23 @@ pub enum Role {
     Xdg,
     /// Paired by Xwayland with an X window.
     Xwayland,
+    /// The image of a drag.
+    DndIcon,
 }
 
 pub enum XdgRole {
     None,
-    Toplevel { obj: u32, title: String, app_id: String, decoration: Option<u32>, sent: Option<(i32, i32, bool, Option<wm::FsMode>)> },
+    Toplevel {
+        obj: u32,
+        title: String,
+        app_id: String,
+        decoration: Option<u32>,
+        sent: Option<(i32, i32, bool, Option<wm::FsMode>)>,
+        /// The parent toplevel's surface: a dialog.
+        parent: Option<u32>,
+        min: (i32, i32),
+        max: (i32, i32),
+    },
     Popup { obj: u32, parent: u32, geo: Rect },
 }
 
@@ -204,6 +218,7 @@ pub struct Positioner {
     pub anchor: u32,
     pub gravity: u32,
     pub offset: (i32, i32),
+    pub constraint_adjustment: u32,
 }
 
 pub struct Output {
@@ -329,6 +344,8 @@ pub struct State {
     /// Notification popups, top to bottom.
     pub notices: Vec<NoticeView>,
     pub shot: Option<ShotView>,
+    pub drag: Option<dnd::Drag>,
+    pub dropped: Option<dnd::Dropped>,
     /// For screenshots: draw without the pointer.
     pub hide_cursor: bool,
     /// Pickers closed without a choice, for whoever opened them.
@@ -379,6 +396,8 @@ impl State {
             launcher: None,
             notices: Vec::new(),
             shot: None,
+            drag: None,
+            dropped: None,
             hide_cursor: false,
             abandoned: Vec::new(),
             xwayland: None,
@@ -563,7 +582,7 @@ impl State {
             Kind::XdgPositioner => xdg::positioner(self, c, id, op, args),
             Kind::XdgSurface { surface } => xdg::xdg_surface(self, c, surface, version, op, args),
             Kind::XdgToplevel { surface } => xdg::toplevel(self, c, surface, op, args),
-            Kind::XdgPopup { surface } => xdg::popup(self, c, surface, op),
+            Kind::XdgPopup { surface } => xdg::popup(self, c, surface, op, args),
             Kind::DecorationManager => xdg::decoration_manager(self, c, version, op, args),
             Kind::Decoration { surface } => xdg::decoration(self, c, id, surface, op),
             Kind::DataDeviceManager
@@ -582,6 +601,7 @@ impl State {
                 misc::request(self, c, id, kind, version, op, args)
             }
             Kind::Dmabuf | Kind::DmabufParams | Kind::DmabufFeedback => dmabuf::request(self, c, id, kind, version, op, args),
+            Kind::DragOffer => dnd::offer_request(self, c, id, op, args),
             Kind::XwaylandShell | Kind::XwaylandSurface { .. } => xwm::request(self, c, id, kind, version, op, args),
             Kind::Callback | Kind::Region | Kind::Keyboard | Kind::Touch | Kind::Output => {}
         }
@@ -642,6 +662,7 @@ impl State {
         self.positioners.retain(|k, _| k.client != client);
         self.idle_inhibitors.retain(|k, _| k.client != client);
         selection::client_gone(self, client);
+        dnd::client_gone(self, client);
         self.needs_redraw = true;
     }
 
@@ -673,6 +694,9 @@ impl State {
             }
         }
         self.idle_inhibitors.retain(|_, s| *s != key);
+        if let Some(d) = self.drag.as_mut().filter(|d| d.icon == Some(key)) {
+            d.icon = None;
+        }
         self.needs_redraw = true;
     }
 
@@ -770,6 +794,46 @@ impl State {
         }
     }
 
+    /// Dialogs and fixed-size windows float instead of tiling.
+    pub fn wants_float(&self, key: SKey) -> bool {
+        if let Some(w) = xwm::window(self, key) {
+            return w.floats();
+        }
+        match self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
+            Some(XdgRole::Toplevel { parent, min, max, .. }) => parent.is_some() || (min == max && min.0 > 0 && min.1 > 0),
+            _ => false,
+        }
+    }
+
+    pub fn is_floating(&self, key: SKey) -> bool {
+        self.window_ws.get(&key).and_then(|ws| self.workspaces.get(ws)).is_some_and(|w| w.is_floating(key))
+    }
+
+    /// Floating windows get their current size; new ones are centred.
+    fn place_floats(&mut self, ws: WsId) {
+        let work = self.work_area();
+        let keys: Vec<SKey> = self.workspaces.get(&ws).map(|w| w.floating.iter().map(|(k, _)| *k).collect()).unwrap_or_default();
+        for k in keys {
+            let Some((w, h)) = self.window_size(k) else { continue };
+            let Some(f) = self.workspaces.get_mut(&ws).and_then(|ws| ws.floating.iter_mut().find(|(t, _)| *t == k)) else { continue };
+            let r = &mut f.1;
+            if r.w == 0 {
+                r.x = work.x + ((work.w - w) / 2).max(0);
+                r.y = work.y + ((work.h - h) / 2).max(0);
+            }
+            (r.w, r.h) = (w, h);
+        }
+    }
+
+    /// A floating window committed: follow its new size.
+    pub fn float_resized(&mut self, key: SKey) {
+        let Some(&ws) = self.window_ws.get(&key) else { return };
+        let current = self.workspaces.get(&ws).and_then(|w| w.floating.iter().find(|(t, _)| *t == key)).map(|(_, r)| (r.w, r.h));
+        if current.is_some() && current != self.window_size(key) {
+            self.relayout();
+        }
+    }
+
     /// A window that is on screen (as far as its role is concerned).
     pub fn shown(&self, key: SKey) -> bool {
         self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).is_some_and(|x| x.mapped) || xwm::window(self, key).is_some_and(|w| w.shown)
@@ -810,7 +874,7 @@ impl State {
             WsId::Chat => "chat".to_string(),
             WsId::Special => "special:resize".to_string(),
         };
-        let mut list: Vec<WsId> = self.workspaces.iter().filter(|(_, w)| !w.tiling.is_empty()).map(|(id, _)| *id).collect();
+        let mut list: Vec<WsId> = self.workspaces.iter().filter(|(_, w)| !w.is_empty()).map(|(id, _)| *id).collect();
         if !list.contains(&self.active) {
             list.push(self.active);
         }
@@ -867,6 +931,10 @@ impl State {
     }
 
     pub fn relayout(&mut self) {
+        self.place_floats(self.active);
+        if self.special_shown {
+            self.place_floats(WsId::Special);
+        }
         let (work, out) = (self.work_area(), self.output_rect());
         let mut layout = self.workspaces.get(&self.active).map(|w| w.layout(work, out)).unwrap_or_default();
         self.special_start = layout.len();
@@ -877,6 +945,16 @@ impl State {
         for (key, rect) in self.layout.clone() {
             xdg::configure_toplevel(self, key, rect.w, rect.h);
             xwm::configure(self, key, rect);
+        }
+        // Floating windows not placed yet choose their own size.
+        let unplaced: Vec<SKey> = [Some(self.active), self.special_shown.then_some(WsId::Special)]
+            .into_iter()
+            .flatten()
+            .filter_map(|ws| self.workspaces.get(&ws))
+            .flat_map(|w| w.floating.iter().filter(|(_, r)| r.w == 0).map(|(k, _)| *k))
+            .collect();
+        for key in unplaced {
+            xdg::configure_toplevel(self, key, 0, 0);
         }
         self.needs_redraw = true;
         self.pointer_dirty = true;
@@ -967,6 +1045,7 @@ impl State {
                 r.draw(t, Quad { x: rect.x as f32, y: rect.y as f32, w: rect.w as f32, h: rect.h as f32 }, true);
             }
         }
+        dnd::draw_icon(self, r);
         self.draw_shot(r);
         if !self.hide_cursor {
             seat::draw_cursor(self, r);
@@ -1023,6 +1102,9 @@ impl State {
 
     /// Size of a window's content (its window geometry, else its surface).
     pub fn window_size(&self, key: SKey) -> Option<(i32, i32)> {
+        if let Some(w) = xwm::window(self, key) {
+            return Some((w.geometry.w, w.geometry.h)).filter(|(w, h)| *w > 0 && *h > 0);
+        }
         let sf = self.surfaces.get(&key)?;
         let g = sf.xdg.as_ref().and_then(|x| x.geometry);
         Some(g.map_or(sf.size, |g| (g.w, g.h))).filter(|(w, h)| *w > 0 && *h > 0)

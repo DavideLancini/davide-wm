@@ -184,6 +184,9 @@ pub enum FsMode {
 #[derive(Debug)]
 pub struct Workspace<T> {
     pub tiling: Dwindle<T>,
+    /// Windows above the tiles at their own size (dialogs), bottom to top.
+    /// A zero size means not placed yet.
+    pub floating: Vec<(T, Rect)>,
     /// Last focused window, restored when the workspace becomes active again.
     pub focus: Option<T>,
     pub fullscreen: Option<(T, FsMode)>,
@@ -191,13 +194,34 @@ pub struct Workspace<T> {
 
 impl<T: Copy + PartialEq> Default for Workspace<T> {
     fn default() -> Self {
-        Workspace { tiling: Dwindle::default(), focus: None, fullscreen: None }
+        Workspace { tiling: Dwindle::default(), floating: Vec::new(), focus: None, fullscreen: None }
     }
 }
 
 impl<T: Copy + PartialEq> Workspace<T> {
+    pub fn is_empty(&self) -> bool {
+        self.tiling.is_empty() && self.floating.is_empty()
+    }
+
+    pub fn contains(&self, w: T) -> bool {
+        self.tiling.contains(w) || self.is_floating(w)
+    }
+
+    pub fn is_floating(&self, w: T) -> bool {
+        self.floating.iter().any(|(t, _)| *t == w)
+    }
+
+    /// Raises a floating window above the others.
+    pub fn raise(&mut self, w: T) {
+        if let Some(i) = self.floating.iter().position(|(t, _)| *t == w) {
+            let f = self.floating.remove(i);
+            self.floating.push(f);
+        }
+    }
+
     pub fn remove(&mut self, w: T) {
         self.tiling.remove(w);
+        self.floating.retain(|(t, _)| *t != w);
         if self.focus == Some(w) {
             self.focus = None;
         }
@@ -211,7 +235,11 @@ impl<T: Copy + PartialEq> Workspace<T> {
         match self.fullscreen {
             Some((w, FsMode::Fullscreen)) => vec![(w, output)],
             Some((w, FsMode::Maximized)) => vec![(w, work)],
-            None => self.tiling.layout(work),
+            None => {
+                let mut l = self.tiling.layout(work);
+                l.extend(self.floating.iter().filter(|(_, r)| r.w > 0 && r.h > 0).copied());
+                l
+            }
         }
     }
 }
@@ -304,11 +332,12 @@ impl<T: Persist> Persist for Dwindle<T> {
 impl<T: Persist> Persist for Workspace<T> {
     fn save(&self, e: &mut Enc) {
         self.tiling.save(e);
+        self.floating.save(e);
         self.focus.save(e);
         self.fullscreen.save(e);
     }
     fn load(d: &mut Dec) -> state::Result<Self> {
-        Ok(Workspace { tiling: Persist::load(d)?, focus: Persist::load(d)?, fullscreen: Persist::load(d)? })
+        Ok(Workspace { tiling: Persist::load(d)?, floating: Persist::load(d)?, focus: Persist::load(d)?, fullscreen: Persist::load(d)? })
     }
 }
 
@@ -352,6 +381,20 @@ mod tests {
         assert_eq!(ws.layout(AREA, AREA), vec![(1, AREA)]);
         ws.remove(1);
         assert_eq!(ws.layout(AREA, AREA), vec![(2, AREA)]);
+    }
+
+    #[test]
+    fn floating_on_top() {
+        let mut ws = Workspace::default();
+        ws.tiling.insert(1, None);
+        ws.floating.push((2, Rect::new(10, 10, 100, 50)));
+        ws.floating.push((3, Rect::new(0, 0, 0, 0)));
+        assert_eq!(ws.layout(AREA, AREA), vec![(1, AREA), (2, Rect::new(10, 10, 100, 50))]);
+        assert!(ws.contains(3) && ws.is_floating(2) && !ws.is_floating(1));
+        ws.remove(2);
+        ws.remove(3);
+        ws.remove(1);
+        assert!(ws.is_empty());
     }
 
     #[test]
