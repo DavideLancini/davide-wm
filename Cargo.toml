@@ -24,6 +24,7 @@ sys = { path = "crates/sys" }
 wire = { path = "crates/wire" }
 wm = { path = "crates/wm" }
 x11 = { path = "crates/x11" }
+pipewire = { path = "crates/pipewire" }
 
 [profile.release]
 opt-level = 3

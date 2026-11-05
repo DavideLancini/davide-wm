@@ -67,6 +67,9 @@ pub enum Action {
     ClipboardHistory,
     /// The notification list.
     Notifications,
+    /// Select a region, a window or the output; the PNG goes to the
+    /// clipboard and to `SCREENSHOT_DIR`.
+    Screenshot,
     Exit,
 }
 
@@ -101,7 +104,7 @@ pub fn binds() -> Vec<Bind> {
         b(0, keys::AUDIO_RAISE_VOLUME, Action::Spawn("pactl set-sink-volume @DEFAULT_SINK@ +5%")),
         b(0, keys::MON_BRIGHTNESS_DOWN, Action::Spawn("brightness down")),
         b(0, keys::MON_BRIGHTNESS_UP, Action::Spawn("brightness up")),
-        b(0, keys::PRINT, Action::Spawn(r#"grim -g "$(slurp)" - | swappy -f -"#)),
+        b(0, keys::PRINT, Action::Screenshot),
         b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::ToggleBar),
         b(MAIN | SHIFT, keys::P, Action::Spawn("poweroff")),
         b(MAIN | SHIFT, keys::R, Action::Spawn("reboot")),
@@ -202,6 +205,11 @@ pub const CLIPBOARD_MAX_BYTES: usize = 16 << 20;
 /// popups show at once, and how many notifications the list keeps.
 pub const NOTIFICATION_TIMEOUT_MS: u64 = 5000;
 pub const NOTIFICATION_POPUPS: usize = 4;
+/// Under `$HOME`; screenshots are also copied to the clipboard.
+pub const SCREENSHOT_DIR: &str = "Screenshots";
+/// Frame rate cap of screen casts.
+pub const CAST_FPS: u32 = 30;
+
 pub const NOTIFICATION_HISTORY: usize = 50;
 
 /// Idle blanking: the timeout set automatically while an exclusive monitor is

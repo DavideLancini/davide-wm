@@ -17,6 +17,7 @@ sys.workspace = true
 wire.workspace = true
 wm.workspace = true
 x11.workspace = true
+pipewire.workspace = true
 jpeg.workspace = true
 
 [build-dependencies]

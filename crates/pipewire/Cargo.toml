@@ -1,0 +1,9 @@
+[package]
+name = "pipewire"
+description = "Minimal FFI to libpipewire: a video source stream fed from the compositor's loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true

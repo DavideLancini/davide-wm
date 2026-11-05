@@ -13,6 +13,8 @@ pub enum Done {
     Saved,
     /// The kernel log check after lighting an exclusive monitor.
     LinkCheck { name: String, failed: bool },
+    /// A screenshot encoded and saved: the file (or why not) and the PNG.
+    Screenshot { request: u32, path: Result<String, String>, png: Vec<u8> },
     /// A Wayland selection read for an X client.
     XSelection { request: crate::server::xwm::selection::Request, data: Result<Vec<u8>, String> },
 }

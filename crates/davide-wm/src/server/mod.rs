@@ -237,6 +237,32 @@ pub enum Purpose {
     Clipboard(Vec<u64>),
     /// The notification list; item 0 clears it, then these ids.
     Notifications(Vec<u32>),
+    /// Sources for a screen cast asked by the portal (`request`, 0 for none).
+    Cast(u32, Vec<CastChoice>),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CastChoice {
+    Output,
+    Window(SKey),
+}
+
+/// The screenshot selector: the frozen screen, dimmed outside the selection.
+pub struct ShotView {
+    pub pixels: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    tex: Option<Texture>,
+    /// Where the drag started.
+    pub anchor: Option<(f64, f64)>,
+    /// The portal request it answers, 0 for the key binding.
+    pub request: u32,
+}
+
+impl ShotView {
+    pub fn new(pixels: Vec<u8>, width: i32, height: i32, request: u32) -> ShotView {
+        ShotView { pixels, width, height, tex: None, anchor: None, request }
+    }
 }
 
 /// A rendered card: height and ARGB pixels.
@@ -302,6 +328,11 @@ pub struct State {
     pub launcher: Option<LauncherView>,
     /// Notification popups, top to bottom.
     pub notices: Vec<NoticeView>,
+    pub shot: Option<ShotView>,
+    /// For screenshots: draw without the pointer.
+    pub hide_cursor: bool,
+    /// Pickers closed without a choice, for whoever opened them.
+    pub abandoned: Vec<Purpose>,
     /// The client that is Xwayland: only it may bind `xwayland_shell_v1`.
     pub xwayland: Option<ClientId>,
     /// Serials announced for Xwayland surfaces not paired yet.
@@ -347,6 +378,9 @@ impl State {
             bar: BarSurface { visible: true, ..Default::default() },
             launcher: None,
             notices: Vec::new(),
+            shot: None,
+            hide_cursor: false,
+            abandoned: Vec::new(),
             xwayland: None,
             xwayland_serials: HashMap::new(),
             xwm: None,
@@ -695,6 +729,7 @@ impl State {
 
     pub fn close_launcher(&mut self) {
         let Some(l) = self.launcher.take() else { return };
+        self.abandoned.push(l.purpose.clone());
         if let Some(t) = l.tex {
             self.dead_textures.push(t);
         }
@@ -932,7 +967,10 @@ impl State {
                 r.draw(t, Quad { x: rect.x as f32, y: rect.y as f32, w: rect.w as f32, h: rect.h as f32 }, true);
             }
         }
-        seat::draw_cursor(self, r);
+        self.draw_shot(r);
+        if !self.hide_cursor {
+            seat::draw_cursor(self, r);
+        }
         r.finish();
         let time = self.time_ms();
         let mut done = Vec::new();
@@ -943,6 +981,59 @@ impl State {
             self.send_callback_done(c, f, time);
         }
         self.needs_redraw = false;
+    }
+
+    /// The selection: the dragged rectangle, else the window under the
+    /// pointer, else the whole output.
+    pub fn shot_selection(&self) -> Rect {
+        let (px, py) = (self.pointer.x, self.pointer.y);
+        let dragged = self.shot.as_ref().and_then(|v| v.anchor).filter(|(ax, ay)| (ax - px).abs() > 4.0 || (ay - py).abs() > 4.0);
+        match dragged {
+            Some((ax, ay)) => {
+                let (x0, y0) = (ax.min(px).max(0.0) as i32, ay.min(py).max(0.0) as i32);
+                let (x1, y1) = (ax.max(px).min(self.output.width as f64) as i32, ay.max(py).min(self.output.height as f64) as i32);
+                Rect::new(x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
+            }
+            None => self.layout.iter().rev().find(|(_, r)| r.contains(px, py)).map(|(_, r)| *r).unwrap_or(self.output_rect()),
+        }
+    }
+
+    /// Closes the selector and hands back what it showed.
+    pub fn close_shot(&mut self) -> Option<ShotView> {
+        let mut v = self.shot.take()?;
+        self.dead_textures.extend(v.tex.take());
+        self.needs_redraw = true;
+        Some(v)
+    }
+
+    fn draw_shot(&mut self, r: &mut Renderer) {
+        let sel = self.shot_selection();
+        let Some(v) = &mut self.shot else { return };
+        let tex = v.tex.get_or_insert_with(|| r.upload_rgba(v.width, v.height, &v.pixels));
+        let full = Quad { x: 0.0, y: 0.0, w: v.width as f32, h: v.height as f32 };
+        r.draw(tex, full, true);
+        r.fill(full, [0.0, 0.0, 0.0, 0.45]);
+        let q = |x: i32, y: i32, w: i32, h: i32| Quad { x: x as f32, y: y as f32, w: w as f32, h: h as f32 };
+        r.draw_cropped(tex, q(sel.x, sel.y, sel.w, sel.h), q(sel.x, sel.y, sel.w, sel.h));
+        let white = [1.0, 1.0, 1.0, 1.0];
+        for b in [q(sel.x, sel.y, sel.w, 2), q(sel.x, sel.y + sel.h - 2, sel.w, 2), q(sel.x, sel.y, 2, sel.h), q(sel.x + sel.w - 2, sel.y, 2, sel.h)] {
+            r.fill(b, white);
+        }
+    }
+
+    /// Size of a window's content (its window geometry, else its surface).
+    pub fn window_size(&self, key: SKey) -> Option<(i32, i32)> {
+        let sf = self.surfaces.get(&key)?;
+        let g = sf.xdg.as_ref().and_then(|x| x.geometry);
+        Some(g.map_or(sf.size, |g| (g.w, g.h))).filter(|(w, h)| *w > 0 && *h > 0)
+    }
+
+    /// Draws one window alone into `target`, for a window cast.
+    pub fn render_window(&mut self, r: &mut Renderer, key: SKey, target: &Target) {
+        r.begin(target, [0.0, 0.0, 0.0, 1.0]);
+        let o = self.surface_origin(key, (0, 0));
+        self.draw_tree(r, key, o);
+        r.finish();
     }
 
     fn texture(&self, key: SKey) -> Option<&Texture> {

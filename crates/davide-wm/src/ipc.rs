@@ -58,6 +58,8 @@ pub enum Command {
     /// Test helpers: move the pointer, click the left button, report the focus.
     Pointer(f64, f64),
     Click,
+    /// Left button down (true) or up, for drags.
+    Button(bool),
     /// Press evdev key codes in order, release them in reverse (a chord).
     Key(Vec<u32>),
     Focused,
@@ -73,6 +75,10 @@ pub enum Command {
     Notifications,
     /// Writes what the primary output shows to a PNG file.
     Screenshot(String),
+    /// Starts a cast of the output (or of the focused window) without asking;
+    /// answers with the PipeWire node.
+    Cast(bool),
+    CastStop(u32),
     Exit,
 }
 
@@ -109,6 +115,8 @@ fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "click" => Ok(Command::Click),
+        "press" => Ok(Command::Button(true)),
+        "release" => Ok(Command::Button(false)),
         "key" => match arg.split_whitespace().map(str::parse).collect::<Result<Vec<u32>, _>>() {
             Ok(codes) if !codes.is_empty() => Ok(Command::Key(codes)),
             _ => Err("key <evdev code>...".into()),
@@ -126,8 +134,10 @@ fn parse(line: &str) -> Result<Command, String> {
         "clipboard" => Ok(Command::Clipboard),
         "notifications" => Ok(Command::Notifications),
         "screenshot" if !arg.is_empty() => Ok(Command::Screenshot(arg.to_string())),
+        "cast" => Ok(Command::Cast(arg == "window")),
+        "cast-stop" => arg.parse().map(Command::CastStop).map_err(|_| format!("bad cast id {arg:?}")),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, exit".into()),
     }
 }
 

@@ -3,12 +3,14 @@ macro_rules! log {
 }
 
 mod backend;
+mod cast;
 mod display;
 mod event_loop;
 mod ipc;
 mod keyboard;
 mod notify;
 mod png;
+mod portal;
 mod server;
 mod worker;
 mod xwayland;
@@ -25,7 +27,7 @@ use config::{mods, Action};
 use event_loop::{Epoll, HANGUP, READABLE};
 use backend::{nested::Nested, outputs, Drm, Event};
 use render::{Renderer, Target};
-use server::{clipboard, seat, selection, workspaces, xwm, ClientId, Purpose, State};
+use server::{clipboard, seat, selection, workspaces, xwm, CastChoice, ClientId, Purpose, State};
 
 const TOKEN_LISTENER: u64 = 1;
 const TOKEN_HOST: u64 = 2;
@@ -43,6 +45,8 @@ const TOKEN_NOTIFY_TIMER: u64 = 13;
 const TOKEN_XWAYLAND_READY: u64 = 14;
 const TOKEN_XWAYLAND_EXIT: u64 = 15;
 const TOKEN_XWM: u64 = 16;
+const TOKEN_PIPEWIRE: u64 = 17;
+const TOKEN_PORTAL: u64 = 18;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -169,6 +173,15 @@ struct App {
     /// The clipboard history changed and is not saved yet.
     clipboard_dirty: bool,
     xwayland: Option<xwayland::Xwayland>,
+    casts: cast::Casts,
+    /// PipeWire's fd is in the epoll (it is opened with the first cast).
+    pipewire_watched: bool,
+    portal: portal::Portal,
+    /// A screenshot to take once the renderer is at hand: the portal
+    /// request (0 for the key binding) and whether to let the user select.
+    shot_request: Option<(u32, bool)>,
+    /// Selected screenshots waiting for the worker: request, RGBA, size.
+    shots: Vec<(u32, Vec<u8>, u32, u32)>,
 }
 
 impl App {
@@ -291,6 +304,7 @@ impl App {
             Action::Upgrade => self.upgrade = true,
             Action::ClipboardHistory => self.open_clipboard(),
             Action::Notifications => self.open_notifications(),
+            Action::Screenshot => self.shot_request = Some((0, true)),
             Action::Exit => self.running = false,
         }
     }
@@ -320,8 +334,15 @@ impl App {
 
     /// Enter in a picker.
     fn picked(&mut self, purpose: Purpose, i: usize) {
+        self.state.abandoned.retain(|p| *p != purpose);
         match purpose {
             Purpose::Apps => {}
+            Purpose::Cast(request, choices) => match choices.get(i) {
+                Some(c) => {
+                    self.start_cast(request, *c);
+                }
+                None => self.portal.cancelled(request, false),
+            },
             Purpose::Clipboard(hashes) => {
                 if let Some(clip) = self.clip_index(&hashes, i).map(|j| self.state.selection.history.entries[j].clone()) {
                     selection::set_server(&mut self.state, clip);
@@ -343,7 +364,7 @@ impl App {
     /// Delete in a picker.
     fn deleted(&mut self, purpose: Purpose, i: usize) {
         match purpose {
-            Purpose::Apps => {}
+            Purpose::Apps | Purpose::Cast(..) => {}
             Purpose::Clipboard(hashes) => {
                 if let Some(j) = self.clip_index(&hashes, i) {
                     self.state.selection.history.entries.remove(j);
@@ -359,6 +380,183 @@ impl App {
             },
         }
         self.sync_notices();
+    }
+
+    /// The source list for a cast: the output, then the windows.
+    fn open_cast_picker(&mut self, request: u32, types: u32) {
+        let mut choices = Vec::new();
+        let mut labels = Vec::new();
+        if types & portal::MONITOR != 0 {
+            choices.push(CastChoice::Output);
+            labels.push(format!("Schermo intero ({}x{})", self.state.output.width, self.state.output.height));
+        }
+        if types & portal::WINDOW != 0 {
+            let mut windows: Vec<_> = self.state.window_ws.iter().map(|(k, ws)| (ipc::ws_name(*ws), *k)).collect();
+            windows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (ws, k) in windows {
+                choices.push(CastChoice::Window(k));
+                labels.push(format!("{} — {} [{ws}]", self.state.app_id(k), self.state.title(k)));
+            }
+        }
+        if choices.is_empty() {
+            self.portal.cancelled(request, true);
+            return;
+        }
+        self.state.open_view(launcher::Launcher::picker(labels), Purpose::Cast(request, choices));
+    }
+
+    fn start_cast(&mut self, request: u32, choice: CastChoice) -> Option<u32> {
+        let (source, size) = match choice {
+            CastChoice::Output => (cast::Source::Output, Some((self.state.output.width, self.state.output.height))),
+            CastChoice::Window(k) => (cast::Source::Window(k), self.state.window_size(k)),
+        };
+        let started = size.ok_or_else(|| io::Error::other("the window has no size")).and_then(|(w, h)| self.casts.start(source, w as u32, h as u32));
+        match started {
+            Ok(id) => {
+                if request != 0 {
+                    self.portal.picked(request, id, matches!(choice, CastChoice::Window(_)));
+                }
+                Some(id)
+            }
+            Err(e) => {
+                log!("cannot start the cast: {e}");
+                if request != 0 {
+                    self.portal.cancelled(request, true);
+                }
+                None
+            }
+        }
+    }
+
+    /// For `davide-wm msg cast`: starts a cast and waits for its node.
+    fn cast_now(&mut self, window: bool) -> String {
+        let choice = match (window, self.state.focus) {
+            (true, Some(k)) => CastChoice::Window(k),
+            (true, None) => return "error: no focused window\n".into(),
+            (false, _) => CastChoice::Output,
+        };
+        let Some(id) = self.start_cast(0, choice) else { return "error: cannot start the cast\n".into() };
+        for _ in 0..200 {
+            if let Some(fd) = self.casts.fd() {
+                let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                unsafe { libc::poll(&mut p, 1, 10) };
+            }
+            let mut wake = false;
+            for ev in self.casts.dispatch(&mut wake) {
+                if let cast::Event::Ready { id: i, node, .. } = ev {
+                    if i == id {
+                        return format!("cast {id} node {node}\n");
+                    }
+                }
+            }
+        }
+        "error: PipeWire did not register the stream\n".into()
+    }
+
+    fn portal_action(&mut self, a: portal::Action) {
+        match a {
+            portal::Action::PickSource { request, types } => self.open_cast_picker(request, types),
+            portal::Action::CancelPick { request } => {
+                let open = |p: &Purpose| matches!(p, Purpose::Cast(r, _) if *r == request);
+                if self.state.launcher.as_ref().is_some_and(|l| open(&l.purpose)) {
+                    self.state.close_launcher();
+                }
+                if self.state.shot.as_ref().is_some_and(|v| v.request == request) {
+                    self.state.close_shot();
+                }
+                self.state.abandoned.clear();
+            }
+            portal::Action::StopCast(id) => self.casts.stop(id),
+            portal::Action::Screenshot { request, interactive } => self.shot_request = Some((request, interactive)),
+        }
+    }
+
+    /// Draws the output offscreen without the pointer: RGBA, width, height.
+    fn capture(&mut self, r: &mut Renderer) -> Option<(Vec<u8>, i32, i32)> {
+        let (w, h) = (self.state.output.width, self.state.output.height);
+        let t = r.create_target(w, h, 0).inspect_err(|e| log!("screenshot: {e}")).ok()?;
+        self.state.hide_cursor = true;
+        self.state.render(r, &t);
+        self.state.hide_cursor = false;
+        self.state.needs_redraw = true;
+        let mut px = r.read_target(&t);
+        r.destroy_target(t);
+        for p in px.as_chunks_mut::<4>().0 {
+            p[3] = 255;
+        }
+        Some((px, w, h))
+    }
+
+    fn take_screenshot(&mut self, r: &mut Renderer, request: u32, interactive: bool) {
+        self.state.close_launcher();
+        let Some((px, w, h)) = self.capture(r) else {
+            if request != 0 {
+                self.portal.screenshot_done(request, None);
+            }
+            return;
+        };
+        if interactive {
+            self.state.shot = Some(server::ShotView::new(px, w, h, request));
+        } else {
+            self.shots.push((request, px, w as u32, h as u32));
+        }
+    }
+
+    /// Input while the screenshot selector is open.
+    fn shot_event(&mut self, e: Event) {
+        const BTN_LEFT: u32 = 0x110;
+        let s = &mut self.state;
+        match e {
+            Event::PointerMotion(..) | Event::PointerMotionRelative(..) => {
+                let (x, y) = match e {
+                    Event::PointerMotion(x, y) => (x, y),
+                    Event::PointerMotionRelative(dx, dy) => (s.pointer.x + dx, s.pointer.y + dy),
+                    _ => unreachable!(),
+                };
+                s.pointer.x = x.clamp(0.0, (s.output.width - 1) as f64);
+                s.pointer.y = y.clamp(0.0, (s.output.height - 1) as f64);
+                s.needs_redraw = true;
+            }
+            Event::PointerButton(BTN_LEFT, true) => {
+                if let Some(v) = &mut s.shot {
+                    v.anchor = Some((s.pointer.x, s.pointer.y));
+                }
+            }
+            Event::PointerButton(BTN_LEFT, false) => {
+                let sel = s.shot_selection();
+                self.finish_shot(Some(sel));
+            }
+            Event::PointerButton(_, true) => self.finish_shot(None),
+            Event::Key(k, pressed) => {
+                s.keyboard.update(k, pressed);
+                if !pressed {
+                    self.swallowed.retain(|x| *x != k);
+                    return;
+                }
+                match s.keyboard.sym(k) {
+                    0xff1b => self.finish_shot(None),
+                    0xff0d | 0xff8d => {
+                        let full = s.output_rect();
+                        self.finish_shot(Some(full));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Closes the selector; with a rectangle the shot is saved.
+    fn finish_shot(&mut self, sel: Option<wm::Rect>) {
+        let Some(v) = self.state.close_shot() else { return };
+        match sel {
+            Some(r) => {
+                let px = png::crop(&v.pixels, v.width as u32, (r.x as u32, r.y as u32, r.w as u32, r.h as u32));
+                self.shots.push((v.request, px, r.w as u32, r.h as u32));
+            }
+            None if v.request != 0 => self.portal.cancelled(v.request, false),
+            None => {}
+        }
     }
 
     /// Focuses the window of the app that raised a notification.
@@ -433,6 +631,7 @@ impl App {
                 self.backend_event(Event::PointerButton(0x110, true));
                 self.backend_event(Event::PointerButton(0x110, false));
             }
+            ipc::Command::Button(down) => self.backend_event(Event::PointerButton(0x110, down)),
             ipc::Command::Focused => {
                 let s = &self.state;
                 return match s.focus {
@@ -478,6 +677,8 @@ impl App {
             ipc::Command::Notifications => return self.notifications_text(),
             // Handled by the event loop, which has the renderer.
             ipc::Command::Screenshot(_) => {}
+            ipc::Command::Cast(window) => return self.cast_now(window),
+            ipc::Command::CastStop(id) => self.casts.stop(id),
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -662,9 +863,25 @@ impl App {
         if self.state.needs_redraw {
             if let Some(i) = self.backend.acquire(0, r)? {
                 self.state.render(r, self.backend.target(0, i));
+                if !self.casts.is_empty() {
+                    self.casts.frames(&mut self.state, r, self.backend.target(0, i));
+                }
                 self.last_frame = Some(i);
                 self.mirrors_stale = (1..heads).collect();
                 self.present(0, i, r)?;
+            } else if matches!(self.backend, Backend::Nested(_)) && self.casts.streaming() {
+                // A host that does not show our window (another workspace)
+                // stops taking frames: keep the casts going offscreen.
+                if self.casts.due() {
+                    let (w, h) = (self.state.output.width, self.state.output.height);
+                    if let Ok(t) = r.create_target(w, h, 0) {
+                        self.state.render(r, &t);
+                        self.casts.frames(&mut self.state, r, &t);
+                        r.destroy_target(t);
+                    }
+                }
+                self.casts.catch_up = true;
+                self.state.needs_redraw = true;
             }
         }
         let Some(src) = self.last_frame else { return Ok(()) };
@@ -717,6 +934,10 @@ impl App {
                 }
                 return;
             }
+        }
+        if self.state.shot.is_some() {
+            self.shot_event(e);
+            return;
         }
         if self.state.launcher.is_some() {
             match e {
@@ -822,6 +1043,11 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         bar_notifications: None,
         clipboard_dirty: false,
         xwayland: None,
+        casts: cast::Casts::default(),
+        pipewire_watched: false,
+        portal: portal::Portal::start(),
+        shot_request: None,
+        shots: Vec::new(),
     }
 }
 
@@ -918,6 +1144,28 @@ impl App {
     }
 }
 
+/// Writes a screenshot to `$HOME/SCREENSHOT_DIR/Screenshot_<local time>.png`.
+fn save_screenshot(png: &[u8]) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+    let dir = PathBuf::from(home).join(config::SCREENSHOT_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut tm) };
+    let name = format!(
+        "Screenshot_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.png",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, png).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn clip_hash(c: &clipboard::Clip) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -966,6 +1214,9 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
     }
     app.watch_xwayland(&ep)?;
+    if let Some(fd) = app.portal.bus_fd() {
+        ep.add(fd, TOKEN_PORTAL)?;
+    }
     if app.state.wallpaper.is_none() && !WALLPAPER.is_empty() {
         worker.run(|| {
             let mut img = jpeg::decode(WALLPAPER).map_err(|e| e.to_string())?;
@@ -1048,7 +1299,9 @@ fn keep_previous_binary() {
 
 fn encode(ctx: Ctx) -> state::Enc {
     use state::Persist;
-    let Ctx { app, mut renderer, exe, .. } = ctx;
+    let Ctx { mut app, mut renderer, exe, .. } = ctx;
+    // PipeWire streams cannot be handed over: casts end here.
+    app.portal.close_all();
     let mut e = state::Enc::default();
     BLOB_FORMAT.save(&mut e);
     (app.session, app.main_mod, exe.to_string_lossy().into_owned()).save(&mut e);
@@ -1191,7 +1444,12 @@ fn resume(fd: i32) -> io::Result<Ctx> {
 fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
     let Ctx { app, renderer, ep, worker, .. } = ctx;
     while app.running && !app.upgrade {
-        for (token, events) in ep.wait(-1)? {
+        let timeout = if app.casts.catch_up { (1000 / config::CAST_FPS) as i32 } else { -1 };
+        let ready = ep.wait(timeout)?;
+        if app.casts.catch_up {
+            app.state.needs_redraw = true;
+        }
+        for (token, events) in ready {
             let mut backend_events = Vec::new();
             match token {
                 TOKEN_LISTENER => loop {
@@ -1233,6 +1491,17 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                                 app.clipboard_dirty = true;
                             }
                             Ok(worker::Done::Saved) => {}
+                            Ok(worker::Done::Screenshot { request, path, png }) => match request {
+                                0 => {
+                                    match &path {
+                                        Ok(p) => log!("screenshot saved to {p}"),
+                                        Err(e) => log!("screenshot not saved: {e}"),
+                                    }
+                                    selection::set_server(&mut app.state, clipboard::Clip { mime: "image/png".into(), data: png });
+                                    app.clipboard_dirty = true;
+                                }
+                                r => app.portal.screenshot_done(r, path.ok().as_deref()),
+                            },
                             Ok(worker::Done::XSelection { request, data }) => xwm::selection::answer(&mut app.state, request, data),
                             Ok(worker::Done::LinkCheck { name, failed }) => {
                                 let lit = app.backend.heads().iter().any(|h| h.name == name);
@@ -1264,6 +1533,26 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 TOKEN_NOTIFY_TIMER => {
                     if app.notifier.expire() {
                         app.sync_notices();
+                    }
+                }
+                TOKEN_PIPEWIRE => {
+                    let mut wake = false;
+                    for ev in app.casts.dispatch(&mut wake) {
+                        match ev {
+                            cast::Event::Ready { id, node, size } => {
+                                log!("cast {id}: PipeWire node {node}");
+                                app.portal.cast_ready(id, node, size);
+                            }
+                            cast::Event::Ended(id) => app.portal.cast_ended(id),
+                        }
+                    }
+                    if wake {
+                        app.state.needs_redraw = true;
+                    }
+                }
+                TOKEN_PORTAL => {
+                    for a in app.portal.dispatch() {
+                        app.portal_action(a);
                     }
                 }
                 TOKEN_XWAYLAND_READY => app.xwayland_ready(ep)?,
@@ -1332,6 +1621,33 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
             worker.run(move || {
                 let data = clipboard::capture(fd)?;
                 Ok(worker::Done::Clip { generation, clip: clipboard::Clip { mime, data } })
+            });
+        }
+        if let (false, Some(fd)) = (app.pipewire_watched, app.casts.fd()) {
+            ep.add(fd, TOKEN_PIPEWIRE)?;
+            app.pipewire_watched = true;
+        }
+        for (id, source) in app.casts.ids() {
+            if let cast::Source::Window(k) = source {
+                if !app.state.surfaces.contains_key(&k) {
+                    app.casts.stop(id);
+                    app.portal.cast_ended(id);
+                }
+            }
+        }
+        for p in std::mem::take(&mut app.state.abandoned) {
+            if let Purpose::Cast(request, _) = p {
+                app.portal.cancelled(request, false);
+            }
+        }
+        if let Some((request, interactive)) = app.shot_request.take() {
+            app.take_screenshot(renderer, request, interactive);
+        }
+        for (request, px, w, h) in std::mem::take(&mut app.shots) {
+            worker.run(move || {
+                let png = png::encode(w, h, &px);
+                let path = save_screenshot(&png);
+                Ok(worker::Done::Screenshot { request, path, png })
             });
         }
         if let Some(x) = &mut app.state.xwm {
