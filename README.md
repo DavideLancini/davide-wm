@@ -42,7 +42,7 @@
 
 | Field | Value |
 |---|---|
-| Doc version | 0.16 |
+| Doc version | 0.17 |
 | Last updated | 2026-11-05 |
 | Owner | Davide Lancini |
 | Project status | in daily use (switch-over in progress) |
@@ -329,7 +329,7 @@ davide-wm/
 | Environment | Infrastructure | Notes |
 |-------------|----------------|-------|
 | dev | nested backend inside the running Hyprland session (`cargo run -p davide-wm`, then `WAYLAND_DISPLAY=<socket printed at startup> foot`); headless backend for automated tests later | Main modifier is Alt when nested (Super belongs to Hyprland): Alt+T terminal, Alt+Q close, Alt+arrows focus, Alt+Shift+E exit. No risk to the working session; DRM tests on a second TTY. |
-| prod | the laptop, started from a TTY login (`davide-wm` to try it, `davide-wm --session` as the real session: exports the environment to systemd/D-Bus and starts `davide-wm-session.target`; Super is the main modifier) | Hyprland stays as fallback until switch-over. Ctrl+Alt+F1…F12 switch VT, Ctrl+Alt+Backspace exits. `davide-wm outputs` lists connectors and the one that would be driven. |
+| prod | the laptop, started from a TTY login (`davide-wm` to try it, `davide-wm --session` as the real session: exports the environment to systemd/D-Bus and starts `davide-wm-session.target`; Super is the main modifier) | The only session since 2026-11-05 (Hyprland uninstalled). Ctrl+Alt+F1…F12 switch VT, Ctrl+Alt+Backspace exits. `davide-wm outputs` lists connectors and the one that would be driven. |
 
 - **Build/CI-CD:** `cargo build --release` (opt-level, LTO, strip, panic handling decided in ADR-006); `run.sh` installs the binary to `~/7Scripts/davide-wm` and the portal/unit files from `dist/`. No CI.
 - **Configuration & secrets:** configuration compiled in (`crates/config/`). Spotify client credentials are currently compiled into topbar (known debt, sec. 11); the refresh token stays in `~/.local/state/topbar/spotify-token` until moved to `~/.local/state/davide-wm/`.
@@ -515,7 +515,7 @@ davide-wm/
 | Spotify credentials in the binary | debt | Move them out (file under `$XDG_CONFIG_HOME`). |
 | Second D-Bus client in the bar | debt | UPower, BlueZ and MPRIS widgets to port to `crates/dbus`. |
 | X11 gaps | debt | Drag and drop with X clients; Wayland selections over 256 KiB towards X clients (INCR). |
-| Remove Hyprland and the absorbed tools | switch-over | Hyprland, xdg-desktop-portal-hyprland/-wlr, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, wf-recorder, nm-applet; archive `topbar`, `super` and the absorbed parts of `dawn`. After some days without problems. |
+| Archive the absorbed tools | switch-over | Uninstalled 2026-11-05: Hyprland, xdg-desktop-portal-hyprland/-wlr, awww, cliphist, wofi, grim, slurp, swappy, nm-applet, nmgui, pavucontrol, blueman, keyd, ydotool, with their user services and configs. Left on disk, unused: `topbar`, `super`, `monitor-manager`, `blk`, `brightness`, `light`, `lid-*`, `bt-headphones-battery`, `cpu-*` in `~/7Scripts`, `nwg-notifications`, `fintie-unstick.sh`; to archive in their repositories. wf-recorder stays for `cast`. |
 
 ## 12. Glossary
 *Domain and technical terms specific to the project. Removes ambiguity for everyone (the AI included).*
