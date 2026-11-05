@@ -20,27 +20,6 @@ const TIMEOUT: &str = "0.5";
 /// hypothetical.
 const KILL_AFTER: &str = "1";
 
-/// Runs `cmd` through a shell and returns its trimmed stdout, or an empty
-/// string on any failure.
-///
-/// **Bounded by `TIMEOUT`.** Without it a hung helper freezes the bar for as
-/// long as it takes: the bar thread's loop is single-threaded, so a command that never
-/// returns is a bar that never redraws. `timeout(1)` rather than a thread and
-/// a channel — the command is already a fork, and coreutils is not a
-/// dependency worth avoiding here.
-pub fn run(cmd: &str) -> String {
-    let output = Command::new("timeout")
-        .args(["--kill-after", KILL_AFTER, TIMEOUT, "sh", "-c", cmd])
-        // A system without coreutils keeps working, unbounded: losing the
-        // widget entirely would be the worse failure.
-        .output()
-        .or_else(|_| Command::new("sh").args(["-c", cmd]).output());
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => String::new(),
-    }
-}
-
 /// Same, but in a cgroup of its own, for commands that leave a daemon behind.
 ///
 /// `mega-sync` starts `mega-cmd-server` when it is not already up. A child
@@ -82,11 +61,11 @@ mod session_tests {
     /// easy to wrap a command in a way that swallows what it printed.
     #[test]
     fn output_still_comes_back() {
-        assert_eq!(run("echo hello"), "hello");
-        assert_eq!(run("printf '  spaces  '"), "spaces", "trimmed");
+        assert_eq!(run_detached_scope("echo hello"), "hello");
+        assert_eq!(run_detached_scope("printf '  spaces  '"), "spaces", "trimmed");
         // A failing command yields nothing rather than its partial output.
-        assert_eq!(run("echo discarded; false"), "");
-        assert_eq!(run("command-that-does-not-exist 2>/dev/null"), "");
+        assert_eq!(run_detached_scope("echo discarded; false"), "");
+        assert_eq!(run_detached_scope("command-that-does-not-exist 2>/dev/null"), "");
     }
 
     /// The scoped form must land in a different cgroup from ours: that is the
@@ -118,48 +97,5 @@ mod session_tests {
         if !out.is_empty() {
             assert_eq!(out, "hello");
         }
-    }
-}
-
-#[cfg(test)]
-mod timeout_tests {
-    use super::*;
-    use std::time::Instant;
-
-    /// A hung command must be abandoned, not waited on. This is the property
-    /// that keeps a stuck helper from freezing the whole bar.
-    #[test]
-    fn a_hanging_command_is_cut_off() {
-        let start = Instant::now();
-        let out = run("sleep 30");
-        let elapsed = start.elapsed();
-        assert!(out.is_empty(), "a killed command has no output");
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "waited {elapsed:?}: the timeout did not fire"
-        );
-    }
-
-    /// A command that ignores SIGTERM still has to die: `--kill-after`
-    /// escalates. `mega-cmd-server` is precisely this case.
-    #[test]
-    fn sigterm_deaf_commands_are_killed() {
-        let start = Instant::now();
-        let out = run("trap '' TERM; sleep 30");
-        assert!(out.is_empty());
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(6),
-            "the escalation to SIGKILL did not happen"
-        );
-    }
-
-    /// Normal commands are untouched: the limit must not cost anything in the
-    /// ordinary case, nor truncate output.
-    #[test]
-    fn quick_commands_are_unaffected() {
-        assert_eq!(run("echo hello"), "hello");
-        assert_eq!(run("printf 'a\\nb'"), "a\nb");
-        // Something slow but well within budget still completes.
-        assert_eq!(run("sleep 0.2; echo late"), "late");
     }
 }

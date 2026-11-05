@@ -249,6 +249,27 @@ impl Notifier {
         Some(out)
     }
 
+    /// A notification from the compositor itself.
+    pub fn local(&mut self, app: &str, summary: &str, body: &str, critical: bool) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let expires = (!critical).then(|| Instant::now() + Duration::from_millis(config::NOTIFICATION_TIMEOUT_MS));
+        self.list.push(Notification {
+            id,
+            app: app.into(),
+            summary: summary.into(),
+            body: body.into(),
+            actions: Vec::new(),
+            entry: String::new(),
+            critical,
+            live: true,
+            expires,
+        });
+        let excess = self.list.len().saturating_sub(config::NOTIFICATION_HISTORY);
+        self.list.drain(..excess);
+        self.arm();
+    }
+
     /// The timer fired: popups past their time leave the screen (they stay
     /// in the list). True when something changed.
     pub fn expire(&mut self) -> bool {

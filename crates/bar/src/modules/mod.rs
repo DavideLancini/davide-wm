@@ -5,6 +5,7 @@
 pub mod backlight;
 pub mod battery;
 pub mod bluetooth;
+pub mod bt_battery;
 pub mod clock;
 pub mod cpu;
 pub mod cpu_freq;

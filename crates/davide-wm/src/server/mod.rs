@@ -255,6 +255,8 @@ pub enum Purpose {
     /// Sources for a screen cast asked by the portal (`request`, 0 for none).
     Cast(u32, Vec<CastChoice>),
     Wifi(Vec<crate::wifi::Network>),
+    /// Countdown lengths in seconds; 0 stops the timer.
+    Timer(Vec<u64>),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

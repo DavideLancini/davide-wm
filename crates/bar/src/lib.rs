@@ -62,6 +62,8 @@ pub enum ToBar {
     /// Volume keys, handled on the bar's PulseAudio connection; the bar
     /// answers with `FromBar::Audio`.
     Audio(AudioKey),
+    /// Starts a countdown of that many seconds, or stops it.
+    Timer(Option<u64>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -89,6 +91,15 @@ pub enum FromBar {
     ToggleNotifications,
     /// The network widget: the Wi-Fi list.
     Wifi,
+    /// The CPU widget: the next power level.
+    CpuCycle,
+    /// The backlight widget: this brightness on every panel.
+    Brightness(u32),
+    /// The timer widget: ask for a duration.
+    Timer,
+    /// The countdown ran out.
+    TimerDone,
+    Screenshot,
     /// The audio state after a volume key, for the on-screen indicator:
     /// microphone or output, level and mute.
     Audio { mic: bool, level: u32, muted: bool },

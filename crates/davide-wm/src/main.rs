@@ -6,6 +6,7 @@ mod agents;
 mod backend;
 mod brightness;
 mod cast;
+mod cpu;
 mod display;
 mod event_loop;
 mod ipc;
@@ -205,6 +206,8 @@ struct App {
     polkit_job: Option<(String, String, String)>,
     /// Background Wi-Fi work: true lists networks; a network connects.
     wifi_job: Option<Option<wifi::Network>>,
+    /// Switch to the next CPU level (on the worker: it runs sudo).
+    cpu_job: bool,
 }
 
 impl App {
@@ -371,6 +374,11 @@ impl App {
         self.state.abandoned.retain(|p| *p != purpose);
         match purpose {
             Purpose::Apps => {}
+            Purpose::Timer(secs) => {
+                if let (Some(s), Some(bar)) = (secs.get(i), &self.bar) {
+                    bar.send(bar::ToBar::Timer((*s > 0).then_some(*s)));
+                }
+            }
             Purpose::Wifi(nets) => {
                 if let Some(n) = nets.get(i) {
                     self.show_osd(&format!("Wi-Fi: connessione a {}…", n.ssid), None);
@@ -404,7 +412,7 @@ impl App {
     /// Delete in a picker.
     fn deleted(&mut self, purpose: Purpose, i: usize) {
         match purpose {
-            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) => {}
+            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) | Purpose::Timer(_) => {}
             Purpose::Clipboard(hashes) => {
                 if let Some(j) = self.clip_index(&hashes, i) {
                     self.state.selection.history.entries.remove(j);
@@ -937,6 +945,33 @@ impl App {
             bar::FromBar::Blank => self.blank(),
             bar::FromBar::ToggleNotifications => self.open_notifications(),
             bar::FromBar::Wifi => self.wifi_job = Some(None),
+            bar::FromBar::CpuCycle => self.cpu_job = true,
+            bar::FromBar::Brightness(pct) => {
+                if let Some(pct) = brightness::set_panel(pct) {
+                    self.ddc = Some(pct);
+                    self.show_osd(&format!("Luminosità {pct}%"), Some(pct as f32 / 100.0));
+                }
+            }
+            bar::FromBar::Timer => {
+                const CHOICES: [(u64, &str); 9] = [
+                    (300, "5 minuti"),
+                    (600, "10 minuti"),
+                    (900, "15 minuti"),
+                    (1500, "25 minuti"),
+                    (1800, "30 minuti"),
+                    (2700, "45 minuti"),
+                    (3600, "1 ora"),
+                    (7200, "2 ore"),
+                    (0, "Ferma il timer"),
+                ];
+                let labels = CHOICES.iter().map(|(_, l)| l.to_string()).collect();
+                self.state.open_view(launcher::Launcher::picker(labels), Purpose::Timer(CHOICES.iter().map(|(s, _)| *s).collect()));
+            }
+            bar::FromBar::TimerDone => {
+                self.notifier.local("Timer", "Tempo scaduto", "", true);
+                self.sync_notices();
+            }
+            bar::FromBar::Screenshot => self.shot_request = Some((0, true)),
             bar::FromBar::CycleScreensaver => {
                 let mut ss = self.display.screensaver;
                 ss.cycle();
@@ -1299,6 +1334,7 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         agents: None,
         polkit_job: None,
         wifi_job: None,
+        cpu_job: false,
     }
 }
 
@@ -1754,6 +1790,10 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                             Ok(worker::Done::Unlock(ok)) => app.unlocked(ok),
                             Ok(worker::Done::Polkit(ok)) => app.polkit_checked(ok),
                             Ok(worker::Done::Networks(nets)) => app.open_wifi(nets),
+                            Ok(worker::Done::Cpu(label)) => {
+                                app.notifier.local("CPU", &label, "", false);
+                                app.sync_notices();
+                            }
                             Ok(worker::Done::WifiConnect(r)) => match r {
                                 Ok(ssid) => app.show_osd(&format!("Wi-Fi: {ssid}"), None),
                                 Err(e) => {
@@ -1923,6 +1963,9 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         }
         if let Some((user, cookie, password)) = app.polkit_job.take() {
             worker.run(move || Ok(worker::Done::Polkit(agents::polkit_check(&user, &cookie, password))));
+        }
+        if std::mem::take(&mut app.cpu_job) {
+            worker.run(|| Ok(worker::Done::Cpu(cpu::cycle())));
         }
         match app.wifi_job.take() {
             Some(None) => worker.run(|| wifi::scan().map(worker::Done::Networks)),

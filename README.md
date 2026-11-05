@@ -42,7 +42,7 @@
 
 | Field | Value |
 |---|---|
-| Doc version | 0.13 |
+| Doc version | 0.14 |
 | Last updated | 2026-11-05 |
 | Owner | Davide Lancini |
 | Project status | development |
@@ -191,6 +191,12 @@
     - *Screenshots (ADR-043):* Print freezes the screen (drawn again without the pointer) and shows it dimmed: drag for a region, click for the window under the pointer (highlighted while hovering), Enter for the whole output, Esc or another button to cancel. The PNG (own deflate encoder, on the worker) is saved in `~/Screenshots/` and becomes the clipboard (it also enters the history). The portal's Screenshot uses the same path, interactive or not.
     - *Not done:* dmabuf buffers (frames are copied through the CPU: fine at 30 fps), cursor as metadata, restore tokens, the virtual (headless) output `cast on virtual` needs — `cast` itself (Miracast) stays a separate program and has to take its frames from `davide-wm msg cast` instead of `wf-recorder`. Casts end on a live upgrade (the session gets Closed).
   - **After M7 (2026-11-05, tested nested with Thunar):** floating windows (ADR-044): xdg dialogs (with a parent, or with equal minimum and maximum size) and X dialogs (`WM_TRANSIENT_FOR`, dialog/utility type, fixed size hints) are centred above the tiles at their own size and raised on focus; popups are kept on the output by flipping, sliding and shrinking as their positioner allows (`xdg_popup.reposition` too); drag and drop between Wayland clients (`start_drag`, offers with actions, drop, finish; the drag icon follows the pointer). Blob format 6.
+  - **Session services (2026-11-05, tested nested; unlock, polkit's password check and Wi-Fi secrets still need the TTY):**
+    - *Lock screen (ADR-045):* Main+L, `loginctl lock-session` and suspend lock: only a password box is drawn, no client gets input, VT switches still work. PAM (`config::LOCK_PAM_SERVICE`, Arch's `system-local-login`) checks the password on the worker; suspend waits for the lock through a logind delay inhibitor. The lock survives a live upgrade.
+    - *polkit agent (ADR-046):* registered for the session on the system bus; the request shows in a password box over the desktop (Esc refuses it) and the password goes to the socket-activated `polkit-agent-helper-1` (`/run/polkit/agent-helper.socket`), which reports to polkitd. Three wrong passwords refuse the request.
+    - *Wi-Fi (ADR-046):* NetworkManager secret agent (Wi-Fi passwords in the same box); Main+W and the bar's network widget list networks in the launcher box (strength, protection, the connected one first) and connect to a saved connection or create one. Replaces nmgui and nm-applet.
+    - *Volume and brightness:* the keys change the volume through the bar's PulseAudio connection and the brightness of every panel (sysfs, DDC/CI for external monitors, absorbing dawn's `brightness`), with a level box at the bottom of the screen. No more `pactl` or `brightness` processes.
+    - *Bar helpers:* the CPU widget cycles power levels from the compositor (dawn's `cpu-cycle`/`cpu-levels`; the privileged writes still go through `sudo -n` to `cpu-freq-set`, `ryzen-tdp-set` and the Huawei WMI interface), the Bluetooth battery is read over D-Bus and RFCOMM inside the bar (dawn's `bt-headphones-battery`), the timer is native (durations picked in the launcher box, end kept in `$XDG_STATE_HOME/davide-wm/timer`, a notification when it runs out), the backlight and screenshot widgets go through the compositor. Agents run on the DRM backend, or nested with `DAVIDE_WM_AGENTS=1`. Blob format 7.
   - **Switch-over:** install the portal files from `dist/`; remove Hyprland, xdg-desktop-portal-hyprland/-wlr, wf-recorder, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
   - **Afterwards:** keep migrating the remaining `dawn` crates and helper scripts the bar calls (`cpu-cycle`, `brightness`, `set-timer.sh`, `bt-headphones-battery`, ...).
 
@@ -387,6 +393,8 @@ davide-wm/
 | 42 | Portal source picker in the launcher box | accepted | 2026-11-05 | No separate dialog program (xdg-desktop-portal-hyprland ships one in Qt): the picker reuses `Launcher::picker`, so typing filters windows. Only one source per session; `multiple` is ignored. |
 | 43 | Screenshots inside the compositor | accepted | 2026-11-05 | Replaces grim, slurp and swappy: the frozen frame is the selector's background, so what is saved is what was on screen when Print was pressed. Saved to `~/Screenshots/` and copied to the clipboard; swappy's annotations are dropped. PNG encoding (own deflate, about 0.25 s for a full 2160x1440 frame in release) runs on the worker. |
 | 44 | Floating dialogs | accepted | 2026-11-05 | Hyprland floated dialogs on its own; tiling them made file pickers and confirmations take half the screen. A workspace keeps its floating windows apart from the dwindle tree, with a position chosen once (centred in the work area) and the size the client picks. Neighbour navigation and swapping stay tile-only. |
+| 45 | Lock screen inside the compositor | accepted | 2026-11-05 | No ext-session-lock client: the compositor already owns the input and the frame, so locking is a flag that stops both. PAM through FFI on the worker (a wrong password costs pam_unix's delay). A crash of the compositor ends the session rather than leaving it unlocked behind a dead locker. |
+| 46 | Password agents in the compositor | accepted | 2026-11-05 | polkit and NetworkManager agents share one system bus connection and one password box; the polkit check goes through polkit's own helper socket, so no PAM code runs for it here. Only Wi-Fi PSK secrets are answered; other secrets get NoSecrets. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>

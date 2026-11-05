@@ -47,6 +47,7 @@ fn assemble(parts: Vec<(String, Target, u32)>) -> Zone {
 
 /// Module state that must persist between refreshes: sampling baselines, live
 /// connections and cached helper output.
+#[derive(Default)]
 pub struct State {
     pub cpu: super::cpu::Cpu,
     pub audio: super::pulseaudio::Audio,
@@ -54,10 +55,10 @@ pub struct State {
     /// Set by the compositor (ToBar::Display).
     pub lid: String,
     pub screensaver: String,
-    pub bt_headphones: super::helpers::Helper,
+    pub bt_headphones: super::bt_battery::BtBattery,
     /// Notification count, set by the compositor.
     pub notifications: String,
-    /// Timer helper, cached at a rate that follows whether one is running.
+    /// Countdown timer.
     pub timer: super::timer::Timer,
     /// Whether the clock shows the date as well as the time. Off at startup:
     /// the date costs 96 px and is rarely the thing being looked for.
@@ -68,32 +69,11 @@ pub struct State {
     pub mega: super::mega::Sync,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        State {
-            cpu: super::cpu::Cpu::default(),
-            audio: super::pulseaudio::Audio::default(),
-            bluetooth: super::bluetooth::Bluetooth::default(),
-            lid: String::new(),
-            screensaver: String::new(),
-            bt_headphones: super::helpers::bt_headphones(),
-            notifications: String::new(),
-            timer: super::timer::Timer::default(),
-            clock_date: false,
-            spotify: super::spotify::NowPlaying::default(),
-            mega: super::mega::Sync::default(),
-        }
-    }
-}
-
 impl State {
     /// Drops the cached values of the widgets a click can change, so the next
     /// render re-reads them. Cheap: these helpers only run when asked.
     pub fn invalidate_cached(&mut self) {
         self.bt_headphones.invalidate();
-        // Clicking the timer widget is how a timer gets set, so its cache has
-        // to go with the rest.
-        self.timer.invalidate();
     }
 }
 

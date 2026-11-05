@@ -20,6 +20,8 @@ pub enum Done {
     /// polkit's verdict on a password.
     Polkit(bool),
     Networks(Vec<crate::wifi::Network>),
+    /// A CPU level was applied: its description.
+    Cpu(String),
     /// Connecting to a network: its name, or why not.
     WifiConnect(Result<String, String>),
     /// A Wayland selection read for an X client.

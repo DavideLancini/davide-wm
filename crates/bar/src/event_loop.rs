@@ -244,6 +244,9 @@ impl<'a> Loop<'a> {
                         };
                         self.tick();
                         dirty = true;
+                        if std::mem::take(&mut self.zones.modules.timer.done) {
+                            self.link.send(FromBar::TimerDone);
+                        }
                     }
                     _ => {
                         let Some(&source) = SOURCES.get((tag - TAG_SOURCES) as usize) else {
@@ -381,6 +384,10 @@ impl<'a> Loop<'a> {
                 m.lid = if lid_inhibited { "LID:ON" } else { "LID:OFF" }.into();
                 true
             }
+            ToBar::Timer(secs) => {
+                self.zones.modules.timer.set(secs);
+                true
+            }
             ToBar::Audio(key) => {
                 let audio = &mut self.zones.modules.audio;
                 let (mic, state) = match key {
@@ -428,6 +435,10 @@ impl<'a> Loop<'a> {
             Widget::Lid => self.link.send(FromBar::ToggleLid),
             Widget::Notifications => self.link.send(FromBar::ToggleNotifications),
             Widget::Network => self.link.send(FromBar::Wifi),
+            Widget::CpuFreq => self.link.send(FromBar::CpuCycle),
+            Widget::Backlight => self.link.send(FromBar::Brightness(0)),
+            Widget::Timer => self.link.send(FromBar::Timer),
+            Widget::Screenshot => self.link.send(FromBar::Screenshot),
             _ => {
                 if let Some(command) = widget.command() {
                     actions::run_detached(command);

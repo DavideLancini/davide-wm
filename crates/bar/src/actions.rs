@@ -48,19 +48,12 @@ impl Widget {
     pub fn command(self) -> Option<&'static str> {
         use Widget::*;
         Some(match self {
-            CpuFreq => "/home/davidelancini/7Scripts/cpu-cycle",
             BtHeadphones => "blueman-manager",
-            // Through `brightness`, not a write to sysfs: that only reached
-            // the laptop panel, leaving any external monitor lit. The helper
-            // drives those over DDC as well.
-            Backlight => "/home/davidelancini/7Scripts/brightness set 0",
-            Timer => "/home/davidelancini/0Projects/myArch/configs/waybar/set-timer.sh",
-            // The same command the Print key runs: select a region, then hand
-            // it to the editor rather than straight to a file.
-            Screenshot => "grim -g \"$(slurp)\" - | swappy -f -",
             // Handled by the bar thread or the compositor: these change state
             // rather than running anything.
-            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid | Notifications | Network => return None,
+            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid | Notifications | Network | CpuFreq | Backlight | Timer | Screenshot => {
+                return None
+            }
         })
     }
 }
@@ -82,13 +75,6 @@ pub fn run_detached(command: &str) {
 /// The screenshot command relies on the shell for both the pipe and the
 /// command substitution around `slurp`, so it must not be split into argv.
 #[cfg(test)]
-#[test]
-fn screenshot_needs_a_shell() {
-    let cmd = Widget::Screenshot.command().expect("bound to left click");
-    assert!(cmd.contains("$(slurp)"), "the region has to be picked interactively");
-    assert!(cmd.contains('|'), "grim's output is piped to the editor");
-}
-
 #[cfg(test)]
 mod tests {
     use super::Widget::*;
@@ -97,11 +83,7 @@ mod tests {
     /// One action per widget, all of it on the left button.
     #[test]
     fn covers_the_waybar_bindings() {
-        assert_eq!(CpuFreq.command().unwrap(), "/home/davidelancini/7Scripts/cpu-cycle");
-        assert_eq!(Network.command().unwrap(), "nmgui");
         assert_eq!(BtHeadphones.command().unwrap(), "blueman-manager");
-        assert!(Backlight.command().unwrap().ends_with("brightness set 0"));
-        assert!(Timer.command().unwrap().contains("set-timer.sh"));
     }
 
     /// The audio widgets mute through the PulseAudio connection the bar keeps
@@ -110,7 +92,7 @@ mod tests {
     /// of them may shell out.
     #[test]
     fn stateful_widgets_have_no_command() {
-        for w in [Volume, Microphone, Clock, Spotify, Blk, Screensaver, Lid, Notifications] {
+        for w in [Volume, Microphone, Clock, Spotify, Blk, Screensaver, Lid, Notifications, Network, CpuFreq, Backlight, Timer, Screenshot] {
             assert!(w.command().is_none(), "{w:?} must not shell out");
         }
     }
@@ -118,9 +100,7 @@ mod tests {
     /// Every other widget keeps its action.
     #[test]
     fn command_widgets_keep_their_action() {
-        let widgets = [
-            CpuFreq, Network, BtHeadphones, Backlight, Timer, Screenshot,
-        ];
+        let widgets = [BtHeadphones];
         for w in widgets {
             assert!(w.command().is_some(), "{w:?} lost its action");
         }

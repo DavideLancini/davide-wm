@@ -215,7 +215,7 @@ mod live {
     /// Reads the real sync on this machine. Skipped where MEGAcmd is absent.
     #[test]
     fn reports_the_real_folder() {
-        if crate::exec::run("command -v mega-sync 2>/dev/null").trim().is_empty() {
+        if !std::path::Path::new("/usr/bin/mega-sync").exists() {
             return;
         }
         let state = state();

@@ -33,7 +33,6 @@ pub const PAD: i32 = 2;
 pub const BACKLIGHT_PATH: &str = "/sys/class/backlight/amdgpu_bl1";
 
 // --- Custom timer (script path)
-pub const TIMER_SCRIPT: &str = "/home/davidelancini/0Projects/myArch/configs/waybar/timer.sh";
 
 /// Tick for the sampled widgets. Sources fed by push events (workspaces, audio,
 /// D-Bus) refresh independently of this.
