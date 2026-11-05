@@ -374,6 +374,10 @@ impl<'a> Loop<'a> {
                 }
                 false
             }
+            ToBar::Dnd(on) => {
+                self.zones.modules.dnd = on;
+                true
+            }
             ToBar::NotificationCount(n) => {
                 self.zones.modules.notifications = n.to_string();
                 true
@@ -445,7 +449,7 @@ impl<'a> Loop<'a> {
             Widget::Blk => self.link.send(FromBar::Blank),
             Widget::Screensaver => self.link.send(FromBar::CycleScreensaver),
             Widget::Lid => self.link.send(FromBar::ToggleLid),
-            Widget::Notifications => self.link.send(FromBar::ToggleNotifications),
+            Widget::Notifications => self.link.send(FromBar::ToggleDnd),
             Widget::Network => self.link.send(FromBar::Wifi),
             Widget::CpuFreq => self.link.send(FromBar::CpuCycle),
             Widget::Backlight => self.link.send(FromBar::Brightness(0)),

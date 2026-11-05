@@ -68,6 +68,26 @@ impl Notification {
     }
 }
 
+fn dnd_path() -> std::path::PathBuf {
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
+    dir.join("davide-wm/dnd")
+}
+
+/// Do not disturb: kept in a file so it survives restarts.
+pub fn dnd() -> bool {
+    dnd_path().exists()
+}
+
+pub fn set_dnd(on: bool) {
+    let p = dnd_path();
+    let _ = match on {
+        true => p.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::write(&p, "")),
+        false => std::fs::remove_file(&p),
+    };
+}
+
 pub struct Notifier {
     bus: Option<Bus>,
     /// Oldest first.
@@ -238,7 +258,8 @@ impl Notifier {
             actions,
             entry,
             critical,
-            live: true,
+            // Do not disturb: to the list only; critical ones still show.
+            live: critical || !dnd(),
             expires,
         };
         let out = (id, n.app.clone(), n.entry.clone());

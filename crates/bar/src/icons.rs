@@ -121,6 +121,8 @@ pub mod color {
     /// same green while charging, and with no separator between widgets two
     /// identical colours read as one.
     pub const NOTIFICATIONS: u32 = 0xE6_9E_D2;
+    /// The bell while do not disturb is on.
+    pub const DND: u32 = 0x60_60_60;
     pub const BLK: u32 = 0xE6_E6_E6;
     pub const SCREENSHOT: u32 = 0xE6_D9_8A;
     pub const SCREENSAVER: u32 = 0xC8_C8_D8;

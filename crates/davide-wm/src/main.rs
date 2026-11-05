@@ -600,6 +600,14 @@ impl App {
         self.state.open_view(launcher::Launcher::picker(labels), Purpose::Bluetooth(powered, devices));
     }
 
+    fn set_dnd(&mut self, on: bool) {
+        notify::set_dnd(on);
+        if let Some(bar) = &self.bar {
+            bar.send(bar::ToBar::Dnd(on));
+        }
+        self.show_osd(if on { "Non disturbare: attivo" } else { "Non disturbare: spento" }, None);
+    }
+
     /// The month under the clock; a second click hides it.
     fn toggle_calendar(&mut self) {
         if self.state.calendar.is_some() {
@@ -1049,6 +1057,12 @@ impl App {
             ipc::Command::Cast(window) => return self.cast_now(window),
             ipc::Command::CastStop(id) => self.casts.stop(id),
             ipc::Command::Lock => self.lock(),
+            ipc::Command::Dnd(on) => {
+                if let Some(on) = on {
+                    self.set_dnd(on);
+                }
+                return format!("{}\n", if notify::dnd() { "on" } else { "off" });
+            }
             ipc::Command::Damage(on) => {
                 self.damage_tracking = on;
                 self.state.needs_redraw = true;
@@ -1112,6 +1126,7 @@ impl App {
             }
             bar::FromBar::Blank => self.blank(),
             bar::FromBar::ToggleNotifications => self.open_notifications(),
+            bar::FromBar::ToggleDnd => self.set_dnd(!notify::dnd()),
             bar::FromBar::Wifi => self.wifi_job = Some(None),
             bar::FromBar::CpuCycle => self.cpu_job = true,
             bar::FromBar::Brightness(pct) => {
@@ -1794,6 +1809,7 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
         ep.add(fd, TOKEN_NOTIFY_BUS)?;
     }
     app.sync_notices();
+    bar.send(bar::ToBar::Dnd(notify::dnd()));
     app.bar = Some(bar);
     for (id, fd) in app.state.client_fds() {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;

@@ -82,6 +82,8 @@ pub enum Command {
     Cast(bool),
     CastStop(u32),
     Lock,
+    /// Do not disturb: shows it, or sets it.
+    Dnd(Option<bool>),
     /// Partial redraws on (default) or off, for debugging.
     Damage(bool),
     /// The cursor on its own plane (default) or drawn in the scene.
@@ -149,12 +151,17 @@ fn parse(line: &str) -> Result<Command, String> {
         "cast" => Ok(Command::Cast(arg == "window")),
         "cast-stop" => arg.parse().map(Command::CastStop).map_err(|_| format!("bad cast id {arg:?}")),
         "lock" => Ok(Command::Lock),
+        "dnd" => match arg {
+            "" => Ok(Command::Dnd(None)),
+            "on" | "off" => Ok(Command::Dnd(Some(arg == "on"))),
+            _ => Err("dnd takes on or off".into()),
+        },
         "damage" if arg == "on" || arg == "off" => Ok(Command::Damage(arg == "on")),
         "cursor" if arg == "hw" || arg == "sw" => Ok(Command::HwCursor(arg == "hw")),
         "night" => Ok(Command::Night((!arg.is_empty()).then(|| arg.to_string()))),
         "clipboard-import" if !arg.is_empty() => Ok(Command::ClipboardImport(arg.to_string())),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, damage on|off, cursor hw|sw, night [on|off|auto], clipboard-import <file>, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, dnd [on|off], damage on|off, cursor hw|sw, night [on|off|auto], clipboard-import <file>, exit".into()),
     }
 }
 

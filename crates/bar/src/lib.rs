@@ -57,6 +57,8 @@ pub enum ToBar {
     Notification { app: String },
     /// Notifications kept in the list.
     NotificationCount(u32),
+    /// Do not disturb is on.
+    Dnd(bool),
     /// Screensaver label ("OFF", "1m") and whether the lid switch is inhibited.
     Display { screensaver: String, lid_inhibited: bool },
     /// Volume keys, handled on the bar's PulseAudio connection; the bar
@@ -93,6 +95,8 @@ pub enum FromBar {
     CycleScreensaver,
     ToggleLid,
     ToggleNotifications,
+    /// The bell: do not disturb on or off.
+    ToggleDnd,
     /// The network widget: the Wi-Fi list.
     Wifi,
     /// The CPU widget: the next power level.
