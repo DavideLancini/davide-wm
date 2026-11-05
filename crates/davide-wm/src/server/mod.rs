@@ -343,6 +343,8 @@ pub struct State {
     pub launcher: Option<LauncherView>,
     /// Notification popups, top to bottom.
     pub notices: Vec<NoticeView>,
+    /// The volume/brightness indicator.
+    pub osd: Option<NoticeView>,
     pub shot: Option<ShotView>,
     pub drag: Option<dnd::Drag>,
     pub dropped: Option<dnd::Dropped>,
@@ -395,6 +397,7 @@ impl State {
             bar: BarSurface { visible: true, ..Default::default() },
             launcher: None,
             notices: Vec::new(),
+            osd: None,
             shot: None,
             drag: None,
             dropped: None,
@@ -747,6 +750,19 @@ impl State {
         self.needs_redraw = true;
     }
 
+    /// Shows the indicator (bottom centre), or hides it.
+    pub fn set_osd(&mut self, card: Option<Card>) {
+        if let Some(t) = self.osd.take().and_then(|o| o.tex) {
+            self.dead_textures.push(t);
+        }
+        self.osd = card.map(|(h, px)| {
+            let w = launcher::card::OSD_WIDTH as i32;
+            let rect = Rect::new((self.output.width - w) / 2, self.output.height - h as i32 - 80, w, h as i32);
+            NoticeView { id: 0, rect, pixels: Some(px), tex: None }
+        });
+        self.needs_redraw = true;
+    }
+
     pub fn notice_at(&self, x: f64, y: f64) -> Option<u32> {
         self.notices.iter().find(|n| n.rect.contains(x, y)).map(|n| n.id)
     }
@@ -1025,7 +1041,7 @@ impl State {
         for (key, origin) in xwm::floating(self) {
             self.draw_tree(r, key, origin);
         }
-        for n in &mut self.notices {
+        for n in self.notices.iter_mut().chain(self.osd.as_mut()) {
             if let Some(px) = n.pixels.take() {
                 n.tex = Some(r.upload(n.tex.take(), n.rect.w, n.rect.h, n.rect.w * 4, &px));
             }

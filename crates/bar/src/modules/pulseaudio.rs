@@ -91,6 +91,25 @@ impl Audio {
         Some(!sink.muted)
     }
 
+    /// Moves the output volume by `delta` points, within 0..=100; returns the
+    /// new level and whether the output is muted.
+    pub fn change_sink(&mut self, delta: i64) -> Option<(u64, bool)> {
+        let pulse = self.ensure()?;
+        let sink = pulse.default_sink()?;
+        let level = (sink.volume_percent as i64 + delta).clamp(0, 100) as u64;
+        pulse.set_sink_volume(sink.index, sink.channels, level)?;
+        Some((level, sink.muted))
+    }
+
+    /// Level and mute state of the output and of the microphone.
+    pub fn sink_state(&mut self) -> Option<(u64, bool)> {
+        self.ensure()?.default_sink().map(|d| (d.volume_percent, d.muted))
+    }
+
+    pub fn source_state(&mut self) -> Option<(u64, bool)> {
+        self.ensure()?.default_source().map(|d| (d.volume_percent, d.muted))
+    }
+
     /// Whether the microphone is muted, for the widget that shows it.
     ///
     /// `None` when the server cannot be reached: the button then says it does

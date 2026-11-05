@@ -21,6 +21,8 @@ const CMD_SET_CLIENT_NAME: u32 = 9;
 const CMD_GET_SINK_INFO: u32 = 21;
 const CMD_GET_SOURCE_INFO: u32 = 23;
 const CMD_SUBSCRIBE: u32 = 35;
+/// Sets every channel of a sink: index, name, cvolume.
+const CMD_SET_SINK_VOLUME: u32 = 36;
 /// Mutes or unmutes a source. Takes index, name, then the desired state — the
 /// server has no "toggle", so the caller reads the state first and sends its
 /// opposite.
@@ -180,6 +182,8 @@ pub struct DeviceState {
     /// info queries, the server rejects `INVALID_INDEX` plus a null name with
     /// PA_ERR_INVALID rather than resolving it to the default device.
     pub index: u32,
+    /// Channels, for writing a volume back.
+    pub channels: u8,
 }
 
 /// Raw volume -> percentage, rounded as `pactl` prints it.
@@ -202,12 +206,14 @@ fn parse_device_info(body: &[u8]) -> Option<DeviceState> {
     r.skip_sample_spec()?;
     r.skip_channel_map()?;
     r.u32()?; // owner_module
+    let channels = *body.get(r.pos + 1)?;
     let volume = r.cvolume_max()?;
     let muted = r.bool()?;
     Some(DeviceState {
         volume_percent: to_percent(volume),
         muted,
         index,
+        channels,
     })
 }
 
@@ -334,6 +340,19 @@ impl Pulse {
             .null_string()
             .bool(muted)
             .finish();
+        self.request(&req).map(|_| ())
+    }
+
+    /// Sets every channel of the sink at `index` to `percent`.
+    pub fn set_sink_volume(&mut self, index: u32, channels: u8, percent: u64) -> Option<()> {
+        let tag = self.next_tag();
+        let raw = ((percent * NORM_VOLUME as u64 + 50) / 100) as u32;
+        let mut req = Writer::default().u32(CMD_SET_SINK_VOLUME).u32(tag).u32(index).null_string().finish();
+        req.push(TAG_CVOLUME);
+        req.push(channels.max(1));
+        for _ in 0..channels.max(1) {
+            req.extend_from_slice(&raw.to_be_bytes());
+        }
         self.request(&req).map(|_| ())
     }
 
@@ -464,7 +483,7 @@ mod tests {
         // resolve INVALID_INDEX to the default device when setting mute.
         assert_eq!(
             parse_device_info(&body),
-            Some(DeviceState { volume_percent: 80, muted: false, index: 58 })
+            Some(DeviceState { volume_percent: 80, muted: false, index: 58, channels: 2 })
         );
     }
 

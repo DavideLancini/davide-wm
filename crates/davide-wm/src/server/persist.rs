@@ -357,6 +357,7 @@ impl State {
             bar,
             launcher: _,
             notices: _,
+            osd: _,
             shot: _,
             drag: _,
             dropped: _,

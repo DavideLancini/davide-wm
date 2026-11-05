@@ -55,6 +55,26 @@ impl Epoll {
     }
 }
 
+/// A one-shot monotonic timerfd, disarmed.
+pub fn timer_fd() -> io::Result<OwnedFd> {
+    let fd = check(unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Fires `fd` once after `after`.
+pub fn arm_timer(fd: &OwnedFd, after: std::time::Duration) {
+    let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+    spec.it_value.tv_sec = after.as_secs() as libc::time_t;
+    spec.it_value.tv_nsec = after.subsec_nanos().max(1) as libc::c_long;
+    unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+}
+
+/// Consumes an expiry so the fd stops being readable.
+pub fn read_timer(fd: &OwnedFd) {
+    let mut n = 0u64;
+    unsafe { libc::read(fd.as_raw_fd(), (&mut n as *mut u64).cast(), 8) };
+}
+
 /// Blocks SIGINT and SIGTERM and returns a signalfd that reports them.
 pub fn signal_fd() -> io::Result<OwnedFd> {
     unsafe {

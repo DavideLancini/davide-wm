@@ -3,6 +3,7 @@ macro_rules! log {
 }
 
 mod backend;
+mod brightness;
 mod cast;
 mod display;
 mod event_loop;
@@ -47,6 +48,7 @@ const TOKEN_XWAYLAND_EXIT: u64 = 15;
 const TOKEN_XWM: u64 = 16;
 const TOKEN_PIPEWIRE: u64 = 17;
 const TOKEN_PORTAL: u64 = 18;
+const TOKEN_OSD: u64 = 19;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -182,6 +184,10 @@ struct App {
     shot_request: Option<(u32, bool)>,
     /// Selected screenshots waiting for the worker: request, RGBA, size.
     shots: Vec<(u32, Vec<u8>, u32, u32)>,
+    /// Hides the volume/brightness indicator.
+    osd_timer: OwnedFd,
+    /// A brightness to mirror to external monitors (slow: on the worker).
+    ddc: Option<u32>,
 }
 
 impl App {
@@ -305,6 +311,10 @@ impl App {
             Action::ClipboardHistory => self.open_clipboard(),
             Action::Notifications => self.open_notifications(),
             Action::Screenshot => self.shot_request = Some((0, true)),
+            Action::Volume(d) => self.audio_key(bar::AudioKey::Volume(d)),
+            Action::ToggleMute => self.audio_key(bar::AudioKey::ToggleMute),
+            Action::ToggleMic => self.audio_key(bar::AudioKey::ToggleMic),
+            Action::Brightness(d) => self.change_brightness(d),
             Action::Exit => self.running = false,
         }
     }
@@ -380,6 +390,29 @@ impl App {
             },
         }
         self.sync_notices();
+    }
+
+    fn audio_key(&mut self, key: bar::AudioKey) {
+        if let Some(bar) = &self.bar {
+            bar.send(bar::ToBar::Audio(key));
+        }
+    }
+
+    fn change_brightness(&mut self, delta: i32) {
+        let Some(cur) = brightness::get() else { return };
+        let Some(pct) = brightness::set_panel((cur as i32 + delta).clamp(0, 100) as u32) else { return };
+        self.ddc = Some(pct);
+        self.show_osd(&format!("Luminosità {pct}%"), Some(pct as f32 / 100.0));
+    }
+
+    /// The volume/brightness indicator, for `OSD_TIMEOUT_MS`.
+    fn show_osd(&mut self, label: &str, fraction: Option<f32>) {
+        if self.cards.is_none() {
+            self.cards = launcher::card::Cards::new().inspect_err(|e| log!("{e}")).ok();
+        }
+        let Some(cards) = &self.cards else { return };
+        self.state.set_osd(Some(cards.osd(label, fraction)));
+        event_loop::arm_timer(&self.osd_timer, std::time::Duration::from_millis(config::OSD_TIMEOUT_MS));
     }
 
     /// The source list for a cast: the output, then the windows.
@@ -724,6 +757,13 @@ impl App {
                     log!("lid inhibitor: {e}");
                 }
             }
+            bar::FromBar::Audio { mic, level, muted } => {
+                let what = if mic { "Microfono" } else { "Volume" };
+                match muted {
+                    true => self.show_osd(&format!("{what}: muto"), None),
+                    false => self.show_osd(&format!("{what} {level}%"), Some(level as f32 / 100.0)),
+                }
+            }
             bar::FromBar::Notified { workspace } => {
                 if let Some(ws) = ws_of(workspace).filter(|w| *w != self.state.active) {
                     self.state.urgent_ws.insert(ws);
@@ -1049,6 +1089,8 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         portal: portal::Portal::start(),
         shot_request: None,
         shots: Vec::new(),
+        osd_timer: event_loop::timer_fd().expect("timerfd"),
+        ddc: None,
     }
 }
 
@@ -1218,6 +1260,7 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     if let Some(fd) = app.portal.bus_fd() {
         ep.add(fd, TOKEN_PORTAL)?;
     }
+    ep.add(app.osd_timer.as_raw_fd(), TOKEN_OSD)?;
     if app.state.wallpaper.is_none() && !WALLPAPER.is_empty() {
         worker.run(|| {
             let mut img = jpeg::decode(WALLPAPER).map_err(|e| e.to_string())?;
@@ -1551,6 +1594,10 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                         app.state.needs_redraw = true;
                     }
                 }
+                TOKEN_OSD => {
+                    event_loop::read_timer(&app.osd_timer);
+                    app.state.set_osd(None);
+                }
                 TOKEN_PORTAL => {
                     for a in app.portal.dispatch() {
                         app.portal_action(a);
@@ -1643,6 +1690,12 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         }
         if let Some((request, interactive)) = app.shot_request.take() {
             app.take_screenshot(renderer, request, interactive);
+        }
+        if let Some(pct) = app.ddc.take() {
+            worker.run(move || {
+                brightness::set_external(pct);
+                Ok(worker::Done::Saved)
+            });
         }
         for (request, px, w, h) in std::mem::take(&mut app.shots) {
             worker.run(move || {

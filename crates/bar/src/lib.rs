@@ -59,6 +59,17 @@ pub enum ToBar {
     NotificationCount(u32),
     /// Screensaver label ("OFF", "1m") and whether the lid switch is inhibited.
     Display { screensaver: String, lid_inhibited: bool },
+    /// Volume keys, handled on the bar's PulseAudio connection; the bar
+    /// answers with `FromBar::Audio`.
+    Audio(AudioKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AudioKey {
+    /// Points to add to the output volume (negative lowers it).
+    Volume(i32),
+    ToggleMute,
+    ToggleMic,
 }
 
 pub enum FromBar {
@@ -76,6 +87,9 @@ pub enum FromBar {
     CycleScreensaver,
     ToggleLid,
     ToggleNotifications,
+    /// The audio state after a volume key, for the on-screen indicator:
+    /// microphone or output, level and mute.
+    Audio { mic: bool, level: u32, muted: bool },
 }
 
 /// Handle owned by the compositor.

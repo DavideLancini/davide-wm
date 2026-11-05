@@ -381,6 +381,19 @@ impl<'a> Loop<'a> {
                 m.lid = if lid_inhibited { "LID:ON" } else { "LID:OFF" }.into();
                 true
             }
+            ToBar::Audio(key) => {
+                let audio = &mut self.zones.modules.audio;
+                let (mic, state) = match key {
+                    crate::AudioKey::Volume(d) => (false, audio.change_sink(d as i64)),
+                    crate::AudioKey::ToggleMute => (false, audio.toggle_sink().and_then(|_| audio.sink_state())),
+                    crate::AudioKey::ToggleMic => (true, audio.toggle_mic().and_then(|_| audio.source_state())),
+                };
+                if let Some((level, muted)) = state {
+                    self.link.send(FromBar::Audio { mic, level: level as u32, muted });
+                }
+                self.zones.modules.invalidate_cached();
+                true
+            }
         }
     }
 

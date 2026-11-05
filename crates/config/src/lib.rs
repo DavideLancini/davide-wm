@@ -70,6 +70,12 @@ pub enum Action {
     /// Select a region, a window or the output; the PNG goes to the
     /// clipboard and to `SCREENSHOT_DIR`.
     Screenshot,
+    /// Output volume change in points.
+    Volume(i32),
+    ToggleMute,
+    ToggleMic,
+    /// Brightness change in points, on every panel.
+    Brightness(i32),
     Exit,
 }
 
@@ -97,13 +103,13 @@ pub fn binds() -> Vec<Bind> {
         b(MAIN, keys::N, Action::Notifications),
         b(MAIN, keys::P, Action::ClipboardHistory),
         b(MAIN, keys::S, Action::Spawn("~/7Scripts/tts --clipboard")),
-        b(MAIN, keys::M, Action::Spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle")),
-        b(0, keys::AUDIO_MIC_MUTE, Action::Spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle")),
-        b(0, keys::AUDIO_MUTE, Action::Spawn("pactl set-sink-mute @DEFAULT_SINK@ toggle")),
-        b(0, keys::AUDIO_LOWER_VOLUME, Action::Spawn("pactl set-sink-volume @DEFAULT_SINK@ -5%")),
-        b(0, keys::AUDIO_RAISE_VOLUME, Action::Spawn("pactl set-sink-volume @DEFAULT_SINK@ +5%")),
-        b(0, keys::MON_BRIGHTNESS_DOWN, Action::Spawn("brightness down")),
-        b(0, keys::MON_BRIGHTNESS_UP, Action::Spawn("brightness up")),
+        b(MAIN, keys::M, Action::ToggleMic),
+        b(0, keys::AUDIO_MIC_MUTE, Action::ToggleMic),
+        b(0, keys::AUDIO_MUTE, Action::ToggleMute),
+        b(0, keys::AUDIO_LOWER_VOLUME, Action::Volume(-VOLUME_STEP)),
+        b(0, keys::AUDIO_RAISE_VOLUME, Action::Volume(VOLUME_STEP)),
+        b(0, keys::MON_BRIGHTNESS_DOWN, Action::Brightness(-BRIGHTNESS_STEP)),
+        b(0, keys::MON_BRIGHTNESS_UP, Action::Brightness(BRIGHTNESS_STEP)),
         b(0, keys::PRINT, Action::Screenshot),
         b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::ToggleBar),
         b(MAIN | SHIFT, keys::P, Action::Spawn("poweroff")),
@@ -205,6 +211,11 @@ pub const CLIPBOARD_MAX_BYTES: usize = 16 << 20;
 /// popups show at once, and how many notifications the list keeps.
 pub const NOTIFICATION_TIMEOUT_MS: u64 = 5000;
 pub const NOTIFICATION_POPUPS: usize = 4;
+pub const VOLUME_STEP: i32 = 5;
+pub const BRIGHTNESS_STEP: i32 = 5;
+/// How long the volume/brightness indicator stays.
+pub const OSD_TIMEOUT_MS: u64 = 1500;
+
 /// Under `$HOME`; screenshots are also copied to the clipboard.
 pub const SCREENSHOT_DIR: &str = "Screenshots";
 /// Frame rate cap of screen casts.
