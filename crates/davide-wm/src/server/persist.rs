@@ -12,7 +12,24 @@ use state::{persist_struct, Dec, Enc, Persist, Result};
 use super::*;
 
 persist_struct!(SKey { client, id });
-persist_struct!(Pending { buffer, frames, geometry });
+/// The format of the blob being read: version 7 had no input regions.
+pub static FORMAT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn has_regions() -> bool {
+    FORMAT.load(std::sync::atomic::Ordering::Relaxed) >= 8
+}
+
+impl Persist for Pending {
+    fn save(&self, e: &mut Enc) {
+        (self.buffer, self.frames.clone(), self.geometry).save(e);
+        self.input.save(e);
+    }
+    fn load(d: &mut Dec) -> Result<Self> {
+        let (buffer, frames, geometry) = Persist::load(d)?;
+        let input = if has_regions() { Persist::load(d)? } else { None };
+        Ok(Pending { buffer, frames, geometry, input })
+    }
+}
 persist_struct!(Xdg { obj, role, geometry, configured, mapped });
 persist_struct!(DmabufParams { planes, modifier, used });
 persist_struct!(Positioner { size, anchor_rect, anchor, gravity, offset, constraint_adjustment });
@@ -285,7 +302,7 @@ fn load_texture(d: &mut Dec, r: &mut Renderer, mipmaps: bool) -> Result<Texture>
 }
 
 fn save_surface(sf: &Surface, e: &mut Enc, r: &mut Renderer) {
-    let Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg } = sf;
+    let Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg, input } = sf;
     pending.save(e);
     cached.save(e);
     upload.save(e);
@@ -305,6 +322,7 @@ fn save_surface(sf: &Surface, e: &mut Enc, r: &mut Renderer) {
     role.save(e);
     (above.clone(), below.clone()).save(e);
     xdg.save(e);
+    input.save(e);
 }
 
 fn load_surface(d: &mut Dec, r: &mut Renderer) -> Result<Surface> {
@@ -322,7 +340,8 @@ fn load_surface(d: &mut Dec, r: &mut Renderer) -> Result<Surface> {
     let role = Persist::load(d)?;
     let (above, below) = Persist::load(d)?;
     let xdg = Persist::load(d)?;
-    Ok(Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg })
+    let input = if has_regions() { Persist::load(d)? } else { None };
+    Ok(Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg, input })
 }
 
 impl State {
@@ -338,6 +357,7 @@ impl State {
             dmabuf_formats: _,
             dmabuf_device: _,
             positioners,
+            regions,
             output,
             workspaces,
             window_ws,
@@ -391,6 +411,7 @@ impl State {
         buffers.save(e);
         dmabuf_params.save(e);
         positioners.save(e);
+        regions.save(e);
         output.save(e);
         workspaces.save(e);
         window_ws.save(e);
@@ -427,6 +448,9 @@ impl State {
         s.buffers = Persist::load(d)?;
         s.dmabuf_params = Persist::load(d)?;
         s.positioners = Persist::load(d)?;
+        if has_regions() {
+            s.regions = Persist::load(d)?;
+        }
         s.output = Persist::load(d)?;
         s.workspaces = Persist::load(d)?;
         s.window_ws = Persist::load(d)?;

@@ -8,7 +8,7 @@ mod compositor;
 mod dmabuf;
 pub mod dnd;
 mod misc;
-mod persist;
+pub mod persist;
 pub mod seat;
 pub mod selection;
 pub mod workspaces;
@@ -112,6 +112,16 @@ pub struct Pending {
     pub buffer: Option<Option<u32>>,
     pub frames: Vec<u32>,
     pub geometry: Option<Rect>,
+    /// `Some(None)` resets the input region to the whole surface.
+    pub input: Option<Option<Region>>,
+}
+
+/// A `wl_region`: rectangles added or subtracted in order.
+pub type Region = Vec<(bool, Rect)>;
+
+/// True when the point is in the region (surface-local coordinates).
+pub fn region_contains(region: &Region, x: f64, y: f64) -> bool {
+    region.iter().fold(false, |inside, (add, r)| if r.contains(x, y) { *add } else { inside })
 }
 
 pub enum Role {
@@ -173,6 +183,8 @@ pub struct Surface {
     pub above: Vec<u32>,
     pub below: Vec<u32>,
     pub xdg: Option<Xdg>,
+    /// Where the surface takes pointer input; None is everywhere.
+    pub input: Option<Region>,
 }
 
 pub struct Pool {
@@ -412,6 +424,7 @@ pub struct State {
     /// The render node clients should allocate on (a dev_t).
     pub dmabuf_device: u64,
     pub positioners: HashMap<SKey, Positioner>,
+    pub regions: HashMap<SKey, Region>,
     pub output: Output,
     pub workspaces: HashMap<WsId, Workspace<SKey>>,
     pub window_ws: HashMap<SKey, WsId>,
@@ -487,6 +500,7 @@ impl State {
             dmabuf_formats,
             dmabuf_device: 0,
             positioners: HashMap::new(),
+            regions: HashMap::new(),
             output,
             workspaces: HashMap::new(),
             window_ws: HashMap::new(),
@@ -723,7 +737,8 @@ impl State {
             Kind::Dmabuf | Kind::DmabufParams | Kind::DmabufFeedback => dmabuf::request(self, c, id, kind, version, op, args),
             Kind::DragOffer => dnd::offer_request(self, c, id, op, args),
             Kind::XwaylandShell | Kind::XwaylandSurface { .. } => xwm::request(self, c, id, kind, version, op, args),
-            Kind::Callback | Kind::Region | Kind::Keyboard | Kind::Touch | Kind::Output => {}
+            Kind::Region => compositor::region(self, c, id, op, args),
+            Kind::Callback | Kind::Keyboard | Kind::Touch | Kind::Output => {}
         }
     }
 
@@ -780,6 +795,7 @@ impl State {
         }
         self.dmabuf_params.retain(|k, _| k.client != client);
         self.positioners.retain(|k, _| k.client != client);
+        self.regions.retain(|k, _| k.client != client);
         self.idle_inhibitors.retain(|k, _| k.client != client);
         selection::client_gone(self, client);
         dnd::client_gone(self, client);

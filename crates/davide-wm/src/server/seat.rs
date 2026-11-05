@@ -196,7 +196,8 @@ fn surface_hit(s: &State, key: SKey, (x, y): (i32, i32), px: f64, py: f64) -> Op
     if let Some(hit) = sf.above.iter().rev().find_map(child) {
         return Some(hit);
     }
-    if s.texture(key).is_some() && Rect::new(x, y, sf.size.0, sf.size.1).contains(px, py) {
+    let accepts = sf.input.as_ref().is_none_or(|r| region_contains(r, px - x as f64, py - y as f64));
+    if s.texture(key).is_some() && accepts && Rect::new(x, y, sf.size.0, sf.size.1).contains(px, py) {
         return Some((key, px - x as f64, py - y as f64));
     }
     sf.below.iter().rev().find_map(child)

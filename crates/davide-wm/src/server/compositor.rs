@@ -99,12 +99,13 @@ pub fn compositor(s: &mut State, c: ClientId, version: u32, op: u16, args: Args)
                         above: Vec::new(),
                         below: Vec::new(),
                         xdg: None,
+                        input: None,
                     },
                 );
             }
         }
-        wl_compositor::req::CREATE_REGION => {
-            s.new_object(c, id, &wl_region::INTERFACE, version, Kind::Region);
+        wl_compositor::req::CREATE_REGION if s.new_object(c, id, &wl_region::INTERFACE, version, Kind::Region) => {
+            s.regions.insert(SKey { client: c, id }, Vec::new());
         }
         _ => {}
     }
@@ -129,6 +130,13 @@ pub fn surface(s: &mut State, c: ClientId, id: u32, op: u16, args: Args) {
             }
         }
         wl_surface::req::COMMIT => commit(s, key),
+        wl_surface::req::SET_INPUT_REGION => {
+            let region = args.obj(0);
+            let r = (region != 0).then(|| s.regions.get(&SKey { client: c, id: region }).cloned().unwrap_or_default());
+            if let Some(sf) = s.surfaces.get_mut(&key) {
+                sf.pending.input = Some(r);
+            }
+        }
         wl_surface::req::SET_BUFFER_SCALE if args.int(0) != 1 => {
             log!("client {c}: buffer scale {} not supported yet", args.int(0));
         }
@@ -148,6 +156,9 @@ fn commit(s: &mut State, key: SKey) {
         cached.frames.append(&mut p.frames);
         if p.geometry.is_some() {
             cached.geometry = p.geometry;
+        }
+        if p.input.is_some() {
+            cached.input = p.input;
         }
         return;
     }
@@ -201,6 +212,11 @@ fn apply(s: &mut State, key: SKey, mut p: Pending) {
     }
     let sf = s.surfaces.get_mut(&key).unwrap();
     sf.frames.append(&mut p.frames);
+    if let Some(input) = p.input.take() {
+        sf.input = input;
+        s.pointer_dirty = true;
+    }
+    let sf = s.surfaces.get_mut(&key).unwrap();
     if let Some(x) = sf.xdg.as_mut() {
         if let Some(g) = p.geometry.take() {
             x.geometry = Some(g);
@@ -208,6 +224,21 @@ fn apply(s: &mut State, key: SKey, mut p: Pending) {
     }
     s.damage_surface(key);
     xdg::commit(s, key);
+}
+
+pub fn region(s: &mut State, c: ClientId, id: u32, op: u16, args: Args) {
+    let key = SKey { client: c, id };
+    match op {
+        wl_region::req::DESTROY => {
+            s.regions.remove(&key);
+        }
+        wl_region::req::ADD | wl_region::req::SUBTRACT => {
+            if let Some(r) = s.regions.get_mut(&key) {
+                r.push((op == wl_region::req::ADD, Rect::new(args.int(0), args.int(1), args.int(2), args.int(3))));
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn subcompositor(s: &mut State, c: ClientId, version: u32, op: u16, args: Args) {

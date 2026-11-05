@@ -984,6 +984,30 @@ impl App {
                     None => "none\n".into(),
                 };
             }
+            ipc::Command::Debug => {
+                let s = &self.state;
+                let name = |k: server::SKey| format!("{}/{} {}", k.client, k.id, s.app_id(k));
+                let mut out = format!(
+                    "pointer {:.0},{:.0} focus {:?} hit {:?}\nkeyboard {:?}\ndrag {} lock {} prompt {} launcher {} shot {}\n",
+                    s.pointer.x,
+                    s.pointer.y,
+                    s.pointer.focus.map(name),
+                    seat::surface_at(s, s.pointer.x, s.pointer.y).map(|(k, x, y)| format!("{} at {x:.0},{y:.0}", name(k))),
+                    s.focus.map(name),
+                    s.drag.is_some(),
+                    s.lock.is_some(),
+                    s.prompt.is_some(),
+                    s.launcher.is_some(),
+                    s.shot.is_some(),
+                );
+                for (k, r) in &s.layout {
+                    out += &format!("tile {} {:?} float {}\n", name(*k), r, s.is_floating(*k));
+                }
+                for k in &s.popups {
+                    out += &format!("popup {} origin {:?}\n", name(*k), s.window_origin(*k));
+                }
+                return out;
+            }
             ipc::Command::Blank => self.blank(),
             ipc::Command::Wake => self.wake(),
             ipc::Command::Screensaver(arg) => {
@@ -1848,7 +1872,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 7;
+const BLOB_FORMAT: u32 = 8;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -1914,7 +1938,9 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let err = |e: state::Error| io::Error::other(e.to_string());
     let mut d = state::Dec::new(blob);
     let format = u32::load(&mut d).map_err(err)?;
-    if format != BLOB_FORMAT {
+    // Version 7 differs only by the input regions it lacks.
+    server::persist::FORMAT.store(format, std::sync::atomic::Ordering::Relaxed);
+    if format != BLOB_FORMAT && format != 7 {
         return Err(io::Error::other(format!("state blob format {format}, this binary reads {BLOB_FORMAT}")));
     }
     let (session, main_mod, exe): (bool, u32, String) = Persist::load(&mut d).map_err(err)?;

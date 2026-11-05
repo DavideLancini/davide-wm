@@ -63,6 +63,8 @@ pub enum Command {
     /// Press evdev key codes in order, release them in reverse (a chord).
     Key(Vec<u32>),
     Focused,
+    /// What gets input and what is drawn where, for debugging.
+    Debug,
     /// Black screen until the next input.
     Blank,
     Wake,
@@ -131,6 +133,7 @@ fn parse(line: &str) -> Result<Command, String> {
             _ => Err("key <evdev code>...".into()),
         },
         "focused" => Ok(Command::Focused),
+        "debug" => Ok(Command::Debug),
         "blank" => Ok(Command::Blank),
         "wake" => Ok(Command::Wake),
         "screensaver" => Ok(Command::Screensaver((!arg.is_empty()).then(|| arg.to_string()))),
