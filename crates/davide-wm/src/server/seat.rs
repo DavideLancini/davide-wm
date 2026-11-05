@@ -130,6 +130,13 @@ pub fn set_focus(s: &mut State, key: Option<SKey>) {
     if s.focus == key {
         return;
     }
+    if (s.lock.is_some() || s.prompt.is_some()) && key.is_some() {
+        // Remembered for when the lock or the prompt goes away.
+        if let Some(ws) = key.and_then(|k| s.window_ws.get(&k)).and_then(|w| s.workspaces.get_mut(w)) {
+            ws.focus = key;
+        }
+        return;
+    }
     if let Some(cur) = s.focus {
         let pinned = s.rule(cur).is_some_and(|r| r.stay_focused) && s.shown(cur);
         if pinned && key.is_some() {
@@ -267,7 +274,7 @@ pub fn refresh_pointer(s: &mut State) {
 fn update_pointer(s: &mut State, x: f64, y: f64) {
     s.pointer.x = x.clamp(0.0, (s.output.width - 1).max(0) as f64);
     s.pointer.y = y.clamp(0.0, (s.output.height - 1).max(0) as f64);
-    let hit = surface_at(s, s.pointer.x, s.pointer.y);
+    let hit = surface_at(s, s.pointer.x, s.pointer.y).filter(|_| s.lock.is_none() && s.prompt.is_none());
     let time = s.time_ms();
     let new = hit.map(|h| h.0);
     if new != s.pointer.focus {

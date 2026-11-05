@@ -79,6 +79,7 @@ pub enum Command {
     /// answers with the PipeWire node.
     Cast(bool),
     CastStop(u32),
+    Lock,
     Exit,
 }
 
@@ -136,8 +137,9 @@ fn parse(line: &str) -> Result<Command, String> {
         "screenshot" if !arg.is_empty() => Ok(Command::Screenshot(arg.to_string())),
         "cast" => Ok(Command::Cast(arg == "window")),
         "cast-stop" => arg.parse().map(Command::CastStop).map_err(|_| format!("bad cast id {arg:?}")),
+        "lock" => Ok(Command::Lock),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, exit".into()),
     }
 }
 

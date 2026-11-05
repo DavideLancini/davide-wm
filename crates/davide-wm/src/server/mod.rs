@@ -262,6 +262,90 @@ pub enum CastChoice {
     Window(SKey),
 }
 
+/// A password box: the lock screen, or a prompt over the desktop (polkit,
+/// Wi-Fi). The compositor draws its card when `dirty`.
+#[derive(Default)]
+pub struct PromptView {
+    pub title: String,
+    pub message: String,
+    /// Wiped when dropped.
+    pub typed: String,
+    pub error: String,
+    /// Waiting for the answer to a submitted password.
+    pub busy: bool,
+    pub dirty: bool,
+    /// Rendered card: height and pixels, waiting for upload.
+    pub card: Option<Card>,
+    tex: Option<Texture>,
+    size: (i32, i32),
+}
+
+impl PromptView {
+    pub fn new(title: &str, message: &str) -> PromptView {
+        let mut p = PromptView::default();
+        (p.title, p.message, p.dirty) = (title.into(), message.into(), true);
+        p
+    }
+
+    /// Edits from a key: true when the user submitted (Enter).
+    pub fn key(&mut self, sym: u32, text: Option<char>) -> bool {
+        if self.busy {
+            return false;
+        }
+        match sym {
+            0xff0d | 0xff8d => return !self.typed.is_empty(),
+            0xff08 => {
+                self.typed.pop();
+            }
+            0xff1b => self.typed_clear(),
+            _ => match text.filter(|c| !c.is_control()) {
+                Some(c) => self.typed.push(c),
+                None => return false,
+            },
+        }
+        self.error.clear();
+        self.dirty = true;
+        false
+    }
+
+    /// Takes the typed password out, leaving the field empty.
+    pub fn take(&mut self) -> String {
+        self.busy = true;
+        self.dirty = true;
+        std::mem::take(&mut self.typed)
+    }
+
+    fn typed_clear(&mut self) {
+        let mut b = std::mem::take(&mut self.typed).into_bytes();
+        b.fill(0);
+    }
+
+    pub fn failed(&mut self, error: &str) {
+        self.busy = false;
+        self.error = error.into();
+        self.dirty = true;
+    }
+
+    fn draw(&mut self, r: &mut Renderer, output: &Output) {
+        if let Some((h, px)) = self.card.take() {
+            let w = launcher::card::PROMPT_WIDTH as i32;
+            self.tex = Some(r.upload(self.tex.take(), w, h as i32, w * 4, &px));
+            self.size = (w, h as i32);
+        }
+        if let Some(t) = &self.tex {
+            let (w, h) = self.size;
+            let (x, y) = ((output.width - w) / 2, (output.height - h) / 2);
+            r.draw(t, Quad { x: x as f32, y: y as f32, w: w as f32, h: h as f32 }, true);
+        }
+    }
+}
+
+impl Drop for PromptView {
+    fn drop(&mut self) {
+        self.typed_clear();
+    }
+}
+
 /// The screenshot selector: the frozen screen, dimmed outside the selection.
 pub struct ShotView {
     pub pixels: Vec<u8>,
@@ -346,6 +430,10 @@ pub struct State {
     /// The volume/brightness indicator.
     pub osd: Option<NoticeView>,
     pub shot: Option<ShotView>,
+    /// The lock screen: while set, nothing but it is drawn or gets input.
+    pub lock: Option<PromptView>,
+    /// A password prompt over the desktop.
+    pub prompt: Option<PromptView>,
     pub drag: Option<dnd::Drag>,
     pub dropped: Option<dnd::Dropped>,
     /// For screenshots: draw without the pointer.
@@ -399,6 +487,8 @@ impl State {
             notices: Vec::new(),
             osd: None,
             shot: None,
+            lock: None,
+            prompt: None,
             drag: None,
             dropped: None,
             hide_cursor: false,
@@ -1014,6 +1104,14 @@ impl State {
         for t in self.dead_textures.drain(..) {
             r.destroy_texture(t);
         }
+        if let Some(l) = &mut self.lock {
+            // Nothing of the session shows while locked; clients wait.
+            r.begin(target, [0.0, 0.0, 0.0, 1.0]);
+            l.draw(r, &self.output);
+            r.finish();
+            self.needs_redraw = false;
+            return;
+        }
         self.upload_buffers(r);
         r.begin(target, config::BACKGROUND);
         self.draw_background(r);
@@ -1061,6 +1159,10 @@ impl State {
                 r.draw(t, Quad { x: rect.x as f32, y: rect.y as f32, w: rect.w as f32, h: rect.h as f32 }, true);
             }
         }
+        if let Some(p) = &mut self.prompt {
+            r.fill(Quad { x: 0.0, y: 0.0, w: self.output.width as f32, h: self.output.height as f32 }, [0.0, 0.0, 0.0, 0.5]);
+            p.draw(r, &self.output);
+        }
         dnd::draw_icon(self, r);
         self.draw_shot(r);
         if !self.hide_cursor {
@@ -1091,6 +1193,16 @@ impl State {
             }
             None => self.layout.iter().rev().find(|(_, r)| r.contains(px, py)).map(|(_, r)| *r).unwrap_or(self.output_rect()),
         }
+    }
+
+    /// Removes the lock screen or the prompt, freeing its texture.
+    pub fn drop_prompt(&mut self, lock: bool) {
+        let slot = if lock { &mut self.lock } else { &mut self.prompt };
+        if let Some(mut p) = slot.take() {
+            self.dead_textures.extend(p.tex.take());
+        }
+        self.needs_redraw = true;
+        self.pointer_dirty = true;
     }
 
     /// Closes the selector and hands back what it showed.

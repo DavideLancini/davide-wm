@@ -15,6 +15,8 @@ pub enum Done {
     LinkCheck { name: String, failed: bool },
     /// A screenshot encoded and saved: the file (or why not) and the PNG.
     Screenshot { request: u32, path: Result<String, String>, png: Vec<u8> },
+    /// The lock screen's password check.
+    Unlock(bool),
     /// A Wayland selection read for an X client.
     XSelection { request: crate::server::xwm::selection::Request, data: Result<Vec<u8>, String> },
 }

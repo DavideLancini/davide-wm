@@ -9,6 +9,7 @@ mod display;
 mod event_loop;
 mod ipc;
 mod keyboard;
+mod lock;
 mod notify;
 mod png;
 mod portal;
@@ -188,6 +189,12 @@ struct App {
     osd_timer: OwnedFd,
     /// A brightness to mirror to external monitors (slow: on the worker).
     ddc: Option<u32>,
+    /// A password to check for the lock screen.
+    unlock: Option<String>,
+    /// Delays suspend until the lock screen is on screen.
+    sleep_inhibitor: Option<OwnedFd>,
+    /// Release `sleep_inhibitor` after the next frame.
+    sleep_after_frame: bool,
 }
 
 impl App {
@@ -220,6 +227,11 @@ impl App {
 
     fn key(&mut self, keycode: u32, pressed: bool) {
         let changed = self.state.keyboard.update(keycode, pressed);
+        if self.state.lock.is_some() || self.state.prompt.is_some() {
+            self.tap = None;
+            self.prompt_key(keycode, pressed);
+            return;
+        }
         let base = self.state.keyboard.base_sym(keycode);
         let main_keys: &[u32] = if self.main_mod == mods::SUPER { &[0xffeb, 0xffec] } else { &[0xffe9] };
         let is_main = base.is_some_and(|b| main_keys.contains(&b));
@@ -315,6 +327,7 @@ impl App {
             Action::ToggleMute => self.audio_key(bar::AudioKey::ToggleMute),
             Action::ToggleMic => self.audio_key(bar::AudioKey::ToggleMic),
             Action::Brightness(d) => self.change_brightness(d),
+            Action::Lock => self.lock(),
             Action::Exit => self.running = false,
         }
     }
@@ -390,6 +403,113 @@ impl App {
             },
         }
         self.sync_notices();
+    }
+
+    /// Suspend waits for the lock screen to be drawn (DRM only).
+    fn take_sleep_inhibitor(&mut self) {
+        if matches!(self.backend, Backend::Drm(_)) && self.sleep_inhibitor.is_none() {
+            match backend::logind::inhibit_mode("sleep", "Lock the screen first", "delay") {
+                Ok(fd) => self.sleep_inhibitor = Some(fd),
+                Err(e) => log!("sleep inhibitor: {e}"),
+            }
+        }
+    }
+
+    /// Locks the session: nothing shows or gets input until the password.
+    fn lock(&mut self) {
+        if self.state.lock.is_some() {
+            return;
+        }
+        log!("locked");
+        self.state.close_launcher();
+        self.state.close_shot();
+        seat::set_focus(&mut self.state, None);
+        self.state.lock = Some(server::PromptView::new("Schermo bloccato", &format!("Password di {}", lock::user())));
+        self.state.pointer_dirty = true;
+        self.state.needs_redraw = true;
+    }
+
+    /// Keys while the lock screen or a prompt has the keyboard. VT switches
+    /// still work.
+    fn prompt_key(&mut self, keycode: u32, pressed: bool) {
+        if !pressed {
+            self.swallowed.retain(|k| *k != keycode);
+            return;
+        }
+        let active = self.state.keyboard.bind_mods();
+        let sym = self.state.keyboard.base_sym(keycode);
+        if let Some(Action::SwitchVt(vt)) = self.binds.iter().find(|b| b.mods == active && Some(b.key) == sym).map(|b| b.action) {
+            if let Backend::Drm(d) = &mut self.backend {
+                d.switch_vt(vt);
+            }
+            return;
+        }
+        let sym = self.state.keyboard.sym(keycode);
+        let text = self.state.keyboard.text(keycode);
+        let locked = self.state.lock.is_some();
+        let view = if locked { self.state.lock.as_mut() } else { self.state.prompt.as_mut() };
+        let Some(view) = view else { return };
+        if !locked && sym == 0xff1b {
+            self.prompt_done(None);
+            return;
+        }
+        if view.key(sym, text) {
+            let password = view.take();
+            match locked {
+                true => self.unlock = Some(password),
+                false => self.prompt_done(Some(password)),
+            }
+        }
+        self.state.needs_redraw = true;
+    }
+
+    /// The prompt over the desktop was answered (None: cancelled).
+    fn prompt_done(&mut self, password: Option<String>) {
+        let _ = password;
+        self.state.drop_prompt(false);
+        workspaces::refocus(&mut self.state);
+    }
+
+    fn unlocked(&mut self, ok: bool) {
+        match ok {
+            true => {
+                log!("unlocked");
+                self.state.drop_prompt(true);
+                workspaces::refocus(&mut self.state);
+                self.state.relayout();
+            }
+            false => {
+                if let Some(l) = &mut self.state.lock {
+                    l.failed("Password errata");
+                }
+                self.state.needs_redraw = true;
+            }
+        }
+    }
+
+    /// Draws the cards of the lock screen and of the prompt when they changed.
+    fn prompt_cards(&mut self) {
+        let dirty = [&self.state.lock, &self.state.prompt].iter().any(|p| p.as_ref().is_some_and(|p| p.dirty));
+        if !dirty {
+            return;
+        }
+        if self.cards.is_none() {
+            self.cards = launcher::card::Cards::new().inspect_err(|e| log!("{e}")).ok();
+        }
+        let Some(cards) = &self.cards else { return };
+        for p in [&mut self.state.lock, &mut self.state.prompt].into_iter().flatten() {
+            if !p.dirty {
+                continue;
+            }
+            p.dirty = false;
+            if p.title.is_empty() {
+                // Restored by a live upgrade: only the state came along.
+                p.title = "Schermo bloccato".into();
+                p.message = format!("Password di {}", lock::user());
+            }
+            let status = if p.busy { "Verifica…" } else { p.error.as_str() };
+            p.card = Some(cards.prompt(&p.title, &p.message, p.typed.chars().count(), status));
+        }
     }
 
     fn audio_key(&mut self, key: bar::AudioKey) {
@@ -712,6 +832,7 @@ impl App {
             ipc::Command::Screenshot(_) => {}
             ipc::Command::Cast(window) => return self.cast_now(window),
             ipc::Command::CastStop(id) => self.casts.stop(id),
+            ipc::Command::Lock => self.lock(),
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -975,6 +1096,12 @@ impl App {
                 return;
             }
         }
+        if self.state.lock.is_some() || self.state.prompt.is_some() {
+            if let Event::Key(k, p) = e {
+                self.key(k, p);
+            }
+            return;
+        }
         if self.state.shot.is_some() {
             self.shot_event(e);
             return;
@@ -1044,6 +1171,12 @@ impl App {
             }
             // Handled in the event loop, which has the renderer.
             Event::Lid(_) => {}
+            Event::Lock => self.lock(),
+            Event::Sleep(true) => {
+                self.lock();
+                self.sleep_after_frame = true;
+            }
+            Event::Sleep(false) => self.take_sleep_inhibitor(),
         }
     }
 }
@@ -1091,6 +1224,9 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         shots: Vec::new(),
         osd_timer: event_loop::timer_fd().expect("timerfd"),
         ddc: None,
+        unlock: None,
+        sleep_inhibitor: None,
+        sleep_after_frame: false,
     }
 }
 
@@ -1257,6 +1393,7 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
     }
     app.watch_xwayland(&ep)?;
+    app.take_sleep_inhibitor();
     if let Some(fd) = app.portal.bus_fd() {
         ep.add(fd, TOKEN_PORTAL)?;
     }
@@ -1319,7 +1456,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 6;
+const BLOB_FORMAT: u32 = 7;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -1535,6 +1672,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                                 app.clipboard_dirty = true;
                             }
                             Ok(worker::Done::Saved) => {}
+                            Ok(worker::Done::Unlock(ok)) => app.unlocked(ok),
                             Ok(worker::Done::Screenshot { request, path, png }) => match request {
                                 0 => {
                                     match &path {
@@ -1691,6 +1829,10 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         if let Some((request, interactive)) = app.shot_request.take() {
             app.take_screenshot(renderer, request, interactive);
         }
+        if let Some(password) = app.unlock.take() {
+            worker.run(move || Ok(worker::Done::Unlock(lock::authenticate(password))));
+        }
+        app.prompt_cards();
         if let Some(pct) = app.ddc.take() {
             worker.run(move || {
                 brightness::set_external(pct);
@@ -1719,6 +1861,9 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         }
         app.update_bar();
         app.render(renderer)?;
+        if std::mem::take(&mut app.sleep_after_frame) {
+            app.sleep_inhibitor = None;
+        }
         if let Backend::Nested(n) = &mut app.backend {
             n.flush()?;
         }

@@ -24,6 +24,10 @@ pub enum Event {
     KeyboardLeave,
     /// true when the lid closes.
     Lid(bool),
+    /// logind asks to lock the session.
+    Lock,
+    /// About to suspend (true), or resumed.
+    Sleep(bool),
 }
 
 pub struct Saved {
@@ -290,6 +294,8 @@ impl Drm {
                         self.logind.pause_complete(major, minor);
                     }
                 }
+                logind::Event::Lock => out.push(Event::Lock),
+                logind::Event::Sleep(s) => out.push(Event::Sleep(s)),
                 logind::Event::Resume { major, minor } => {
                     if (major, minor) == self.card {
                         log!("session resumed");

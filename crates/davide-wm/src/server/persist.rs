@@ -359,6 +359,8 @@ impl State {
             notices: _,
             osd: _,
             shot: _,
+            lock,
+            prompt: _,
             drag: _,
             dropped: _,
             hide_cursor: _,
@@ -399,6 +401,7 @@ impl State {
         if let Some(t) = wallpaper {
             save_texture(t, e, r);
         }
+        lock.is_some().save(e);
         (*xwayland, xwayland_serials.clone()).save(e);
         xwm.save(e);
         serial.save(e);
@@ -432,6 +435,9 @@ impl State {
         s.bar.visible = Persist::load(d)?;
         if bool::load(d)? {
             s.wallpaper = Some(load_texture(d, r, true)?);
+        }
+        if bool::load(d)? {
+            s.lock = Some(PromptView::default());
         }
         (s.xwayland, s.xwayland_serials) = Persist::load(d)?;
         s.xwm = Persist::load(d)?;

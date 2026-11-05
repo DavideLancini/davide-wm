@@ -19,6 +19,10 @@ pub enum Event {
     Pause { major: u32, minor: u32, kind: String },
     /// The fd logind passes along is the one we already hold; it is dropped.
     Resume { major: u32, minor: u32 },
+    /// `loginctl lock-session`.
+    Lock,
+    /// The system is about to sleep (true) or woke up (false).
+    Sleep(bool),
 }
 
 pub struct Logind {
@@ -63,6 +67,7 @@ impl Logind {
         }
         let rule = format!("type='signal',sender='{DEST}',path='{}'", l.session);
         l.bus.add_match(&rule).map_err(err)?;
+        l.bus.add_match(&format!("type='signal',sender='{DEST}',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'")).map_err(err)?;
         l.session_call("TakeControl", vec![Value::Bool(false)])?;
         Ok(l)
     }
@@ -114,6 +119,10 @@ impl Logind {
                 let (Some(major), Some(minor)) = (m.body.first().and_then(Value::as_u32), m.body.get(1).and_then(Value::as_u32)) else { continue };
                 let kind = m.body.get(2).and_then(Value::as_str).unwrap_or("").to_string();
                 out.push(Event::Pause { major, minor, kind });
+            } else if m.is_signal(SESSION_IFACE, "Lock") {
+                out.push(Event::Lock);
+            } else if m.is_signal("org.freedesktop.login1.Manager", "PrepareForSleep") {
+                out.push(Event::Sleep(m.body.first().and_then(Value::as_bool).unwrap_or(false)));
             } else if m.is_signal(SESSION_IFACE, "ResumeDevice") {
                 let (Some(major), Some(minor)) = (m.body.first().and_then(Value::as_u32), m.body.get(1).and_then(Value::as_u32)) else { continue };
                 drop(m.take_fd(2));
@@ -127,8 +136,14 @@ impl Logind {
 /// Takes a logind inhibitor lock ("block" mode) on its own bus connection,
 /// so it works nested too; dropping the fd releases it.
 pub fn inhibit(what: &str, why: &str) -> io::Result<OwnedFd> {
+    inhibit_mode(what, why, "block")
+}
+
+/// `mode` "delay": the action waits until the fd is closed (or logind's
+/// delay timeout passes).
+pub fn inhibit_mode(what: &str, why: &str, mode: &str) -> io::Result<OwnedFd> {
     let mut bus = Bus::system().map_err(err)?;
-    let args = [what, "davide-wm", why, "block"].map(|s| Value::Str(s.into())).to_vec();
+    let args = [what, "davide-wm", why, mode].map(|s| Value::Str(s.into())).to_vec();
     let mut reply = bus.call(Message::call(DEST, "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "Inhibit", args), TIMEOUT).map_err(err)?;
     reply.take_fd(0).ok_or_else(|| io::Error::other("Inhibit returned no fd"))
 }
