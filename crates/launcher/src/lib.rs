@@ -10,6 +10,8 @@
 
 mod apps;
 mod calc;
+mod emoji;
+mod units;
 pub mod card;
 mod draw;
 mod settings;
@@ -26,6 +28,14 @@ pub enum Outcome {
     Pick(usize),
     /// Picker: delete this item; it is already gone from the list.
     Delete(usize),
+    /// Close and put this text on the clipboard.
+    Copy(String),
+}
+
+/// A row of a special mode and what Enter does with it.
+enum Action {
+    Launch(String),
+    Copy(String),
 }
 
 pub mod keys {
@@ -48,6 +58,21 @@ pub struct Launcher {
     query: String,
     filtered: Vec<usize>,
     selected: usize,
+    /// Rows of the special modes ("=", ">", ":", "/").
+    special: Vec<(String, Action)>,
+}
+
+/// Files under the home whose name contains `needle`, from plocate's index.
+fn files(needle: &str) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let out = std::process::Command::new("plocate").args(["-i", "-b", "-l", "200", "--", needle]).stderr(std::process::Stdio::null()).output();
+    let Ok(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|p| p.starts_with(&home) && !p[home.len()..].split('/').any(|c| c.starts_with('.')))
+        .take(50)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Quotes a string for `sh`.
@@ -61,13 +86,13 @@ impl Launcher {
     pub fn open() -> Result<Launcher, String> {
         let apps = apps::scan();
         let labels = apps.iter().map(|a| a.name.clone()).collect();
-        Ok(Launcher { font: draw::load_font()?, apps, labels, picks: None, query: String::new(), filtered: Vec::new(), selected: 0 }.filtered())
+        Ok(Launcher { font: draw::load_font()?, apps, labels, picks: None, query: String::new(), filtered: Vec::new(), selected: 0, special: Vec::new() }.filtered())
     }
 
     /// A picker over `items`, filtered as you type; Enter picks, Delete removes.
     pub fn picker(items: Vec<String>) -> Result<Launcher, String> {
         let picks = Some((0..items.len()).collect());
-        Ok(Launcher { font: draw::load_font()?, apps: Vec::new(), labels: items, picks, query: String::new(), filtered: Vec::new(), selected: 0 }.filtered())
+        Ok(Launcher { font: draw::load_font()?, apps: Vec::new(), labels: items, picks, query: String::new(), filtered: Vec::new(), selected: 0, special: Vec::new() }.filtered())
     }
 
     fn filtered(mut self) -> Launcher {
@@ -75,15 +100,45 @@ impl Launcher {
         self
     }
 
-    /// A query starting with "=" is a calculation: nothing to filter or launch.
-    fn is_calc_mode(&self) -> bool {
-        self.picks.is_none() && self.query.starts_with('=')
+    /// "=" calculates or converts, ">" runs a command, ":" finds an emoji,
+    /// "/" finds a file (through plocate) under the home.
+    fn is_special(&self) -> bool {
+        self.picks.is_none() && self.query.starts_with(['=', '>', ':', '/'])
+    }
+
+    fn special_rows(&self) -> Vec<(String, Action)> {
+        let (mode, rest) = self.query.split_at(1);
+        let rest = rest.trim();
+        match mode {
+            "=" => {
+                let result = match units::convert(rest) {
+                    Some((v, unit)) => Some(format!("{} {unit}", calc::format_result(v))),
+                    None => calc::eval(rest).ok().map(calc::format_result),
+                };
+                match result {
+                    Some(r) => vec![(format!("{r}   (Invio copia)"), Action::Copy(r))],
+                    None => vec![("errore".into(), Action::Copy(String::new()))],
+                }
+            }
+            ">" if !rest.is_empty() => vec![(format!("Esegui: {rest}"), Action::Launch(rest.to_string()))],
+            ":" => {
+                let needle = rest.to_lowercase();
+                emoji::EMOJI
+                    .iter()
+                    .filter(|(_, names)| needle.split_whitespace().all(|w| names.contains(w)))
+                    .map(|(e, names)| (names.to_string(), Action::Copy(e.to_string())))
+                    .collect()
+            }
+            "/" if rest.chars().count() >= 3 => files(rest).into_iter().map(|p| (p.clone(), Action::Launch(format!("xdg-open {}", quote(&p))))).collect(),
+            _ => Vec::new(),
+        }
     }
 
     fn refresh_filter(&mut self) {
         self.selected = 0;
-        if self.is_calc_mode() {
-            self.filtered.clear();
+        if self.is_special() {
+            self.special = self.special_rows();
+            self.filtered = (0..self.special.len()).collect();
             return;
         }
         let needle = self.query.to_lowercase();
@@ -122,8 +177,12 @@ impl Launcher {
         match keysym {
             keys::ESCAPE => Outcome::Close,
             keys::RETURN | keys::KP_ENTER => {
-                if self.is_calc_mode() {
-                    return Outcome::Nothing;
+                if self.is_special() {
+                    return match self.filtered.get(self.selected).and_then(|i| self.special.get(*i)).map(|(_, a)| a) {
+                        Some(Action::Launch(cmd)) => Outcome::Launch(cmd.clone()),
+                        Some(Action::Copy(text)) if !text.is_empty() => Outcome::Copy(text.clone()),
+                        _ => Outcome::Nothing,
+                    };
                 }
                 if let Some(picks) = &self.picks {
                     return self.filtered.get(self.selected).map_or(Outcome::Nothing, |i| Outcome::Pick(picks[*i]));
@@ -173,23 +232,20 @@ impl Launcher {
         let (w, h) = (settings::WINDOW_WIDTH, settings::WINDOW_HEIGHT);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let area = draw::Box2D { x: 0, y: 0, w, h };
-        if self.is_calc_mode() {
-            let label = match calc::eval(&self.query[1..]) {
-                Ok(v) => calc::format_result(v),
-                Err(_) => "error".to_string(),
-            };
-            let rows = [draw::ResultRow { label: &label, selected: false }];
-            draw::draw_window(&mut buf, w, h, &area, &self.font, &self.query, &rows);
-            return buf;
-        }
         let offset = self.scroll_offset();
+        let label = |idx: usize| -> &str {
+            match self.is_special() {
+                true => &self.special[idx].0,
+                false => &self.labels[idx],
+            }
+        };
         let rows: Vec<draw::ResultRow> = self
             .filtered
             .iter()
             .skip(offset)
             .take(settings::VISIBLE_RESULTS as usize)
             .enumerate()
-            .map(|(i, &idx)| draw::ResultRow { label: &self.labels[idx], selected: offset + i == self.selected })
+            .map(|(i, &idx)| draw::ResultRow { label: label(idx), selected: offset + i == self.selected })
             .collect();
         draw::draw_window(&mut buf, w, h, &area, &self.font, &self.query, &rows);
         buf
@@ -206,8 +262,18 @@ mod tests {
         for c in "=2*(3+4)".chars() {
             l.key(0, Some(c));
         }
-        assert!(matches!(l.key(keys::RETURN, None), Outcome::Nothing));
+        assert!(matches!(l.key(keys::RETURN, None), Outcome::Copy(r) if r == "14"));
         assert_eq!(l.render().len(), (WIDTH * HEIGHT * 4) as usize);
+        let mut e = Launcher::open().unwrap();
+        for c in ":pizza".chars() {
+            e.key(0, Some(c));
+        }
+        assert!(matches!(e.key(keys::RETURN, None), Outcome::Copy(r) if r == "🍕"));
+        let mut x = Launcher::open().unwrap();
+        for c in ">echo ciao".chars() {
+            x.key(0, Some(c));
+        }
+        assert!(matches!(x.key(keys::RETURN, None), Outcome::Launch(c) if c == "echo ciao"));
         assert_eq!(quote("it's"), r"'it'\''s'");
     }
 

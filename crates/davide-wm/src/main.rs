@@ -302,6 +302,12 @@ impl App {
                         self.state.close_launcher();
                         self.spawn(&cmd);
                     }
+                    launcher::Outcome::Copy(text) => {
+                        self.state.close_launcher();
+                        selection::set_server(&mut self.state, clipboard::Clip { mime: "text/plain;charset=utf-8".into(), data: text.into_bytes() });
+                        self.clipboard_dirty = true;
+                        self.show_osd("Copiato negli appunti", None);
+                    }
                     launcher::Outcome::Pick(i) => {
                         let purpose = view.purpose.clone();
                         self.state.close_launcher();
