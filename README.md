@@ -38,14 +38,14 @@
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
 > Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
-> Status: **M7 done** (tested nested; still to test on the TTY: external monitors, notification popups, Xwayland, screen sharing through the real portal) — screen casting through PipeWire, portal backend and screenshot taker, after Xwayland (M6), clipboard history and notifications (M5), monitors (M4), launcher (M3) and bar (M2). Next: switch-over.
+> Status: **daily driver since 2026-11-05** — the default session on tty1 (Hyprland still installed as a fallback); M0–M7 done, plus the session services (lock screen, polkit and Wi-Fi agents, volume/brightness keys). Being tested in daily use: see the test log and the backlog in sec. 11.
 
 | Field | Value |
 |---|---|
-| Doc version | 0.14 |
+| Doc version | 0.15 |
 | Last updated | 2026-11-05 |
 | Owner | Davide Lancini |
-| Project status | development |
+| Project status | in daily use (switch-over in progress) |
 | Repo | https://github.com/DavideLancini/davide-wm |
 
 ---
@@ -198,8 +198,8 @@
     - *Volume and brightness:* the keys change the volume through the bar's PulseAudio connection and the brightness of every panel (sysfs, DDC/CI for external monitors, absorbing dawn's `brightness`), with a level box at the bottom of the screen. No more `pactl` or `brightness` processes.
     - *Bar helpers:* the CPU widget cycles power levels from the compositor (dawn's `cpu-cycle`/`cpu-levels`; the privileged writes still go through `sudo -n` to `cpu-freq-set`, `ryzen-tdp-set` and the Huawei WMI interface), the Bluetooth battery is read over D-Bus and RFCOMM inside the bar (dawn's `bt-headphones-battery`), the timer is native (durations picked in the launcher box, end kept in `$XDG_STATE_HOME/davide-wm/timer`, a notification when it runs out), the backlight and screenshot widgets go through the compositor. Agents run on the DRM backend, or nested with `DAVIDE_WM_AGENTS=1`. Blob format 7.
   - **First days on davide-wm (2026-11-05):** moving a window (Main+Shift+arrow) works like Hyprland's dwindle `movewindow`: the window leaves its place and splits its neighbour's (no more swaps), and the pointer goes to the centre of the moved or newly focused window so focus-follows-mouse does not snap back. The clipboard history keeps 1000 entries and `davide-wm msg clipboard-import <file>` appends another history file below ours (used once to bring over cliphist's 750 entries).
-  - **Switch-over:** install the portal files from `dist/`; remove Hyprland, xdg-desktop-portal-hyprland/-wlr, wf-recorder, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
-  - **Afterwards:** keep migrating the remaining `dawn` crates and helper scripts the bar calls (`cpu-cycle`, `brightness`, `set-timer.sh`, `bt-headphones-battery`, ...).
+  - **Switch-over (started 2026-11-05):** *done:* `~/.bash_profile` starts `davide-wm --session` on tty1 (the old line is kept in `~/.bash_profile.bak-hyprland`; `start-hyprland` still works from another tty), `dist/davide-wm-session.target` installed, `topbar.service` and `nwg-notifications.service` limited to Hyprland sessions by a `ConditionEnvironment=XDG_CURRENT_DESKTOP=Hyprland` drop-in, portal files installed, cliphist's history imported; the first live upgrade on DRM worked. *Still to do, after some days without problems:* remove Hyprland, xdg-desktop-portal-hyprland/-wlr, wf-recorder, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
+  - **Afterwards:** keep migrating the remaining `dawn` crates that touch the desktop (`cast`, see the backlog).
 
 ---
 
@@ -450,13 +450,53 @@ davide-wm/
 | GPU/driver edge cases (dmabuf modifiers, atomic commit failures, hotplug) | Black screen, frozen outputs | Test hotplug with MSI and TV early (M1); keep a fallback modeset path. |
 | libpipewire FFI | Unsafe code, one more C dependency; struct layouts and SPA ids copied from the 1.6 headers | Isolated in `crates/pipewire` (about 300 lines); checked with a test source read by GStreamer; reconsider a native implementation later. |
 | Ported code inherits topbar debt: hand-written JSON/text parsers, compiled-in Spotify credentials, hard-coded machine paths (`BAT0`, `amdgpu_bl1`, `~/7Scripts`), a second D-Bus client in `crates/bar/src/dbus.rs` | Fragility, secrets in the binary, duplicated code | The bar's D-Bus client lost its monitor and notification code in M5 but still serves UPower, BlueZ and MPRIS; port those widgets to `crates/dbus`; move secrets out of the binary. |
-| Some current behaviour depends on Hyprland specifics (socket2 consumers, `hyprctl` calls in helper scripts) | Regressions after switch-over | `dawn` inventoried in M4 (monitor-manager, blk, lid tools ported); still to check: the helper scripts the bar calls and `cast` (M7). |
-| Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, `persist_struct!` forces every field to be handled, automatic fallback to `davide-wm-prev`. Still missing: round-trip tests on a headless backend, and a test of the DRM path (logind bus, KMS fd, libinput re-open). |
+| Some current behaviour depends on Hyprland specifics (socket2 consumers, `hyprctl` calls in helper scripts) | Regressions after switch-over | `dawn` inventoried in M4 (monitor-manager, blk, lid tools ported) and the bar helpers absorbed; `cast` still records with `wf-recorder` and makes its virtual output with `hyprctl`. |
+| Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, `persist_struct!` forces every field to be handled, automatic fallback to `davide-wm-prev-<pid>`. The DRM path worked on its first real use (2026-11-05). Still missing: round-trip tests on a headless backend. |
 | One huge project, always built together | Long builds, harder refactors | Cargo workspace (ADR-015), clear crate boundaries, live upgrade makes deploying cheap. |
 | Remaining simplifications | Visual glitches with some clients | X windows on hidden workspaces keep their X position (harmless: input follows wl_pointer), no INCR towards X clients. Subsurfaces are always desynchronised, popups have no grabs and resize only by shrinking, full redraw every frame (no damage tracking, cursor drawn by the GPU with the scene), buffer scale 1 only, drag and drop between Wayland clients only (not with X clients), floating windows cannot be moved or resized with the mouse, fullscreen requests before the first commit are ignored. |
 | Open questions | Plan may change | Whether to keep layer-shell for any external client. |
 
 ---
+
+### 11.1 Test log on the TTY (daily use since 2026-11-05)
+
+| # | What | Result |
+|---|------|--------|
+| – | Lock screen with the right password, `pkexec` through the polkit agent, notification popups (several at once), volume/brightness keys with the indicator, Main+Shift+arrow moves, clipboard history with the imported entries, live upgrade | works |
+| 1–3 | Print: region, window, whole output; the image pastes | works |
+| 4 | X11 app (`GDK_BACKEND=x11 zenity`) | works |
+| 5 | Floating dialog (Thunar's "Create New Folder") | works |
+| 6 | Drag and drop between two Thunar windows | works |
+| 7 | Screen sharing from Chromium / Meet through the portal | to test |
+| 8 | CPU widget: next level and notification | works |
+| 9 | Timer widget: countdown and notification at the end | started, result pending |
+| 10 | Network widget and Main+W: Wi-Fi list | works |
+| 11 | Backlight widget | works |
+| 12 | Screensaver widget: the cycle works; the screen actually blanking (laptop and external monitors) | partly tested |
+| 13 | blk widget | works |
+| 14 | Lid widget | works |
+| 15 | Closing the lid without the inhibitor: suspend, locked on resume | to test |
+| 16 | MSI monitor alone, panel back when unplugged | to test |
+| 17 | Other external monitor mirroring the panel | to test |
+| 18 | New Wi-Fi network: password asked by the secret agent | to test |
+| 19 | Bluetooth headphone battery in the bar | to test |
+| 20 | `tools/measure.py davide-wm 60` against Hyprland's ~352 MiB PSS and ~5 % CPU (13 processes, measured 2026-11-05 while in use) | to measure |
+
+### 11.2 Backlog
+
+| Item | Kind | Notes |
+|------|------|-------|
+| Screenshot folder | decision | `config::SCREENSHOT_DIR` is `~/Screenshots`; to be moved, folder not chosen yet. |
+| Smaller screenshots | improvement | Fixed-Huffman deflate makes a photo-heavy full screen about 10 MB (a good encoder: about 3 MB): add dynamic Huffman blocks and a PNG row filter. |
+| Night light | feature, deferred | Warmer colours in the evening through the CRTC gamma LUT. |
+| Move and resize floating windows with Main+drag | feature, deferred | |
+| `cast` (Miracast) | migration | Take frames from `davide-wm msg cast` instead of `wf-recorder`; its virtual output needs a headless output with its own workspaces. |
+| Hardware cursor | performance | Cursor plane, so pointer motion does not redraw the scene; DRM only, to test on the TTY. |
+| Damage tracking | performance | Redraw only what changed (buffer age); decide after the measurement (test 20). |
+| Spotify credentials in the binary | debt | Move them out (file under `$XDG_CONFIG_HOME`). |
+| Second D-Bus client in the bar | debt | UPower, BlueZ and MPRIS widgets to port to `crates/dbus`. |
+| X11 gaps | debt | Drag and drop with X clients; Wayland selections over 256 KiB towards X clients (INCR). |
+| Remove Hyprland and the absorbed tools | switch-over | Hyprland, xdg-desktop-portal-hyprland/-wlr, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, wf-recorder, nm-applet; archive `topbar`, `super` and the absorbed parts of `dawn`. After some days without problems. |
 
 ## 12. Glossary
 *Domain and technical terms specific to the project. Removes ambiguity for everyone (the AI included).*
