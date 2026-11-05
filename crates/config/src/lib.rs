@@ -215,7 +215,7 @@ pub const BLANK_GRACE_MS: u64 = 700;
 /// Programs started once with `--session`, to make the session known
 /// to systemd and D-Bus activated services.
 pub const SESSION_AUTOSTART: &[&str] = &[
-    "dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DAVIDE_WM_SOCKET XDG_SESSION_TYPE && systemctl --user start davide-wm-session.target",
+    "dbus-update-activation-environment --systemd WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP DAVIDE_WM_SOCKET XDG_SESSION_TYPE && systemctl --user start davide-wm-session.target",
 ];
 
 /// DRM render node used by the nested backend.

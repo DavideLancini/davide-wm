@@ -1,11 +1,17 @@
 //! linux-dmabuf: GPU buffers from clients, imported at render time.
 
+use std::os::fd::OwnedFd;
+
 use render::Plane;
 use wire::*;
 
 use super::*;
 
-pub fn send_formats(s: &mut State, c: ClientId, id: u32) {
+/// Formats and modifiers for clients of version 3 and older.
+pub fn send_formats(s: &mut State, c: ClientId, id: u32, version: u32) {
+    if version >= 4 {
+        return;
+    }
     let formats = s.dmabuf_formats.clone();
     let mut sent = Vec::new();
     for (f, m) in formats {
@@ -17,9 +23,51 @@ pub fn send_formats(s: &mut State, c: ClientId, id: u32) {
     }
 }
 
+/// The table of (format, modifier) pairs that feedback refers to by index.
+fn format_table(formats: &[(u32, u64)]) -> std::io::Result<OwnedFd> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::memfd_create(c"dmabuf-formats".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let bytes: Vec<u8> = formats.iter().flat_map(|(fmt, m)| [fmt.to_ne_bytes().as_slice(), &[0; 4], &m.to_ne_bytes()].concat()).collect();
+    f.write_all(&bytes)?;
+    Ok(OwnedFd::from(f))
+}
+
+/// Feedback (version 4): one tranche with every format, on our render node.
+fn send_feedback(s: &mut State, c: ClientId, id: u32) {
+    let formats = s.dmabuf_formats.clone();
+    let table = match format_table(&formats) {
+        Ok(t) => t,
+        Err(e) => {
+            log!("dmabuf format table: {e}");
+            return;
+        }
+    };
+    let device = s.dmabuf_device.to_ne_bytes();
+    let indices: Vec<u8> = (0..formats.len() as u16).flat_map(|i| i.to_ne_bytes()).collect();
+    use zwp_linux_dmabuf_feedback_v1::evt;
+    s.send(c, Msg::new(id, evt::FORMAT_TABLE).fd(table).uint(formats.len() as u32 * 16));
+    s.send(c, Msg::new(id, evt::MAIN_DEVICE).array(&device));
+    s.send(c, Msg::new(id, evt::TRANCHE_TARGET_DEVICE).array(&device));
+    s.send(c, Msg::new(id, evt::TRANCHE_FORMATS).array(&indices));
+    s.send(c, Msg::new(id, evt::TRANCHE_FLAGS).uint(0));
+    s.send(c, Msg::new(id, evt::TRANCHE_DONE));
+    s.send(c, Msg::new(id, evt::DONE));
+}
+
 pub fn request(s: &mut State, c: ClientId, id: u32, kind: Kind, version: u32, op: u16, mut args: Args) {
     let key = SKey { client: c, id };
     match (kind, op) {
+        (Kind::Dmabuf, zwp_linux_dmabuf_v1::req::GET_DEFAULT_FEEDBACK | zwp_linux_dmabuf_v1::req::GET_SURFACE_FEEDBACK) => {
+            let fid = args.obj(0);
+            if s.new_object(c, fid, &zwp_linux_dmabuf_feedback_v1::INTERFACE, version, Kind::DmabufFeedback) {
+                send_feedback(s, c, fid);
+            }
+        }
         (Kind::Dmabuf, zwp_linux_dmabuf_v1::req::CREATE_PARAMS) => {
             let pid = args.obj(0);
             if s.new_object(c, pid, &zwp_linux_buffer_params_v1::INTERFACE, version, Kind::DmabufParams) {

@@ -12,6 +12,7 @@ pub mod seat;
 pub mod selection;
 pub mod workspaces;
 mod xdg;
+pub mod xwm;
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
@@ -79,6 +80,9 @@ pub enum Kind {
     IdleInhibitor { surface: u32 },
     Dmabuf,
     DmabufParams,
+    DmabufFeedback,
+    XwaylandShell,
+    XwaylandSurface { surface: u32 },
 }
 
 pub struct Object {
@@ -114,6 +118,8 @@ pub enum Role {
     /// `sync`: state is applied when the parent commits (the default).
     Subsurface { parent: u32, x: i32, y: i32, sync: bool },
     Xdg,
+    /// Paired by Xwayland with an X window.
+    Xwayland,
 }
 
 pub enum XdgRole {
@@ -270,6 +276,8 @@ pub struct State {
     pub buffers: HashMap<SKey, Buffer>,
     pub dmabuf_params: HashMap<SKey, DmabufParams>,
     pub dmabuf_formats: Vec<(u32, u64)>,
+    /// The render node clients should allocate on (a dev_t).
+    pub dmabuf_device: u64,
     pub positioners: HashMap<SKey, Positioner>,
     pub output: Output,
     pub workspaces: HashMap<WsId, Workspace<SKey>>,
@@ -294,6 +302,11 @@ pub struct State {
     pub launcher: Option<LauncherView>,
     /// Notification popups, top to bottom.
     pub notices: Vec<NoticeView>,
+    /// The client that is Xwayland: only it may bind `xwayland_shell_v1`.
+    pub xwayland: Option<ClientId>,
+    /// Serials announced for Xwayland surfaces not paired yet.
+    pub xwayland_serials: HashMap<u32, u64>,
+    pub xwm: Option<xwm::Xwm>,
     serial: u32,
     start: Instant,
     pub needs_redraw: bool,
@@ -313,6 +326,7 @@ impl State {
             buffers: HashMap::new(),
             dmabuf_params: HashMap::new(),
             dmabuf_formats,
+            dmabuf_device: 0,
             positioners: HashMap::new(),
             output,
             workspaces: HashMap::new(),
@@ -333,6 +347,9 @@ impl State {
             bar: BarSurface { visible: true, ..Default::default() },
             launcher: None,
             notices: Vec::new(),
+            xwayland: None,
+            xwayland_serials: HashMap::new(),
+            xwm: None,
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
@@ -353,7 +370,8 @@ impl State {
             (&wire::xdg_activation_v1::INTERFACE, 1),
             (&wire::xdg_system_bell_v1::INTERFACE, 1),
             (&wire::zwp_idle_inhibit_manager_v1::INTERFACE, 1),
-            (&wire::zwp_linux_dmabuf_v1::INTERFACE, 3),
+            (&wire::zwp_linux_dmabuf_v1::INTERFACE, 4),
+            (&wire::xwayland_shell_v1::INTERFACE, 1),
         ] {
             let name = s.globals.len() as u32 + 1;
             s.globals.push(Global { name, iface, version: version.min(iface.version) });
@@ -529,7 +547,8 @@ impl State {
             Kind::Activation | Kind::ActivationToken | Kind::Bell | Kind::IdleInhibitManager | Kind::IdleInhibitor { .. } => {
                 misc::request(self, c, id, kind, version, op, args)
             }
-            Kind::Dmabuf | Kind::DmabufParams => dmabuf::request(self, c, id, kind, version, op, args),
+            Kind::Dmabuf | Kind::DmabufParams | Kind::DmabufFeedback => dmabuf::request(self, c, id, kind, version, op, args),
+            Kind::XwaylandShell | Kind::XwaylandSurface { .. } => xwm::request(self, c, id, kind, version, op, args),
             Kind::Callback | Kind::Region | Kind::Keyboard | Kind::Touch | Kind::Output => {}
         }
     }
@@ -562,6 +581,12 @@ impl State {
     }
 
     pub fn remove_client(&mut self, client: ClientId) {
+        if self.xwayland == Some(client) {
+            log!("Xwayland disconnected");
+            xwm::stop(self);
+            self.xwayland = None;
+            self.xwayland_serials.clear();
+        }
         if let Some(mut c) = self.clients.remove(&client) {
             let _ = c.conn.flush();
         }
@@ -594,6 +619,7 @@ impl State {
 
     pub fn destroy_surface(&mut self, key: SKey) {
         xdg::unmap(self, key);
+        xwm::surface_gone(self, key);
         let Some(s) = self.surfaces.remove(&key) else { return };
         if let Content::Shm(t) = s.content {
             self.dead_textures.push(t);
@@ -682,6 +708,7 @@ impl State {
 
     /// Asks a toplevel to close.
     pub fn close_window(&mut self, key: SKey) {
+        xwm::close(self, key);
         if let Some(XdgRole::Toplevel { obj, .. }) = self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
             let obj = *obj;
             self.send(key.client, Msg::new(obj, wire::xdg_toplevel::evt::CLOSE));
@@ -689,10 +716,28 @@ impl State {
     }
 
     pub fn app_id(&self, key: SKey) -> &str {
+        if let Some(w) = xwm::window(self, key) {
+            return &w.class;
+        }
         match self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
             Some(XdgRole::Toplevel { app_id, .. }) => app_id,
             _ => "",
         }
+    }
+
+    pub fn title(&self, key: SKey) -> &str {
+        if let Some(w) = xwm::window(self, key) {
+            return &w.title;
+        }
+        match self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
+            Some(XdgRole::Toplevel { title, .. }) => title,
+            _ => "",
+        }
+    }
+
+    /// A window that is on screen (as far as its role is concerned).
+    pub fn shown(&self, key: SKey) -> bool {
+        self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).is_some_and(|x| x.mapped) || xwm::window(self, key).is_some_and(|w| w.shown)
     }
 
     pub fn rule(&self, key: SKey) -> Option<&'static config::Rule> {
@@ -753,10 +798,7 @@ impl State {
             .window_ws
             .iter()
             .map(|(k, w)| {
-                let title = match self.surfaces.get(k).and_then(|s| s.xdg.as_ref()).map(|x| &x.role) {
-                    Some(XdgRole::Toplevel { title, .. }) => title.clone(),
-                    _ => String::new(),
-                };
+                let title = self.title(*k).to_string();
                 let focus_age = if self.focus == Some(*k) { 0 } else { 1 };
                 bar::Client { app_id: self.app_id(*k).to_string(), title, workspace: id(*w), focus_age }
             })
@@ -799,6 +841,7 @@ impl State {
         self.layout = layout;
         for (key, rect) in self.layout.clone() {
             xdg::configure_toplevel(self, key, rect.w, rect.h);
+            xwm::configure(self, key, rect);
         }
         self.needs_redraw = true;
         self.pointer_dirty = true;
@@ -852,7 +895,7 @@ impl State {
             if i == self.special_start {
                 r.fill(Quad { x: 0.0, y: 0.0, w: self.output.width as f32, h: self.output.height as f32 }, config::SPECIAL_DIM);
             }
-            if !self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).is_some_and(|x| x.mapped) {
+            if !self.shown(key) {
                 continue;
             }
             r.clip(Some(Quad { x: rect.x as f32, y: rect.y as f32, w: rect.w as f32, h: rect.h as f32 }));
@@ -865,6 +908,9 @@ impl State {
                 let o = self.surface_origin(key, origin);
                 self.draw_tree(r, key, o);
             }
+        }
+        for (key, origin) in xwm::floating(self) {
+            self.draw_tree(r, key, origin);
         }
         for n in &mut self.notices {
             if let Some(px) = n.pixels.take() {

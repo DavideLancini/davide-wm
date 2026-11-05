@@ -71,6 +71,8 @@ pub enum Command {
     Outputs,
     Clipboard,
     Notifications,
+    /// Writes what the primary output shows to a PNG file.
+    Screenshot(String),
     Exit,
 }
 
@@ -123,8 +125,9 @@ fn parse(line: &str) -> Result<Command, String> {
         "outputs" => Ok(Command::Outputs),
         "clipboard" => Ok(Command::Clipboard),
         "notifications" => Ok(Command::Notifications),
+        "screenshot" if !arg.is_empty() => Ok(Command::Screenshot(arg.to_string())),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, exit".into()),
     }
 }
 

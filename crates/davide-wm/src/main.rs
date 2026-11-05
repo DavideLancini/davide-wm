@@ -8,8 +8,10 @@ mod event_loop;
 mod ipc;
 mod keyboard;
 mod notify;
+mod png;
 mod server;
 mod worker;
+mod xwayland;
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -23,7 +25,7 @@ use config::{mods, Action};
 use event_loop::{Epoll, HANGUP, READABLE};
 use backend::{nested::Nested, outputs, Drm, Event};
 use render::{Renderer, Target};
-use server::{clipboard, seat, selection, workspaces, ClientId, Purpose, State};
+use server::{clipboard, seat, selection, workspaces, xwm, ClientId, Purpose, State};
 
 const TOKEN_LISTENER: u64 = 1;
 const TOKEN_HOST: u64 = 2;
@@ -38,6 +40,9 @@ const TOKEN_BAR: u64 = 10;
 const TOKEN_IDLE: u64 = 11;
 const TOKEN_NOTIFY_BUS: u64 = 12;
 const TOKEN_NOTIFY_TIMER: u64 = 13;
+const TOKEN_XWAYLAND_READY: u64 = 14;
+const TOKEN_XWAYLAND_EXIT: u64 = 15;
+const TOKEN_XWM: u64 = 16;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -163,6 +168,7 @@ struct App {
     bar_notifications: Option<usize>,
     /// The clipboard history changed and is not saved yet.
     clipboard_dirty: bool,
+    xwayland: Option<xwayland::Xwayland>,
 }
 
 impl App {
@@ -175,6 +181,10 @@ impl App {
             .env("XDG_CURRENT_DESKTOP", "davide-wm")
             .env_remove("WAYLAND_SOCKET")
             .stdin(Stdio::null());
+        match &self.xwayland {
+            Some(x) => cmd.env("DISPLAY", format!(":{}", x.display)),
+            None => cmd.env_remove("DISPLAY"),
+        };
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
@@ -398,10 +408,7 @@ impl App {
             ipc::Command::Windows => {
                 let mut out = String::new();
                 for (key, ws) in &s.window_ws {
-                    let title = match s.surfaces.get(key).and_then(|sf| sf.xdg.as_ref()).map(|x| &x.role) {
-                        Some(server::XdgRole::Toplevel { title, .. }) => title.as_str(),
-                        _ => "",
-                    };
+                    let title = s.title(*key);
                     let focused = if s.focus == Some(*key) { "*" } else { " " };
                     out += &format!("{focused} {}\t{}\t{}\n", ipc::ws_name(*ws), s.app_id(*key), title);
                 }
@@ -469,6 +476,8 @@ impl App {
                 return self.state.selection.history.entries.iter().enumerate().map(|(i, c)| format!("{i}\t{}\n", clipboard::label(c))).collect();
             }
             ipc::Command::Notifications => return self.notifications_text(),
+            // Handled by the event loop, which has the renderer.
+            ipc::Command::Screenshot(_) => {}
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()
@@ -812,6 +821,100 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         cards: None,
         bar_notifications: None,
         clipboard_dirty: false,
+        xwayland: None,
+    }
+}
+
+impl App {
+    fn start_xwayland(&mut self) {
+        match xwayland::spawn() {
+            Ok(sp) => {
+                let id = self.state.add_client(sp.wayland);
+                self.state.xwayland = Some(id);
+                self.xwayland = Some(sp.xwayland);
+            }
+            Err(e) => log!("cannot start Xwayland: {e}"),
+        }
+    }
+
+    /// Watches Xwayland's fds: its exit, its readiness, the WM connection.
+    fn watch_xwayland(&self, ep: &Epoll) -> io::Result<()> {
+        if let Some(x) = &self.xwayland {
+            ep.add(x.pidfd.as_raw_fd(), TOKEN_XWAYLAND_EXIT)?;
+            if let Some((ready, _)) = &x.pending {
+                ep.add(ready.as_raw_fd(), TOKEN_XWAYLAND_READY)?;
+            }
+        }
+        if let Some(x) = &self.state.xwm {
+            ep.add(x.conn.raw_fd(), TOKEN_XWM)?;
+        }
+        Ok(())
+    }
+
+    fn xwayland_ready(&mut self, ep: &Epoll) -> io::Result<()> {
+        let Some(wm) = self.xwayland.as_mut().and_then(|x| x.ready()) else { return Ok(()) };
+        match xwm::start(&mut self.state, wm) {
+            Ok(()) => {
+                ep.add(self.state.xwm.as_ref().unwrap().conn.raw_fd(), TOKEN_XWM)?;
+                self.xwm_dispatch(ep);
+            }
+            Err(e) => log!("cannot manage Xwayland windows: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Renders the primary output into a fresh buffer and saves it as PNG.
+    fn screenshot(&mut self, path: &str, r: &mut Renderer) -> String {
+        let (w, h) = (self.state.output.width, self.state.output.height);
+        let t = match r.create_target(w, h, 0) {
+            Ok(t) => t,
+            Err(e) => return format!("error: {e}\n"),
+        };
+        self.state.render(r, &t);
+        self.state.needs_redraw = true;
+        let mut px = r.read_target(&t);
+        r.destroy_target(t);
+        for p in px.as_chunks_mut::<4>().0 {
+            p[3] = 255;
+        }
+        match std::fs::write(path, png::encode(w as u32, h as u32, &px)) {
+            Ok(()) => "ok\n".into(),
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn xwm_dispatch(&mut self, ep: &Epoll) {
+        if let Err(e) = xwm::dispatch(&mut self.state) {
+            log!("X connection lost: {e}");
+            self.xwm_stop(ep);
+        }
+    }
+
+    fn xwm_stop(&mut self, ep: &Epoll) {
+        if let Some(x) = &self.state.xwm {
+            ep.delete(x.conn.raw_fd());
+        }
+        xwm::stop(&mut self.state);
+    }
+
+    fn xwayland_exited(&mut self, ep: &Epoll) -> io::Result<()> {
+        let Some(x) = self.xwayland.take() else { return Ok(()) };
+        log!("Xwayland exited");
+        self.xwm_stop(ep);
+        ep.delete(x.pidfd.as_raw_fd());
+        let again = x.lived();
+        drop(x);
+        if again {
+            self.start_xwayland();
+            if let Some(id) = self.state.xwayland {
+                ep.add(self.state.clients[&id].conn.raw_fd(), TOKEN_CLIENT + id as u64)?;
+            }
+            self.watch_xwayland(ep)?;
+            if let Some(x) = &self.xwayland {
+                std::env::set_var("DISPLAY", format!(":{}", x.display));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -829,6 +932,10 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     std::env::set_var(ipc::ENV, &app.ipc.path);
     std::env::set_var("XDG_CURRENT_DESKTOP", "davide-wm");
     std::env::remove_var("WAYLAND_SOCKET");
+    match &app.xwayland {
+        Some(x) => std::env::set_var("DISPLAY", format!(":{}", x.display)),
+        None => std::env::remove_var("DISPLAY"),
+    }
     let bar = bar::Bar::spawn()?;
     app.state.bar.height = bar.height() as i32;
     app.state.relayout();
@@ -858,6 +965,7 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     for (id, fd) in app.state.client_fds() {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
     }
+    app.watch_xwayland(&ep)?;
     if app.state.wallpaper.is_none() && !WALLPAPER.is_empty() {
         worker.run(|| {
             let mut img = jpeg::decode(WALLPAPER).map_err(|e| e.to_string())?;
@@ -892,6 +1000,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
     log!("listening on {}", socket.name);
     let state = State::new(keyboard, output, renderer.dmabuf_formats());
     let mut state = state;
+    state.dmabuf_device = renderer.device();
     state.selection.history = clipboard::History::load();
     let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(None)?, notify::Notifier::start()?);
     if let Backend::Drm(d) = &mut app.backend {
@@ -901,6 +1010,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
         app.state.pointer.y = (app.state.output.height / 2) as f64;
     }
     app.outputs_changed();
+    app.start_xwayland();
     if session {
         for line in config::SESSION_AUTOSTART {
             app.spawn(line);
@@ -914,7 +1024,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 4;
+const BLOB_FORMAT: u32 = 5;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -949,6 +1059,8 @@ fn encode(ctx: Ctx) -> state::Enc {
     std::mem::forget(inhibitor);
     app.notifier.save(&mut e);
     std::mem::forget(app.notifier);
+    app.xwayland.save(&mut e);
+    std::mem::forget(app.xwayland);
     match app.backend {
         Backend::Nested(n) => {
             0u8.save(&mut e);
@@ -984,6 +1096,7 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     let ipc = ipc::Ipc::load(&mut d).map_err(err)?;
     let inhibitor: Option<OwnedFd> = Persist::load(&mut d).map_err(err)?;
     let notifier = notify::Notifier::load(&mut d).map_err(err)?;
+    let xwayland: Option<xwayland::Xwayland> = Persist::load(&mut d).map_err(err)?;
     let (backend, mut renderer) = match u8::load(&mut d).map_err(err)? {
         0 => {
             let n = Nested::restore(Persist::load(&mut d).map_err(err)?)?;
@@ -996,8 +1109,10 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     };
     let keyboard = keyboard::Keyboard::new(config::KEYBOARD_LAYOUT)?;
     let formats = renderer.dmabuf_formats();
-    let state = State::restore(&mut d, keyboard, formats, &mut renderer).map_err(err)?;
+    let mut state = State::restore(&mut d, keyboard, formats, &mut renderer).map_err(err)?;
+    state.dmabuf_device = renderer.device();
     let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(inhibitor)?, notifier);
+    app.xwayland = xwayland;
     app.outputs_changed();
     log!("live upgrade done");
     finish(app, renderer, PathBuf::from(exe))
@@ -1098,6 +1213,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 TOKEN_IPC => {
                     while let Ok((stream, _)) = app.ipc.listener.accept() {
                         let answer = match ipc::read_command(&stream) {
+                            Ok(ipc::Command::Screenshot(path)) => app.screenshot(&path, renderer),
                             Ok(cmd) => app.command(cmd),
                             Err(e) => format!("error: {e}\n"),
                         };
@@ -1117,6 +1233,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                                 app.clipboard_dirty = true;
                             }
                             Ok(worker::Done::Saved) => {}
+                            Ok(worker::Done::XSelection { request, data }) => xwm::selection::answer(&mut app.state, request, data),
                             Ok(worker::Done::LinkCheck { name, failed }) => {
                                 let lit = app.backend.heads().iter().any(|h| h.name == name);
                                 if let (true, true, Backend::Drm(d)) = (failed, lit, &mut app.backend) {
@@ -1149,6 +1266,9 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                         app.sync_notices();
                     }
                 }
+                TOKEN_XWAYLAND_READY => app.xwayland_ready(ep)?,
+                TOKEN_XWAYLAND_EXIT => app.xwayland_exited(ep)?,
+                TOKEN_XWM => app.xwm_dispatch(ep),
                 TOKEN_SIGNAL => {
                     log!("signal received, exiting");
                     app.running = false;
@@ -1214,9 +1334,18 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 Ok(worker::Done::Clip { generation, clip: clipboard::Clip { mime, data } })
             });
         }
+        if let Some(x) = &mut app.state.xwm {
+            for (fd, request) in std::mem::take(&mut x.sel.outgoing) {
+                worker.run(move || Ok(worker::Done::XSelection { request, data: clipboard::capture(fd) }));
+            }
+        }
         if std::mem::take(&mut app.clipboard_dirty) {
             let bytes = app.state.selection.history.encode();
             worker.run(move || clipboard::save(&bytes).map(|_| worker::Done::Saved).map_err(|e| format!("saving the clipboard history: {e}")));
+        }
+        if let Err(e) = xwm::flush(&mut app.state) {
+            log!("X connection lost: {e}");
+            app.xwm_stop(ep);
         }
         app.update_bar();
         app.render(renderer)?;

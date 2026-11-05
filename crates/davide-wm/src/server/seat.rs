@@ -131,7 +131,7 @@ pub fn set_focus(s: &mut State, key: Option<SKey>) {
         return;
     }
     if let Some(cur) = s.focus {
-        let pinned = s.rule(cur).is_some_and(|r| r.stay_focused) && s.surfaces.get(&cur).and_then(|sf| sf.xdg.as_ref()).is_some_and(|x| x.mapped);
+        let pinned = s.rule(cur).is_some_and(|r| r.stay_focused) && s.shown(cur);
         if pinned && key.is_some() {
             return;
         }
@@ -156,6 +156,7 @@ pub fn set_focus(s: &mut State, key: Option<SKey>) {
             selection::focus_changed(s, k.client);
         }
     }
+    xwm::focus(s, key);
     s.relayout();
 }
 
@@ -194,6 +195,11 @@ fn surface_hit(s: &State, key: SKey, (x, y): (i32, i32), px: f64, py: f64) -> Op
 
 /// The surface under a point, with surface-local coordinates.
 pub fn surface_at(s: &State, px: f64, py: f64) -> Option<(SKey, f64, f64)> {
+    for (key, origin) in xwm::floating(s).into_iter().rev() {
+        if let Some(hit) = surface_hit(s, key, origin, px, py) {
+            return Some(hit);
+        }
+    }
     for key in s.popups.iter().rev() {
         if let Some(origin) = s.window_origin(*key) {
             if let Some(hit) = surface_hit(s, *key, s.surface_origin(*key, origin), px, py) {
@@ -202,11 +208,8 @@ pub fn surface_at(s: &State, px: f64, py: f64) -> Option<(SKey, f64, f64)> {
         }
     }
     for (key, rect) in s.layout.iter().rev() {
-        if rect.contains(px, py) {
-            let mapped = s.surfaces.get(key).and_then(|sf| sf.xdg.as_ref()).is_some_and(|x| x.mapped);
-            if mapped {
-                return surface_hit(s, *key, s.surface_origin(*key, (rect.x, rect.y)), px, py);
-            }
+        if rect.contains(px, py) && s.shown(*key) {
+            return surface_hit(s, *key, s.surface_origin(*key, (rect.x, rect.y)), px, py);
         }
     }
     None
@@ -220,6 +223,7 @@ pub fn toplevel_of(s: &State, mut key: SKey) -> Option<SKey> {
             (Role::Subsurface { parent, .. }, _) => key.id = *parent,
             (_, Some(XdgRole::Popup { parent, .. })) => key.id = *parent,
             (_, Some(XdgRole::Toplevel { .. })) => return Some(key),
+            (Role::Xwayland, _) => return xwm::window(s, key).filter(|w| w.managed).map(|_| key),
             _ => return None,
         }
     }

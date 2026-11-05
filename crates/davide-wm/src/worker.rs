@@ -13,6 +13,8 @@ pub enum Done {
     Saved,
     /// The kernel log check after lighting an exclusive monitor.
     LinkCheck { name: String, failed: bool },
+    /// A Wayland selection read for an X client.
+    XSelection { request: crate::server::xwm::selection::Request, data: Result<Vec<u8>, String> },
 }
 
 pub struct Worker {

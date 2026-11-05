@@ -1,0 +1,10 @@
+[package]
+name = "x11"
+description = "Minimal X11 protocol client for the window manager of Xwayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+state.workspace = true
+libc.workspace = true

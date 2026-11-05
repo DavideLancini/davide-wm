@@ -68,6 +68,9 @@ impl Persist for Kind {
             Kind::IdleInhibitor { surface } => (39, surface, 0),
             Kind::Dmabuf => (40, 0, 0),
             Kind::DmabufParams => (41, 0, 0),
+            Kind::XwaylandShell => (42, 0, 0),
+            Kind::DmabufFeedback => (44, 0, 0),
+            Kind::XwaylandSurface { surface } => (43, surface, 0),
         };
         (tag, a, b).save(e);
     }
@@ -117,6 +120,9 @@ impl Persist for Kind {
             39 => Kind::IdleInhibitor { surface: a },
             40 => Kind::Dmabuf,
             41 => Kind::DmabufParams,
+            42 => Kind::XwaylandShell,
+            44 => Kind::DmabufFeedback,
+            43 => Kind::XwaylandSurface { surface: a },
             _ => return bad("object kind"),
         })
     }
@@ -144,6 +150,7 @@ impl Persist for Role {
             Role::Cursor => (1u8, 0u32, 0i32, 0i32, false).save(e),
             Role::Subsurface { parent, x, y, sync } => (2u8, parent, x, y, sync).save(e),
             Role::Xdg => (3u8, 0u32, 0i32, 0i32, false).save(e),
+            Role::Xwayland => (4u8, 0u32, 0i32, 0i32, false).save(e),
         }
     }
     fn load(d: &mut Dec) -> Result<Self> {
@@ -153,6 +160,7 @@ impl Persist for Role {
             1 => Role::Cursor,
             2 => Role::Subsurface { parent, x, y, sync },
             3 => Role::Xdg,
+            4 => Role::Xwayland,
             _ => return bad("role"),
         })
     }
@@ -321,6 +329,7 @@ impl State {
             buffers,
             dmabuf_params,
             dmabuf_formats: _,
+            dmabuf_device: _,
             positioners,
             output,
             workspaces,
@@ -341,6 +350,9 @@ impl State {
             bar,
             launcher: _,
             notices: _,
+            xwayland,
+            xwayland_serials,
+            xwm,
             serial,
             start,
             needs_redraw: _,
@@ -374,6 +386,8 @@ impl State {
         if let Some(t) = wallpaper {
             save_texture(t, e, r);
         }
+        (*xwayland, xwayland_serials.clone()).save(e);
+        xwm.save(e);
         serial.save(e);
         (start.elapsed().as_millis() as u64).save(e);
     }
@@ -406,6 +420,8 @@ impl State {
         if bool::load(d)? {
             s.wallpaper = Some(load_texture(d, r, true)?);
         }
+        (s.xwayland, s.xwayland_serials) = Persist::load(d)?;
+        s.xwm = Persist::load(d)?;
         s.serial = Persist::load(d)?;
         let elapsed = u64::load(d)?;
         s.start = Instant::now().checked_sub(Duration::from_millis(elapsed)).unwrap_or_else(Instant::now);

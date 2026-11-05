@@ -25,6 +25,8 @@ pub struct Selection {
     /// The top of the history holds this selection's content, so it can be
     /// kept when its owner goes away.
     captured: bool,
+    /// Owned by an X client, through the X window manager.
+    x11: bool,
     mimes: Vec<String>,
     /// Bumped on every change, so offers of an old selection stop working.
     generation: u32,
@@ -144,6 +146,7 @@ fn set(s: &mut State, which: Which, c: ClientId, source: u32, kind: Kind) {
     sel.source = new;
     sel.server = None;
     sel.captured = false;
+    sel.x11 = false;
     sel.mimes = mimes;
     sel.generation += 1;
     let generation = sel.generation;
@@ -181,7 +184,7 @@ fn send_op(kind: Kind) -> u16 {
 pub fn captured(s: &mut State, generation: u32, clip: Clip) {
     s.selection.history.push(clip);
     let sel = &mut s.selection.clipboard;
-    if sel.generation == generation && sel.source.is_some() {
+    if sel.generation == generation && (sel.source.is_some() || sel.x11) {
         sel.captured = true;
     }
 }
@@ -194,6 +197,7 @@ pub fn set_server(s: &mut State, clip: Clip) {
     sel.mimes = clipboard::offered(&clip);
     sel.server = Some(clip.clone());
     sel.captured = false;
+    sel.x11 = false;
     sel.generation += 1;
     if let Some((oc, oid, okind)) = old {
         let op = match okind {
@@ -206,7 +210,83 @@ pub fn set_server(s: &mut State, clip: Clip) {
     broadcast(s, Which::Clipboard);
 }
 
+fn cancel(s: &mut State, old: Option<(ClientId, u32, Kind)>) {
+    if let Some((oc, oid, okind)) = old {
+        let op = match okind {
+            Kind::DataSource => wl_data_source::evt::CANCELLED,
+            Kind::PrimarySource => zwp_primary_selection_source_v1::evt::CANCELLED,
+            _ => ext_data_control_source_v1::evt::CANCELLED,
+        };
+        s.send(oc, Msg::new(oid, op));
+    }
+}
+
+/// An X client took the selection: Wayland clients see these types, read
+/// from it through the X window manager.
+pub fn set_x11(s: &mut State, which: Which, mimes: Vec<String>) {
+    let sel = s.selection.get(which);
+    let old = sel.source.take();
+    sel.server = None;
+    sel.captured = false;
+    sel.x11 = true;
+    sel.mimes = mimes;
+    sel.generation += 1;
+    let generation = sel.generation;
+    cancel(s, old);
+    if which == Which::Clipboard {
+        if let Some(mime) = clipboard::pick_mime(&s.selection.clipboard.mimes) {
+            match clipboard::pipe() {
+                Ok((read, write)) => {
+                    super::xwm::selection::receive(s, which, &mime, write);
+                    s.selection.captures.push((read, generation, mime));
+                }
+                Err(e) => log!("clipboard pipe: {e}"),
+            }
+        }
+    }
+    broadcast(s, which);
+}
+
+/// The X owner let the selection go (or Xwayland went away).
+pub fn clear_x11(s: &mut State, which: Which) {
+    let sel = s.selection.get(which);
+    if !std::mem::take(&mut sel.x11) {
+        return;
+    }
+    sel.mimes.clear();
+    sel.generation += 1;
+    if std::mem::take(&mut sel.captured) {
+        if let Some(top) = s.selection.history.entries.first().cloned() {
+            let sel = s.selection.get(which);
+            sel.mimes = clipboard::offered(&top);
+            sel.server = Some(top);
+        }
+    }
+    broadcast(s, which);
+}
+
+/// The selection belongs to a Wayland client or to the compositor.
+pub fn has_wayland(s: &mut State, which: Which) -> bool {
+    let sel = s.selection.get(which);
+    sel.source.is_some() || sel.server.is_some()
+}
+
+pub fn mimes(s: &mut State, which: Which) -> Vec<String> {
+    s.selection.get(which).mimes.clone()
+}
+
+/// Has the Wayland owner (or the compositor) write the selection into `fd`.
+pub fn request_data(s: &mut State, which: Which, mime: &str, fd: OwnedFd) {
+    let sel = s.selection.get(which);
+    if let Some(clip) = &sel.server {
+        clipboard::serve(fd, clip.data.clone());
+    } else if let Some((c, id, kind)) = sel.source {
+        s.send(c, Msg::new(id, send_op(kind)).str(mime).fd(fd));
+    }
+}
+
 fn broadcast(s: &mut State, which: Which) {
+    super::xwm::selection::wayland_changed(s, which);
     if let Some(c) = focused_client(s) {
         offer_to_client(s, c, which);
     }
@@ -238,7 +318,7 @@ pub fn offer_to_client(s: &mut State, c: ClientId, which: Which) {
         ),
     };
     let sel = s.selection.get(which);
-    let (has, mimes, generation) = (sel.source.is_some() || sel.server.is_some(), sel.mimes.clone(), sel.generation);
+    let (has, mimes, generation) = (sel.source.is_some() || sel.server.is_some() || sel.x11, sel.mimes.clone(), sel.generation);
     for (dev, version) in s.objects_of(c, device_kind) {
         let mut offer = 0;
         if has {
@@ -259,7 +339,7 @@ pub fn offer_to_client(s: &mut State, c: ClientId, which: Which) {
 
 fn offer_to_control(s: &mut State, c: ClientId, dev: u32, version: u32, which: Which) {
     let sel = s.selection.get(which);
-    let (has, mimes, generation) = (sel.source.is_some() || sel.server.is_some(), sel.mimes.clone(), sel.generation);
+    let (has, mimes, generation) = (sel.source.is_some() || sel.server.is_some() || sel.x11, sel.mimes.clone(), sel.generation);
     let mut offer = 0;
     if has {
         let kind = Kind::ControlOffer { generation, primary: which == Which::Primary };
@@ -282,12 +362,11 @@ fn receive(s: &mut State, which: Which, generation: u32, mime: String, fd: Owned
     if sel.generation != generation {
         return;
     }
-    if let Some(clip) = &sel.server {
-        clipboard::serve(fd, clip.data.clone());
+    if sel.x11 {
+        super::xwm::selection::receive(s, which, &mime, fd);
         return;
     }
-    let Some((c, id, kind)) = sel.source else { return };
-    s.send(c, Msg::new(id, send_op(kind)).str(&mime).fd(fd));
+    request_data(s, which, &mime, fd);
 }
 
 fn source_gone(s: &mut State, c: ClientId, id: u32) {
@@ -324,7 +403,7 @@ pub fn focus_changed(s: &mut State, c: ClientId) {
     offer_to_client(s, c, Which::Primary);
 }
 
-state::persist_struct!(Selection { source, server, captured, mimes, generation });
+state::persist_struct!(Selection { source, server, captured, x11, mimes, generation });
 
 /// Captures in flight are dropped: their owner still has the selection.
 impl state::Persist for Selections {

@@ -38,12 +38,12 @@
 > One process (one repo, one build) absorbs `topbar`, `super`, all `dawn` helpers, wallpaper, clipboard history, notifications, screenshots,
 > the X11 window manager for Xwayland and the screen-cast portal backend; it upgrades itself in place without closing any window.
 > Stack: Rust (Cargo workspace), DRM/KMS + GBM + EGL/GLES2, libinput, xkbcommon, logind, own Wayland wire protocol; dwindle layout, compile-time config.
-> Status: **M5 done** (tested nested; M3–M5 still to be tested on the TTY) — clipboard history and notification server in-process, after monitors/blanking (M4), launcher (M3) and bar (M2). Next: M6 (Xwayland).
+> Status: **M6 done** (tested nested; still to test on the TTY: external monitors, notification popups, Xwayland) — X11 window manager for Xwayland, after clipboard history and notifications (M5), monitors (M4), launcher (M3) and bar (M2). Next: M7 (screen sharing).
 
 | Field | Value |
 |---|---|
-| Doc version | 0.10 |
-| Last updated | 2026-11-04 |
+| Doc version | 0.11 |
+| Last updated | 2026-11-05 |
 | Owner | Davide Lancini |
 | Project status | development |
 | Repo | https://github.com/DavideLancini/davide-wm |
@@ -143,16 +143,16 @@
 |-----------|-------------------|-------|
 | Wayland core | `wl_compositor`, `wl_subcompositor`, `wl_shm`, `wl_seat`, `wl_output`, `wl_data_device_manager` | Baseline for every client. |
 | Windows | `xdg_wm_base` (toplevel, popup), `xdg-decoration` (always server-side, drawn as nothing), `xdg-activation-v1`, `xdg-system-bell-v1` | Activation and bell drive focus requests and workspace urgency. |
-| Buffers and timing | `linux-dmabuf-v1`, `wp_viewporter`, `wp_presentation`, `xdg-output` | dmabuf is mandatory for GPU clients (Chromium, VS Code). |
+| Buffers and timing | `linux-dmabuf-v1` (version 4: feedback with the render node, which Xwayland's glamor needs), `wp_viewporter`, `wp_presentation`, `xdg-output` | dmabuf is mandatory for GPU clients (Chromium, VS Code). |
 | Input extras | `wp_cursor_shape_v1`, `zwp_idle_inhibit_manager_v1`, `wp_primary_selection`, `zwp_pointer_constraints_v1` + `zwp_relative_pointer_v1` (later) | Idle inhibit feeds the idle blanking. |
 | Clipboard for external tools | `ext-data-control-v1` (+ `zwlr_data_control` if needed) | Lets `wl-copy`/`wl-paste` (used by `tts --clipboard`) keep working. |
 | Screenshots for external tools | `ext-image-copy-capture-v1` (optional, later) | Only if an external tool still needs it; screenshots are built in. |
-| Xwayland | X11 via `x11rb` on a socketpair; `xwayland-shell-v1` | Compositor spawns `Xwayland -rootless -wm <fd>`, sets `DISPLAY`. |
+| Xwayland | X11 core protocol + Composite + XFixes on the `-wm` socketpair (own client, `crates/x11`); `xwayland-shell-v1` (only Xwayland may bind it) | The compositor listens on `/tmp/.X11-unix/X<n>` (path and abstract), starts `Xwayland :<n> -rootless -listenfd … -displayfd … -wm …` with a private Wayland socket and exports `DISPLAY` to what it spawns. |
 | Session | logind over D-Bus (`TakeControl`, `TakeDevice`, `PauseDevice`, `ResumeDevice`, `SwitchTo`) | No libseat/seatd. |
 | Devices | DRM ioctls (atomic KMS), GBM, EGL + GLES2; libinput (path backend, fds from logind); netlink uevents for hotplug | |
 | Notifications | D-Bus `org.freedesktop.Notifications` (server side) *(planned)* | Own D-Bus implementation, extended from `topbar/src/dbus.rs`. |
 | Screen cast | D-Bus `org.freedesktop.impl.portal.ScreenCast` (+ `Screenshot`), PipeWire stream via libpipewire | `davide-wm.portal` file + `davide-wm-portals.conf` installed under `/usr/share/xdg-desktop-portal/`. |
-| IPC | Unix socket `$XDG_RUNTIME_DIR/davide-wm-<wayland socket>.sock` (path exported to children as `DAVIDE_WM_SOCKET`): one text command per connection (`workspace`, `exec`, `close`, `windows`, `focus-app`, `upgrade`, `exit`; test helpers `pointer`, `click`, `focused`), one reply; event stream *(planned)* | For scripts that remain outside; replaces `hyprctl`/socket2. Client: `davide-wm msg <command>`. |
+| IPC | Unix socket `$XDG_RUNTIME_DIR/davide-wm-<wayland socket>.sock` (path exported to children as `DAVIDE_WM_SOCKET`): one text command per connection (`workspace`, `exec`, `close`, `windows`, `focus-app`, `upgrade`, `exit`; test helpers `pointer`, `click`, `key`, `focused`, `screenshot <file.png>` (renders the primary output offscreen)), one reply; event stream *(planned)* | For scripts that remain outside; replaces `hyprctl`/socket2. Client: `davide-wm msg <command>`. |
 | Signals | `signalfd`: TERM/INT (clean exit), USR1/USR2 kept for compatibility (bar toggle/refresh) | |
 
 ---
@@ -160,7 +160,7 @@
 ## 4. Solution strategy
 *The fundamental decisions in brief: key technologies, patterns, approach. The condensed "why".*
 
-- **Main stack:** Rust (stable). The only crate dependency is `libc`. Own Wayland wire protocol (`crates/wire`, tables generated from the vendored XML in `protocols/`, ADR-019); hand-written FFI to libEGL, libGLESv2, libgbm and libxkbcommon (`crates/sys`, ADR-020); own epoll event loop. Planned: libinput and libpipewire through the same kind of FFI, `x11rb` or own X11 code for the XWM, `fontdue` for text (already used by topbar and super).
+- **Main stack:** Rust (stable). The only crate dependency is `libc`. Own Wayland wire protocol (`crates/wire`, tables generated from the vendored XML in `protocols/`, ADR-019); hand-written FFI to libEGL, libGLESv2, libgbm and libxkbcommon (`crates/sys`, ADR-020); own epoll event loop. Planned: libpipewire through the same kind of FFI. Own minimal X11 client for the XWM (`crates/x11`, ADR-039); `fontdue` for text.
 - **Architectural patterns:** modular monolith, single-threaded epoll event loop owning all state, with every potentially blocking operation (HTTP, process exec with output, file decoding, D-Bus calls with replies) moved to worker threads that post results back as events. Backends behind a small trait: `drm` (real hardware), `nested` (runs as a window inside an existing Wayland compositor, for development), `headless` (tests and cast outputs).
 - **Key technology decisions:** from scratch instead of smithay/wlroots (ADR-001); GLES2 renderer with direct scanout instead of software compositing (ADR-002); logind directly over D-Bus instead of libseat (ADR-003); compile-time config (ADR-004); topbar/super/dawn code ported as in-process modules (ADR-005); own XWM (ADR-008); own portal backend + PipeWire (ADR-009).
 - **How it meets the quality goals (sec. 1.2):** single process and in-memory state remove IPC, forks and polling (footprint, responsiveness); the non-blocking rule and per-feature panic isolation protect the session (reliability); every replaced daemon is one package less (minimal requirements); explicit modules with no framework and compile-time config keep it readable (maintainability).
@@ -179,7 +179,12 @@
     - *Notifications (ADR-038):* `org.freedesktop.Notifications` on the session bus (Notify, CloseNotification, GetCapabilities `actions body persistence`, GetServerInformation; NotificationClosed, ActionInvoked). Popups at the top right below the bar, newest on top, at most `NOTIFICATION_POPUPS`; 5 s unless the app says otherwise, critical ones stay. Left click runs the default action and focuses the app's window, other buttons dismiss. Main+N or the bar's bell opens the list in the launcher box: Enter focuses and removes, Delete removes, the first row clears all. The workspace of the app that notified is marked urgent, as before.
     - *Bar:* the nwg-notifications count and the bus monitor are gone; the compositor sends the count and each new notification.
     - *Not done:* icons and images, body markup, inline replies, do-not-disturb. IPC for tests: `clipboard`, `notifications`, `key` with several codes (a chord).
-  - **M6 — Xwayland:** XWM in-process.
+  - **M6 — Xwayland (done 2026-11-05, tested nested with zenity, Chromium on X11 and tkinter):**
+    - *Process (ADR-040):* Xwayland starts with the compositor on the first free display (`:1` nested inside Hyprland), listening sockets and lock file created by us; `DISPLAY` goes to spawned programs and to the session environment. If it dies after running at least 10 s it is started again. It is our child: it survives a live upgrade, and so does the X connection.
+    - *Window manager (`server/xwm/`):* takes WM_S0, redirects top-level windows (Composite, manual) so they get wl_surfaces, pairs them through `xwayland-shell-v1` serials (or the older `WL_SURFACE_ID`). Normal windows are tiled like xdg toplevels: title from `_NET_WM_NAME`/`WM_NAME`, app id from the `WM_CLASS` class (rules and bar icons match it), focus with `SetInputFocus` and `WM_TAKE_FOCUS`, close with `WM_DELETE_WINDOW` or `KillClient`, `_NET_WM_STATE` fullscreen both ways, `_NET_ACTIVE_WINDOW` requests, WM_HINTS urgency, `_NET_CLIENT_LIST`. Override-redirect windows and menu/tooltip/dropdown/combo/DND/notification/splash types are drawn on top at their own geometry. Focus stealing through X is reverted.
+    - *Selections:* clipboard and primary bridged both ways (XFixes owner tracking, TARGETS, INCR from X; X clients reading a Wayland selection get it through the worker). X selections enter the clipboard history and survive their owner like Wayland ones.
+    - *Also:* `linux-dmabuf` version 4 feedback (Xwayland uses glamor instead of software rendering), the `screenshot` IPC command.
+    - *Not done:* drag and drop with X clients, INCR towards X clients (Wayland selections over 256 KiB are refused to them), floating dialogs, HiDPI scaling, `_NET_WM_MOVERESIZE`.
   - **M7 — Screen sharing:** portal backend, PipeWire stream (outputs and windows), headless outputs for `cast`, screenshot taker.
   - **Switch-over:** remove Hyprland, xdg-desktop-portal-hyprland/-wlr, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
   - **Afterwards:** keep migrating the remaining `dawn` crates and helper scripts the bar calls (`cpu-cycle`, `brightness`, `set-timer.sh`, `bt-headphones-battery`, ...).
@@ -211,7 +216,7 @@ Cargo workspace (ADR-015): one library crate per building block under `crates/`,
 | Launcher | desktop-entry and bookmark scan, filtering, calculator, drawing of the box (`apps.rs`, `calc.rs`, `draw.rs`); the compositor owns the overlay (`LauncherView` in `crates/davide-wm/src/server/mod.rs`) and the keyboard grab | `crates/launcher/` |
 | Clipboard | selections, persisted history, picker, data-control *(planned)* | `crates/clipboard/` |
 | Notifications | D-Bus notification server, popups, panel | `crates/notifications/` |
-| XWM | Xwayland process + X11 window management *(planned)* | `crates/xwayland/` |
+| XWM | Xwayland process; X11 window manager and selection bridge; X11 protocol client | `crates/davide-wm/src/xwayland.rs`, `crates/davide-wm/src/server/xwm/`, `crates/x11/` |
 | Screen cast / screenshots | portal backend, PipeWire streams, screenshot taker *(planned)* | `crates/screencast/` |
 | D-Bus | own minimal client: SASL EXTERNAL, little-endian marshalling of every type, calls with timeouts, signals, fd passing; server side: name requests, method returns, errors, signals | `crates/dbus/` |
 | IPC | Unix socket commands, `davide-wm msg` CLI | `crates/davide-wm/src/ipc.rs` |
@@ -232,8 +237,11 @@ davide-wm/
     │       ├── backend/        # mod.rs (events, Drm), nested.rs, logind.rs, kms.rs, input.rs
     │       ├── ipc.rs          # command socket and `davide-wm msg`
     │       ├── worker.rs       # background jobs (thread + eventfd)
+    │       ├── xwayland.rs     # Xwayland process, X display sockets
+    │       ├── png.rs          # PNG encoder for screenshots
     │       └── server/         # mod.rs (state, clients, render), compositor.rs (core, shm, SIGBUS guard), seat.rs,
-    │                           # xdg.rs, workspaces.rs, selection.rs, dmabuf.rs, misc.rs (activation, bell, idle-inhibit)
+    │                           # xdg.rs, workspaces.rs, selection.rs, dmabuf.rs, misc.rs (activation, bell, idle-inhibit),
+    │                           # xwm/ (X11 window manager, selection bridge)
     ├── wire/               # build.rs generates interface tables from protocols/
     ├── sys/                # egl.rs, gl.rs, gbm.rs, xkb.rs
     ├── render/
@@ -242,6 +250,7 @@ davide-wm/
     ├── jpeg/
     ├── launcher/           # ported super: apps.rs, calc.rs, draw.rs, assets/ font
     ├── wm/
+    ├── x11/                # minimal X11 client: setup, requests, replies, events
     └── config/
 ```
 `run.sh` builds the release binary and live-upgrades every running instance. `dist/davide-wm-session.target` binds the session to `graphical-session.target` (install it in `~/.config/systemd/user/`). Planned additions: `assets/`, `tools/` and the crates marked *(planned)* in sec. 5.1.
@@ -255,7 +264,7 @@ davide-wm/
 
 **Outputs (`backend/outputs.rs`, `backend/kms.rs`, `display.rs`)** — Absorbs `~/0Projects/dawn/crates/` `monitor-manager` (hotplug rules, workspace placement, eDP-1 watchdog, idle blanking from input activity), `blk`/`blackout-core` (black screen per output; the MSI loses signal on DPMS, so it gets a black plane instead of DPMS off), `lid-action`, and `cast` (headless outputs). Idle blanking honours `idle-inhibit`.
 
-**XWM (`crates/xwayland/`)** — Spawns `Xwayland` on demand with a WM socketpair, runs an X11 window manager with `x11rb` (EWMH/ICCCM subset: map/configure, focus, transient/override-redirect, `_NET_WM_STATE` fullscreen, selections bridged to the Wayland clipboard) and pairs X11 windows with `wl_surface`s through `xwayland-shell-v1`.
+**XWM (`server/xwm/`, `crates/x11/`, `xwayland.rs`)** — `crates/x11` speaks the X11 wire protocol on the WM socket: requests are queued and flushed at the end of each loop iteration, replies are waited for synchronously (2 s timeout, as wlroots does), events read meanwhile are queued. An X window becomes a window once it is mapped and its serial matches the one Xwayland set on a wl_surface; from then on it is keyed by that surface like an xdg toplevel, so tiling, focus, workspaces, rules and the bar need no X-specific code beyond `xwm::configure`, `focus`, `close` and the title/app id lookups. Selection transfers from X run one at a time; requests from X clients are read on the worker.
 
 **Screen cast (`crates/screencast/`)** — Owns `org.freedesktop.impl.portal.desktop.davidewm` on the session bus and implements `ScreenCast` (monitor and window sources, chosen through a picker drawn by the compositor) and `Screenshot`. Frames are copied (or exported as dmabuf) into a PipeWire stream created with libpipewire. The screenshot taker (region, window or output; saved to file and copied to the clipboard; no annotations) replaces `grim`/`slurp`/`swappy`.
 
@@ -364,6 +373,8 @@ davide-wm/
 | 36 | DP link check through `journalctl -k` | accepted | 2026-11-04 | After lighting an exclusive monitor, a worker job waits `LINK_CHECK_DELAY_MS` and greps the kernel log for amdgpu's `enabling link N failed`: when training fails, KMS still reports the output lit while it shows nothing. `/dev/kmsg` is not readable (`dmesg_restrict`). On failure the connector is skipped until unplugged and the panel comes back. A modeset error on an external monitor is handled the same way. |
 | 37 | Clipboard history captured by the compositor itself | accepted | 2026-11-04 | No `wl-paste --watch`: on each new clipboard selection the compositor asks the owner for one type through a pipe and reads it on the worker (3 s deadline). Primary selection is not recorded, like cliphist. When the owner exits, the compositor keeps serving the captured clip. Picker and history share the launcher box (`Launcher::picker`). The history lives in the live-upgrade blob and in its own file, written on the worker. |
 | 38 | Notification server on the main thread | accepted | 2026-11-04 | Uses `crates/dbus` (server side added) with the bus fd in the main epoll: calls are short and need compositor state. The name is requested with replace-existing and do-not-queue: when another server holds it (nested inside Hyprland) notifications stay off. Popups are cards drawn by `launcher::card` and composited like the launcher; the list reuses the picker. NotificationClosed is sent when a popup expires, while the entry stays in the list. Before switch-over, remove `~/.local/share/dbus-1/services/org.freedesktop.Notifications.service` and the `nwg-notifications` user service. |
+| 39 | Own X11 client instead of x11rb | accepted | 2026-11-05 | About 600 lines cover setup, the requests a WM needs and event parsing; no new crate dependency (constraint 4), and the connection state (fd, sequence number, buffered input) is plain data that goes into the live-upgrade blob. Only synchronous round trips, so no reply can be pending across an upgrade. |
+| 40 | Xwayland started with the compositor, not on demand | accepted | 2026-11-05 | Simpler than lazy start (no socket watching, no clients waiting for a server that is starting) at the cost of one idle process. Xwayland gets its own socketpair as Wayland connection, which identifies it for `xwayland-shell-v1`. Restarted once it has run 10 s, so a crash loop stops. |
 
 <details>
 <summary>ADR-001: Write the compositor from scratch</summary>
@@ -421,7 +432,7 @@ davide-wm/
 | Some current behaviour depends on Hyprland specifics (socket2 consumers, `hyprctl` calls in helper scripts) | Regressions after switch-over | `dawn` inventoried in M4 (monitor-manager, blk, lid tools ported); still to check: the helper scripts the bar calls and `cast` (M7). |
 | Live upgrade restores a wrong or partial state | Clients misbehave or disconnect after an upgrade | Versioned blob, `persist_struct!` forces every field to be handled, automatic fallback to `davide-wm-prev`. Still missing: round-trip tests on a headless backend, and a test of the DRM path (logind bus, KMS fd, libinput re-open). |
 | One huge project, always built together | Long builds, harder refactors | Cargo workspace (ADR-015), clear crate boundaries, live upgrade makes deploying cheap. |
-| Remaining simplifications | Visual glitches with some clients | Subsurfaces are always desynchronised, popups have no constraint adjustment or grabs, full redraw every frame, buffer scale 1 only, no drag and drop, fullscreen requests before the first commit are ignored. |
+| Remaining simplifications | Visual glitches with some clients | X windows on hidden workspaces keep their X position (harmless: input follows wl_pointer), X dialogs are tiled, no INCR towards X clients. Subsurfaces are always desynchronised, popups have no constraint adjustment or grabs, full redraw every frame, buffer scale 1 only, no drag and drop, fullscreen requests before the first commit are ignored. |
 | Open questions | Plan may change | Whether to keep layer-shell for any external client. |
 
 ---

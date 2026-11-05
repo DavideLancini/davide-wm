@@ -21,7 +21,9 @@ pub fn display(s: &mut State, c: ClientId, op: u16, args: Args) {
             if !s.new_object(c, id, &wl_registry::INTERFACE, 1, Kind::Registry) {
                 return;
             }
-            let globals: Vec<_> = s.globals.iter().map(|g| (g.name, g.iface.name, g.version)).collect();
+            let xwayland = s.xwayland == Some(c);
+            let globals: Vec<_> =
+                s.globals.iter().filter(|g| xwayland || g.iface.name != "xwayland_shell_v1").map(|g| (g.name, g.iface.name, g.version)).collect();
             for (name, iface, version) in globals {
                 s.send(c, Msg::new(id, wl_registry::evt::GLOBAL).uint(name).str(iface).uint(version));
             }
@@ -40,7 +42,7 @@ pub fn registry(s: &mut State, c: ClientId, op: u16, args: Args) {
         return;
     };
     let gi = g.iface;
-    if gi.name != iface || version == 0 || version > g.version {
+    if gi.name != iface || (gi.name == "xwayland_shell_v1" && s.xwayland != Some(c)) || version == 0 || version > g.version {
         s.error(c, 1, wl_display::error::INVALID_OBJECT, &format!("bad bind of {iface} v{version}"));
         return;
     }
@@ -59,6 +61,7 @@ pub fn registry(s: &mut State, c: ClientId, op: u16, args: Args) {
         "xdg_system_bell_v1" => Kind::Bell,
         "zwp_idle_inhibit_manager_v1" => Kind::IdleInhibitManager,
         "zwp_linux_dmabuf_v1" => Kind::Dmabuf,
+        "xwayland_shell_v1" => Kind::XwaylandShell,
         _ => unreachable!("global without kind"),
     };
     if !s.new_object(c, id, gi, version, kind) {
@@ -72,7 +75,7 @@ pub fn registry(s: &mut State, c: ClientId, op: u16, args: Args) {
         }
         Kind::Seat => seat::send_seat_info(s, c, id, version),
         Kind::Output => seat::send_output_info(s, c, id, version),
-        Kind::Dmabuf => dmabuf::send_formats(s, c, id),
+        Kind::Dmabuf => dmabuf::send_formats(s, c, id, version),
         _ => {}
     }
 }

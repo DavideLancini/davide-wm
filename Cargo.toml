@@ -23,6 +23,7 @@ state = { path = "crates/state" }
 sys = { path = "crates/sys" }
 wire = { path = "crates/wire" }
 wm = { path = "crates/wm" }
+x11 = { path = "crates/x11" }
 
 [profile.release]
 opt-level = 3

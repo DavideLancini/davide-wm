@@ -460,6 +460,13 @@ impl Renderer {
     }
 
     /// Formats and modifiers that client dmabufs may use.
+    /// The device number of the DRM node rendered on.
+    pub fn device(&self) -> u64 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        unsafe { libc::fstat(self._node.as_raw_fd(), &mut st) };
+        st.st_rdev
+    }
+
     pub fn dmabuf_formats(&self) -> Vec<(u32, u64)> {
         let (Some(qf), Some(qm)) = (self.query_formats, self.query_modifiers) else {
             return vec![(gbm::FORMAT_XRGB8888, MOD_INVALID), (gbm::FORMAT_ARGB8888, MOD_INVALID)];
@@ -533,6 +540,19 @@ impl Renderer {
             }
             gl::glBindFramebuffer(gl::FRAMEBUFFER, 0);
             gl::glDeleteFramebuffers(1, &fbo);
+        }
+        out
+    }
+
+    /// RGBA pixels of a render target, rows top to bottom (targets are
+    /// drawn upside down for scanout).
+    pub fn read_target(&mut self, t: &Target) -> Vec<u8> {
+        let mut out = vec![0u8; (t.width * t.height * 4) as usize];
+        unsafe {
+            gl::glBindFramebuffer(gl::FRAMEBUFFER, t.fbo);
+            gl::glPixelStorei(PACK_ALIGNMENT, 4);
+            gl::glReadPixels(0, 0, t.width, t.height, gl::RGBA, gl::UNSIGNED_BYTE, out.as_mut_ptr().cast());
+            gl::glBindFramebuffer(gl::FRAMEBUFFER, 0);
         }
         out
     }
