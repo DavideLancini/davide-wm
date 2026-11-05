@@ -27,7 +27,7 @@ impl Persist for Pending {
     fn load(d: &mut Dec) -> Result<Self> {
         let (buffer, frames, geometry) = Persist::load(d)?;
         let input = if has_regions() { Persist::load(d)? } else { None };
-        Ok(Pending { buffer, frames, geometry, input })
+        Ok(Pending { buffer, frames, geometry, input, damage: Vec::new() })
     }
 }
 persist_struct!(Xdg { obj, role, geometry, configured, mapped });
@@ -302,7 +302,7 @@ fn load_texture(d: &mut Dec, r: &mut Renderer, mipmaps: bool) -> Result<Texture>
 }
 
 fn save_surface(sf: &Surface, e: &mut Enc, r: &mut Renderer) {
-    let Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg, input } = sf;
+    let Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg, input, .. } = sf;
     pending.save(e);
     cached.save(e);
     upload.save(e);
@@ -341,7 +341,7 @@ fn load_surface(d: &mut Dec, r: &mut Renderer) -> Result<Surface> {
     let (above, below) = Persist::load(d)?;
     let xdg = Persist::load(d)?;
     let input = if has_regions() { Persist::load(d)? } else { None };
-    Ok(Surface { pending, cached, upload, content, size, opaque, frames, role, above, below, xdg, input })
+    Ok(Surface { pending, cached, upload, damage: None, content, size, opaque, frames, role, above, below, xdg, input })
 }
 
 impl State {
@@ -393,6 +393,7 @@ impl State {
             serial,
             start,
             needs_redraw: _,
+            uploads_pending: _,
             damage: _,
             cursor_changed: _,
             cursor_image_dirty: _,
@@ -484,6 +485,7 @@ impl State {
             }
         }
         s.needs_redraw = true;
+        s.uploads_pending = true;
         Ok(s)
     }
 

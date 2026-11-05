@@ -91,6 +91,7 @@ pub fn compositor(s: &mut State, c: ClientId, version: u32, op: u16, args: Args)
                         pending: Pending::default(),
                         cached: None,
                         upload: None,
+                        damage: None,
                         content: Content::None,
                         size: (0, 0),
                         opaque: false,
@@ -129,6 +130,14 @@ pub fn surface(s: &mut State, c: ClientId, id: u32, op: u16, args: Args) {
                 }
             }
         }
+        wl_surface::req::DAMAGE | wl_surface::req::DAMAGE_BUFFER => {
+            if let Some(sf) = s.surfaces.get_mut(&key) {
+                // Past a few rectangles the whole buffer is uploaded anyway.
+                if sf.pending.damage.len() < 32 {
+                    sf.pending.damage.push(Rect::new(args.int(0), args.int(1), args.int(2), args.int(3)));
+                }
+            }
+        }
         wl_surface::req::COMMIT => commit(s, key),
         wl_surface::req::SET_INPUT_REGION => {
             let region = args.obj(0);
@@ -160,6 +169,7 @@ fn commit(s: &mut State, key: SKey) {
         if p.input.is_some() {
             cached.input = p.input;
         }
+        cached.damage.append(&mut p.damage);
         return;
     }
     apply(s, key, p);
@@ -195,7 +205,13 @@ fn apply(s: &mut State, key: SKey, mut p: Pending) {
     if let Some(b) = p.buffer.take() {
         match b.and_then(|id| s.buffers.get(&SKey { client: key.client, id }).map(|buf| (id, buf))) {
             Some((id, buf)) => {
+                // No damage with a new buffer: take it all, to be safe.
+                match (&mut sf.damage, p.damage.is_empty()) {
+                    (Some(d), false) if d.len() < 32 => d.append(&mut p.damage),
+                    _ => sf.damage = None,
+                }
                 sf.upload = Some(id);
+                s.uploads_pending = true;
                 sf.size = buf.size();
                 sf.opaque = buf.opaque();
             }

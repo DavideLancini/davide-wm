@@ -457,6 +457,25 @@ impl Renderer {
         }
     }
 
+    /// Replaces the given areas `(x, y, w, h)` of a texture made by
+    /// `upload` with the same pixels' layout.
+    pub fn update(&mut self, tex: &Texture, areas: &[(i32, i32, i32, i32)], stride: i32, pixels: &[u8]) {
+        unsafe {
+            gl::glBindTexture(gl::TEXTURE_2D, tex.id);
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
+            gl::glPixelStorei(gl::UNPACK_ROW_LENGTH, stride / 4);
+            for &(x, y, w, h) in areas {
+                debug_assert!(x >= 0 && y >= 0 && x + w <= tex.width && y + h <= tex.height);
+                gl::glPixelStorei(gl::UNPACK_SKIP_PIXELS, x);
+                gl::glPixelStorei(gl::UNPACK_SKIP_ROWS, y);
+                gl::glTexSubImage2D(gl::TEXTURE_2D, 0, x, y, w, h, gl::BGRA_EXT, gl::UNSIGNED_BYTE, pixels.as_ptr().cast());
+            }
+            gl::glPixelStorei(gl::UNPACK_SKIP_PIXELS, 0);
+            gl::glPixelStorei(gl::UNPACK_SKIP_ROWS, 0);
+            gl::glPixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+        }
+    }
+
     /// Uploads RGBA pixels with mipmaps, for images drawn scaled down.
     pub fn upload_mipmapped(&mut self, width: i32, height: i32, rgba: &[u8]) -> Texture {
         debug_assert_eq!(rgba.len(), (width * height * 4) as usize);

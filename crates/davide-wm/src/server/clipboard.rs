@@ -1,7 +1,8 @@
 //! Clipboard history (replaces `wl-paste --watch cliphist store` and the
 //! wofi picker): every new clipboard selection is read from its owner on a
-//! worker thread, kept newest first and saved to
-//! `$XDG_STATE_HOME/davide-wm/clipboard` so it survives reboots.
+//! worker thread, kept newest first and saved under
+//! `$XDG_STATE_HOME/davide-wm/clipboard.d` so it survives reboots: an
+//! index with the text, and a file per image.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -57,35 +58,95 @@ pub fn offered(clip: &Clip) -> Vec<String> {
 }
 
 /// One line for the picker.
-pub fn label(clip: &Clip) -> String {
-    if is_text(&clip.mime) {
-        let text = String::from_utf8_lossy(&clip.data);
-        let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut out: String = flat.chars().take(100).collect();
-        if flat.chars().count() > 100 {
-            out.push('…');
+pub fn label(e: &Entry) -> String {
+    match &e.data {
+        Some(data) if is_text(&e.mime) => {
+            let text = String::from_utf8_lossy(data);
+            let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut out: String = flat.chars().take(100).collect();
+            if flat.chars().count() > 100 {
+                out.push('…');
+            }
+            out
         }
-        out
-    } else {
-        format!("[{}, {} KB]", clip.mime, clip.data.len().div_ceil(1024))
+        _ => format!("[{}, {} KB]", e.mime, e.len.div_ceil(1024)),
     }
+}
+
+/// A history entry. Text stays in memory; anything else (images) lives in
+/// a file of its own, named after the hash, and is read when picked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub mime: String,
+    /// FNV-1a of the data.
+    pub hash: u64,
+    pub len: usize,
+    data: Option<Vec<u8>>,
+}
+
+impl Entry {
+    fn same(&self, hash: u64, len: usize, mime: &str) -> bool {
+        self.hash == hash && self.len == len && is_text(&self.mime) == is_text(mime)
+    }
+}
+
+fn fnv(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ *b as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 #[derive(Default)]
 pub struct History {
     /// Newest first.
-    pub entries: Vec<Clip>,
+    pub entries: Vec<Entry>,
+    /// Where entries kept out of memory go; without it all stay in memory.
+    dir: Option<PathBuf>,
 }
 
-state::persist_struct!(History { entries });
+impl state::Persist for History {
+    fn save(&self, e: &mut state::Enc) {
+        self.entries.len().save(e);
+        for x in &self.entries {
+            (x.mime.clone(), x.hash, x.len).save(e);
+            x.data.is_some().save(e);
+            if let Some(d) = &x.data {
+                state::save_bytes(d, e);
+            }
+        }
+    }
+    fn load(d: &mut state::Dec) -> state::Result<Self> {
+        if crate::server::persist::FORMAT.load(std::sync::atomic::Ordering::Relaxed) < 10 {
+            let clips: Vec<Clip> = state::Persist::load(d)?;
+            let mut h = History { entries: Vec::new(), dir: Some(dir()) };
+            h.import(clips);
+            return Ok(h);
+        }
+        let n = usize::load(d)?;
+        let mut entries = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (mime, hash, len) = state::Persist::load(d)?;
+            let data = if bool::load(d)? { Some(state::load_bytes(d)?) } else { None };
+            entries.push(Entry { mime, hash, len, data });
+        }
+        Ok(History { entries, dir: Some(dir()) })
+    }
+}
 
 const MAGIC: &[u8] = b"DWCL1\n";
+const INDEX_MAGIC: &[u8] = b"DWCL2\n";
 
-fn path() -> PathBuf {
-    let dir = std::env::var_os("XDG_STATE_HOME")
+fn state_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
-    dir.join("davide-wm/clipboard")
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"))
+        .join("davide-wm")
+}
+
+fn dir() -> PathBuf {
+    state_dir().join("clipboard.d")
+}
+
+fn blob_name(hash: u64) -> String {
+    format!("{hash:016x}")
 }
 
 impl History {
@@ -97,75 +158,196 @@ impl History {
         if is_text(&clip.mime) && clip.data.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        let same = |c: &Clip| c.data == clip.data && is_text(&c.mime) == is_text(&clip.mime);
-        self.entries.retain(|c| !same(c));
-        self.entries.insert(0, clip);
-        self.entries.truncate(config::CLIPBOARD_HISTORY);
+        let (hash, len) = (fnv(&clip.data), clip.data.len());
+        self.entries.retain(|e| !e.same(hash, len, &clip.mime));
+        let entry = self.store(clip, hash);
+        self.entries.insert(0, entry);
+        for gone in self.entries.split_off(self.entries.len().min(config::CLIPBOARD_HISTORY)) {
+            self.forget(&gone);
+        }
     }
 
-    /// Appends older entries (from another history) below ours, skipping
-    /// what we already have; returns how many were added.
-    pub fn import(&mut self, older: History) -> usize {
-        let before = self.entries.len();
-        for clip in older.entries {
-            let dup = self.entries.iter().any(|c| c.data == clip.data && is_text(&c.mime) == is_text(&clip.mime));
-            if !dup && !clip.data.is_empty() && clip.data.len() <= config::CLIPBOARD_MAX_BYTES {
-                self.entries.push(clip);
+    /// Keeps text in memory and writes anything else to its file.
+    fn store(&self, clip: Clip, hash: u64) -> Entry {
+        let len = clip.data.len();
+        let data = match &self.dir {
+            Some(dir) if !is_text(&clip.mime) => match write_private(&dir.join(blob_name(hash)), &clip.data) {
+                Ok(()) => None,
+                Err(e) => {
+                    log!("clipboard: keeping an entry in memory: {e}");
+                    Some(clip.data)
+                }
+            },
+            _ => Some(clip.data),
+        };
+        Entry { mime: clip.mime, hash, len, data }
+    }
+
+    /// Deletes the file of an entry no longer in the history.
+    fn forget(&self, gone: &Entry) {
+        if let (None, Some(dir)) = (&gone.data, &self.dir) {
+            if !self.entries.iter().any(|e| e.hash == gone.hash && e.data.is_none()) {
+                let _ = std::fs::remove_file(dir.join(blob_name(gone.hash)));
             }
         }
-        self.entries.truncate(config::CLIPBOARD_HISTORY);
-        self.entries.len().saturating_sub(before)
     }
 
+    /// The clip of entry `i`, read from its file when not in memory.
+    pub fn get(&self, i: usize) -> Option<Clip> {
+        let e = self.entries.get(i)?;
+        let data = match &e.data {
+            Some(d) => d.clone(),
+            None => std::fs::read(self.dir.as_ref()?.join(blob_name(e.hash))).inspect_err(|err| log!("clipboard entry {:016x}: {err}", e.hash)).ok()?,
+        };
+        Some(Clip { mime: e.mime.clone(), data })
+    }
+
+    pub fn remove(&mut self, i: usize) {
+        if i < self.entries.len() {
+            let gone = self.entries.remove(i);
+            self.forget(&gone);
+        }
+    }
+
+    /// Bytes of entry data held in memory.
+    pub fn in_memory(&self) -> usize {
+        self.entries.iter().filter_map(|e| e.data.as_ref()).map(Vec::len).sum()
+    }
+
+    /// Appends older entries below ours, skipping what we already have;
+    /// returns how many were added.
+    pub fn import(&mut self, older: Vec<Clip>) -> usize {
+        let before = self.entries.len();
+        for clip in older {
+            if self.entries.len() >= config::CLIPBOARD_HISTORY {
+                break;
+            }
+            let (hash, len) = (fnv(&clip.data), clip.data.len());
+            if len == 0 || len > config::CLIPBOARD_MAX_BYTES || self.entries.iter().any(|e| e.same(hash, len, &clip.mime)) {
+                continue;
+            }
+            let entry = self.store(clip, hash);
+            self.entries.push(entry);
+        }
+        self.entries.len() - before
+    }
+
+    /// The index: every entry's type, hash and size, and the text itself.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = MAGIC.to_vec();
-        for c in &self.entries {
-            out.extend_from_slice(&(c.mime.len() as u32).to_le_bytes());
-            out.extend_from_slice(c.mime.as_bytes());
-            out.extend_from_slice(&(c.data.len() as u64).to_le_bytes());
-            out.extend_from_slice(&c.data);
+        let mut out = INDEX_MAGIC.to_vec();
+        for e in &self.entries {
+            out.extend_from_slice(&(e.mime.len() as u32).to_le_bytes());
+            out.extend_from_slice(e.mime.as_bytes());
+            out.extend_from_slice(&e.hash.to_le_bytes());
+            out.extend_from_slice(&(e.len as u64).to_le_bytes());
+            match &e.data {
+                Some(d) => {
+                    out.push(1);
+                    out.extend_from_slice(d);
+                }
+                None => out.push(0),
+            }
         }
         out
     }
 
-    pub fn decode(mut b: &[u8]) -> History {
-        let mut h = History::default();
-        if !b.starts_with(MAGIC) {
+    fn decode(mut b: &[u8], dir: Option<PathBuf>) -> History {
+        let mut h = History { entries: Vec::new(), dir };
+        if !b.starts_with(INDEX_MAGIC) {
             return h;
         }
-        b = &b[MAGIC.len()..];
-        let mut take = |n: usize| -> Option<Vec<u8>> {
+        b = &b[INDEX_MAGIC.len()..];
+        let mut take = |n: usize| -> Option<&[u8]> {
             let (head, rest) = (b.get(..n)?, b.get(n..)?);
             b = rest;
-            Some(head.to_vec())
+            Some(head)
         };
         let mut next = || {
             let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
-            let mime = String::from_utf8(take(n)?).ok()?;
-            let n = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
-            Some(Clip { mime, data: take(n)? })
+            let mime = String::from_utf8(take(n)?.to_vec()).ok()?;
+            let hash = u64::from_le_bytes(take(8)?.try_into().ok()?);
+            let len = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+            let data = match take(1)?[0] {
+                1 => Some(take(len)?.to_vec()),
+                _ => None,
+            };
+            Some(Entry { mime, hash, len, data })
         };
-        while let Some(c) = next() {
-            h.entries.push(c);
+        while let Some(e) = next() {
+            h.entries.push(e);
         }
         h
     }
 
+    /// The saved history; the single-file format of before is moved over.
     pub fn load() -> History {
-        std::fs::read(path()).map(|b| History::decode(&b)).unwrap_or_default()
+        let dir = dir();
+        if let Ok(b) = std::fs::read(dir.join("index")) {
+            let h = History::decode(&b, Some(dir));
+            h.collect_garbage();
+            return h;
+        }
+        let mut h = History { entries: Vec::new(), dir: Some(dir) };
+        if let Ok(b) = std::fs::read(state_dir().join("clipboard")) {
+            h.import(decode_v1(&b));
+            let _ = save(&h.encode());
+        }
+        h
+    }
+
+    /// Removes files no entry refers to (left by a crash).
+    fn collect_garbage(&self) {
+        let Some(dir) = &self.dir else { return };
+        let keep: std::collections::HashSet<String> = self.entries.iter().filter(|e| e.data.is_none()).map(|e| blob_name(e.hash)).collect();
+        for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = f.file_name().to_string_lossy().into_owned();
+            if name.len() == 16 && !keep.contains(&name) {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
     }
 }
 
-/// Writes the encoded history, readable by the owner only.
-pub fn save(bytes: &[u8]) -> io::Result<()> {
+/// Clips in the single-file format of before.
+pub fn decode_v1(mut b: &[u8]) -> Vec<Clip> {
+    let mut out = Vec::new();
+    if !b.starts_with(MAGIC) {
+        return out;
+    }
+    b = &b[MAGIC.len()..];
+    let mut take = |n: usize| -> Option<Vec<u8>> {
+        let (head, rest) = (b.get(..n)?, b.get(n..)?);
+        b = rest;
+        Some(head.to_vec())
+    };
+    let mut next = || {
+        let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let mime = String::from_utf8(take(n)?).ok()?;
+        let n = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+        Some(Clip { mime, data: take(n)? })
+    };
+    while let Some(c) = next() {
+        out.push(c);
+    }
+    out
+}
+
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let path = path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?.write_all(bytes)?;
     std::fs::rename(tmp, path)
+}
+
+/// Writes the encoded index, readable by the owner only; the single file
+/// of before goes once the index holds its entries.
+pub fn save(bytes: &[u8]) -> io::Result<()> {
+    write_private(&dir().join("index"), bytes)?;
+    let _ = std::fs::remove_file(state_dir().join("clipboard"));
+    Ok(())
 }
 
 pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
@@ -233,9 +415,10 @@ mod tests {
         h.push(Clip { mime: "UTF8_STRING".into(), data: b"a".to_vec() });
         h.push(text("  \n"));
         assert_eq!(h.entries.iter().map(label).collect::<Vec<_>>(), ["a", "b"]);
-        let back = History::decode(&h.encode());
+        let back = History::decode(&h.encode(), None);
         assert_eq!(back.entries, h.entries);
-        assert!(History::decode(b"junk").entries.is_empty());
+        assert!(History::decode(b"junk", None).entries.is_empty());
+        assert_eq!(h.get(1), Some(text("b")));
     }
 
     #[test]
@@ -245,6 +428,8 @@ mod tests {
         assert_eq!(pick_mime(&m(&["image/jpeg", "image/png"])).as_deref(), Some("image/png"));
         assert_eq!(pick_mime(&m(&["text/plain", SECRET])), None);
         assert_eq!(pick_mime(&m(&["application/x-foo"])), None);
-        assert_eq!(label(&text("uno\n  due\ttre")), "uno due tre");
+        let mut h = History::default();
+        h.push(text("uno\n  due\ttre"));
+        assert_eq!(label(&h.entries[0]), "uno due tre");
     }
 }

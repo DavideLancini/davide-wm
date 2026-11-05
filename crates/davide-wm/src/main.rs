@@ -403,7 +403,7 @@ impl App {
     fn open_clipboard(&mut self) {
         let entries = &self.state.selection.history.entries;
         let labels = entries.iter().map(clipboard::label).collect();
-        let hashes = entries.iter().map(clip_hash).collect();
+        let hashes = entries.iter().map(|e| e.hash).collect();
         self.state.open_view(launcher::Launcher::picker(labels), Purpose::Clipboard(hashes));
     }
 
@@ -420,7 +420,7 @@ impl App {
 
     fn clip_index(&self, hashes: &[u64], i: usize) -> Option<usize> {
         let h = hashes.get(i)?;
-        self.state.selection.history.entries.iter().position(|c| clip_hash(c) == *h)
+        self.state.selection.history.entries.iter().position(|e| e.hash == *h)
     }
 
     /// Enter in a picker.
@@ -485,7 +485,7 @@ impl App {
                 None => self.portal.cancelled(request, false),
             },
             Purpose::Clipboard(hashes) => {
-                if let Some(clip) = self.clip_index(&hashes, i).map(|j| self.state.selection.history.entries[j].clone()) {
+                if let Some(clip) = self.clip_index(&hashes, i).and_then(|j| self.state.selection.history.get(j)) {
                     selection::set_server(&mut self.state, clip);
                     self.save_clipboard();
                 }
@@ -508,7 +508,7 @@ impl App {
             Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) | Purpose::Timer(_) | Purpose::Power | Purpose::Battery | Purpose::Outputs(_) | Purpose::Bluetooth(..) => {}
             Purpose::Clipboard(hashes) => {
                 if let Some(j) = self.clip_index(&hashes, i) {
-                    self.state.selection.history.entries.remove(j);
+                    self.state.selection.history.remove(j);
                     self.save_clipboard();
                 }
             }
@@ -1192,6 +1192,22 @@ impl App {
                 for k in &s.popups {
                     out += &format!("popup {} origin {:?}\n", name(*k), s.window_origin(*k));
                 }
+                let mib = |b: usize| b as f64 / (1 << 20) as f64;
+                let heap = unsafe { libc::mallinfo2() };
+                let clips = &s.selection.history.entries;
+                out += &format!(
+                    "mem: clients {} surfaces {} buffers {} pools {} ({:.1} MiB mapped) clipboard {} ({:.1} MiB) notifications {} heap {:.1} MiB used {:.1} MiB free\n",
+                    s.clients.len(),
+                    s.surfaces.len(),
+                    s.buffers.len(),
+                    s.pools.len(),
+                    mib(s.pools.values().map(|p| p.size).sum()),
+                    clips.len(),
+                    mib(s.selection.history.in_memory()),
+                    self.notifier.list.len(),
+                    mib(heap.uordblks + heap.hblkhd),
+                    mib(heap.fordblks),
+                );
                 return out;
             }
             ipc::Command::Blank => self.blank(),
@@ -1262,7 +1278,7 @@ impl App {
             }
             ipc::Command::ClipboardImport(path) => {
                 let older = match std::fs::read(&path) {
-                    Ok(b) => clipboard::History::decode(&b),
+                    Ok(b) => clipboard::decode_v1(&b),
                     Err(e) => return format!("error: {e}\n"),
                 };
                 let n = self.state.selection.history.import(older);
@@ -1621,15 +1637,20 @@ impl App {
                 self.casts.catch_up = true;
                 self.state.needs_redraw = true;
             }
-        } else if self.cursor_moved {
-            if let Backend::Drm(d) = &mut self.backend {
-                match d.commit_cursor() {
-                    Ok(true) => self.cursor_moved = false,
-                    // A flip is pending: again after it.
-                    Ok(false) => {}
-                    Err(e) => {
-                        log!("cursor: {e}");
-                        self.cursor_moved = false;
+        } else {
+            if self.state.uploads_pending && self.state.lock.is_none() {
+                self.state.upload_pending(r);
+            }
+            if self.cursor_moved {
+                if let Backend::Drm(d) = &mut self.backend {
+                    match d.commit_cursor() {
+                        Ok(true) => self.cursor_moved = false,
+                        // A flip is pending: again after it.
+                        Ok(false) => {}
+                        Err(e) => {
+                            log!("cursor: {e}");
+                            self.cursor_moved = false;
+                        }
                     }
                 }
             }
@@ -2048,13 +2069,6 @@ fn save_screenshot(png: &[u8]) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-fn clip_hash(c: &clipboard::Clip) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    c.data.hash(&mut h);
-    h.finish()
-}
-
 /// Registers every fd with a fresh epoll and starts background jobs.
 fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     // Programs started by the bar inherit these.
@@ -2170,7 +2184,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 9;
+const BLOB_FORMAT: u32 = 10;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -2263,6 +2277,8 @@ fn decode(blob: &[u8]) -> io::Result<Ctx> {
     state.dmabuf_device = renderer.device();
     let mut app = new_app(backend, state, socket, ipc, main_mod, session, display::Display::new(inhibitor)?, notifier);
     app.xwayland = xwayland;
+    // An older state may have brought the history in the old layout.
+    app.clipboard_dirty = format < BLOB_FORMAT;
     app.outputs_changed();
     log!("live upgrade done");
     finish(app, renderer, PathBuf::from(exe))
@@ -2471,6 +2487,8 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                     event_loop::read_timer(&app.battery_timer);
                     app.battery_tick();
                     app.xwayland_idle_check();
+                    // Freed memory inside the heap goes back to the system.
+                    unsafe { libc::malloc_trim(0) };
                 }
                 TOKEN_OSD => {
                     event_loop::read_timer(&app.osd_timer);

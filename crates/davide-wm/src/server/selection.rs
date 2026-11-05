@@ -266,7 +266,7 @@ pub fn clear_x11(s: &mut State, which: Which) {
     sel.mimes.clear();
     sel.generation += 1;
     if std::mem::take(&mut sel.captured) {
-        if let Some(top) = s.selection.history.entries.first().cloned() {
+        if let Some(top) = s.selection.history.get(0) {
             let sel = s.selection.get(which);
             sel.mimes = clipboard::offered(&top);
             sel.server = Some(top);
@@ -389,7 +389,7 @@ fn source_gone(s: &mut State, c: ClientId, id: u32) {
             sel.generation += 1;
             // The clipboard outlives the program it was copied from.
             if std::mem::take(&mut sel.captured) {
-                if let Some(top) = s.selection.history.entries.first().cloned() {
+                if let Some(top) = s.selection.history.get(0) {
                     let sel = s.selection.get(which);
                     sel.mimes = clipboard::offered(&top);
                     sel.server = Some(top);

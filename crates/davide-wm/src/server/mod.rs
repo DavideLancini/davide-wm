@@ -114,6 +114,8 @@ pub struct Pending {
     pub geometry: Option<Rect>,
     /// `Some(None)` resets the input region to the whole surface.
     pub input: Option<Option<Region>>,
+    /// Buffer damage; not kept across a live upgrade (all is uploaded).
+    pub damage: Vec<Rect>,
 }
 
 /// A `wl_region`: rectangles added or subtracted in order.
@@ -175,6 +177,8 @@ pub struct Surface {
     pub cached: Option<Pending>,
     /// Committed buffer not uploaded yet.
     pub upload: Option<u32>,
+    /// What changed in the buffer since the last upload; `None`: all of it.
+    pub damage: Option<Vec<Rect>>,
     pub content: Content,
     pub size: (i32, i32),
     pub opaque: bool,
@@ -475,6 +479,9 @@ pub struct State {
     start: Instant,
     /// The whole output must be drawn again.
     pub needs_redraw: bool,
+    /// A surface committed a buffer not uploaded yet: hidden windows too,
+    /// whose clients wait for the buffer back.
+    pub uploads_pending: bool,
     /// Areas to draw again when `needs_redraw` is not set.
     pub damage: Vec<Rect>,
     /// The pointer moved or changed image.
@@ -539,6 +546,7 @@ impl State {
             serial: 0,
             start: Instant::now(),
             needs_redraw: true,
+            uploads_pending: false,
             damage: Vec::new(),
             cursor_changed: false,
             cursor_image_dirty: false,
@@ -1471,10 +1479,13 @@ impl State {
     }
 
     fn upload_buffers(&mut self, r: &mut Renderer) {
+        self.uploads_pending = false;
         self.import_shown_dmabufs(r);
         let keys: Vec<SKey> = self.surfaces.iter().filter(|(_, s)| s.upload.is_some()).map(|(k, _)| *k).collect();
         for key in keys {
-            let bid = self.surfaces.get_mut(&key).unwrap().upload.take().unwrap();
+            let sf = self.surfaces.get_mut(&key).unwrap();
+            let bid = sf.upload.take().unwrap();
+            let damage = sf.damage.replace(Vec::new());
             let bkey = SKey { client: key.client, id: bid };
             let new_content = match self.buffers.get_mut(&bkey) {
                 None => continue,
@@ -1487,7 +1498,14 @@ impl State {
                         _ => None,
                     };
                     let ptr = unsafe { p.ptr.add(offset as usize) };
-                    let (tex, faulted) = compositor::guarded_read(ptr, len, |pixels| r.upload(old, width, height, stride, pixels));
+                    let areas = damage.and_then(|d| changed_areas(&d, width, height));
+                    let (tex, faulted) = compositor::guarded_read(ptr, len, |pixels| match (old, areas) {
+                        (Some(t), Some(areas)) if (t.width, t.height) == (width, height) => {
+                            r.update(&t, &areas, stride, pixels);
+                            t
+                        }
+                        (old, _) => r.upload(old, width, height, stride, pixels),
+                    });
                     if faulted {
                         self.error(key.client, bid, wire::wl_shm::error::INVALID_FD, "shm pool truncated by the client");
                     }
@@ -1515,4 +1533,20 @@ impl State {
             }
         }
     }
+}
+
+/// The buffer areas to upload, clipped to it; `None` when uploading it
+/// all is about as cheap.
+fn changed_areas(damage: &[Rect], width: i32, height: i32) -> Option<Vec<(i32, i32, i32, i32)>> {
+    let mut areas = Vec::with_capacity(damage.len());
+    let mut total = 0i64;
+    for d in damage {
+        let (x0, y0) = (d.x.clamp(0, width), d.y.clamp(0, height));
+        let (x1, y1) = (d.x.saturating_add(d.w).clamp(0, width), d.y.saturating_add(d.h).clamp(0, height));
+        if x1 > x0 && y1 > y0 {
+            areas.push((x0, y0, x1 - x0, y1 - y0));
+            total += (x1 - x0) as i64 * (y1 - y0) as i64;
+        }
+    }
+    (total * 2 < width as i64 * height as i64 && areas.len() <= 16).then_some(areas)
 }

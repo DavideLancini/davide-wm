@@ -14,6 +14,8 @@ pub const BLEND: GLenum = 0x0BE2;
 pub const SCISSOR_TEST: GLenum = 0x0C11;
 pub const UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 pub const UNPACK_ROW_LENGTH: GLenum = 0x0CF2;
+pub const UNPACK_SKIP_ROWS: GLenum = 0x0CF3;
+pub const UNPACK_SKIP_PIXELS: GLenum = 0x0CF4;
 pub const TEXTURE_2D: GLenum = 0x0DE1;
 pub const UNSIGNED_BYTE: GLenum = 0x1401;
 pub const FLOAT: GLenum = 0x1406;
@@ -100,6 +102,17 @@ extern "C" {
         w: GLsizei,
         h: GLsizei,
         border: GLint,
+        format: GLenum,
+        kind: GLenum,
+        data: *const c_void,
+    );
+    pub fn glTexSubImage2D(
+        target: GLenum,
+        level: GLint,
+        x: GLint,
+        y: GLint,
+        w: GLsizei,
+        h: GLsizei,
         format: GLenum,
         kind: GLenum,
         data: *const c_void,
