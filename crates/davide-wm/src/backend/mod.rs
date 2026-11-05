@@ -248,6 +248,12 @@ impl Drm {
             .collect()
     }
 
+    /// Colour multipliers for every head (night light); applied with the
+    /// next frame.
+    pub fn set_gamma(&mut self, g: Option<(f32, f32, f32)>) {
+        self.kms.gamma = g;
+    }
+
     pub fn set_blank(&mut self, blanked: bool) -> io::Result<()> {
         self.blanked = blanked;
         self.apply_power()

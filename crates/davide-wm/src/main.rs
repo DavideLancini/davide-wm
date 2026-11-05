@@ -15,6 +15,7 @@ mod lock;
 mod notify;
 mod png;
 mod portal;
+mod services;
 mod server;
 mod wifi;
 mod worker;
@@ -54,6 +55,7 @@ const TOKEN_PIPEWIRE: u64 = 17;
 const TOKEN_PORTAL: u64 = 18;
 const TOKEN_OSD: u64 = 19;
 const TOKEN_AGENTS: u64 = 20;
+const TOKEN_BATTERY: u64 = 21;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -208,7 +210,17 @@ struct App {
     wifi_job: Option<Option<wifi::Network>>,
     /// Switch to the next CPU level (on the worker: it runs sudo).
     cpu_job: bool,
+    /// Blocking jobs for the worker (D-Bus calls of the small services).
+    jobs: Vec<Job>,
+    /// Ticks every minute for the battery watch.
+    battery_timer: OwnedFd,
+    battery: services::BatteryWatch,
+    night: display::Night,
+    /// The multipliers last handed to the backend.
+    night_sent: Option<Option<(f32, f32, f32)>>,
 }
+
+type Job = Box<dyn FnOnce() -> Result<worker::Done, String> + Send>;
 
 impl App {
     fn spawn(&self, line: &str) {
@@ -342,6 +354,16 @@ impl App {
             Action::Brightness(d) => self.change_brightness(d),
             Action::Lock => self.lock(),
             Action::Wifi => self.wifi_job = Some(None),
+            Action::PowerMenu => {
+                let labels = ["Blocca", "Sospendi", "Riavvia", "Spegni", "Esci da davide-wm"].map(String::from).to_vec();
+                self.state.open_view(launcher::Launcher::picker(labels), Purpose::Power);
+            }
+            Action::Media(key) => self.jobs.push(Box::new(move || services::media(key).map(|_| worker::Done::Saved))),
+            Action::AudioOutputs => {
+                if let Some(bar) = &self.bar {
+                    bar.send(bar::ToBar::ListOutputs);
+                }
+            }
             Action::Exit => self.running = false,
         }
     }
@@ -374,6 +396,28 @@ impl App {
         self.state.abandoned.retain(|p| *p != purpose);
         match purpose {
             Purpose::Apps => {}
+            Purpose::Power => match i {
+                0 => self.lock(),
+                1 => self.jobs.push(Box::new(|| services::power(services::Power::Suspend).map(|_| worker::Done::Saved))),
+                2 => self.jobs.push(Box::new(|| services::power(services::Power::Reboot).map(|_| worker::Done::Saved))),
+                3 => self.jobs.push(Box::new(|| services::power(services::Power::Shutdown).map(|_| worker::Done::Saved))),
+                4 => self.running = false,
+                _ => {}
+            },
+            Purpose::Outputs(names) => {
+                if let (Some(n), Some(bar)) = (names.get(i), &self.bar) {
+                    bar.send(bar::ToBar::SetOutput(n.clone()));
+                }
+            }
+            Purpose::Bluetooth(powered, devices) => match (i, powered) {
+                (0, p) => self.jobs.push(Box::new(move || services::bt_power(!p).map(worker::Done::Osd))),
+                (i, _) => {
+                    if let Some(d) = devices.get(i - 1).cloned() {
+                        self.show_osd(&format!("{}…", d.name), None);
+                        self.jobs.push(Box::new(move || services::bt_toggle(&d).map(worker::Done::Osd)));
+                    }
+                }
+            },
             Purpose::Timer(secs) => {
                 if let (Some(s), Some(bar)) = (secs.get(i), &self.bar) {
                     bar.send(bar::ToBar::Timer((*s > 0).then_some(*s)));
@@ -412,7 +456,7 @@ impl App {
     /// Delete in a picker.
     fn deleted(&mut self, purpose: Purpose, i: usize) {
         match purpose {
-            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) | Purpose::Timer(_) => {}
+            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) | Purpose::Timer(_) | Purpose::Power | Purpose::Outputs(_) | Purpose::Bluetooth(..) => {}
             Purpose::Clipboard(hashes) => {
                 if let Some(j) = self.clip_index(&hashes, i) {
                     self.state.selection.history.entries.remove(j);
@@ -535,6 +579,65 @@ impl App {
             self.state.needs_redraw = true;
         }
         self.agent_actions(actions);
+    }
+
+    fn open_bluetooth(&mut self, powered: bool, devices: Vec<services::BtDevice>) {
+        let mut labels = vec![if powered { "Spegni il Bluetooth".to_string() } else { "Accendi il Bluetooth".to_string() }];
+        labels.extend(devices.iter().map(|d| if d.connected { format!("{} · connesso", d.name) } else { d.name.clone() }));
+        self.state.open_view(launcher::Launcher::picker(labels), Purpose::Bluetooth(powered, devices));
+    }
+
+    /// The month under the clock; a second click hides it.
+    fn toggle_calendar(&mut self) {
+        if self.state.calendar.is_some() {
+            self.state.set_calendar(None);
+            return;
+        }
+        if self.cards.is_none() {
+            self.cards = launcher::card::Cards::new().inspect_err(|e| log!("{e}")).ok();
+        }
+        let Some(cards) = &self.cards else { return };
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&now, &mut tm) };
+        let (year, month, day) = (tm.tm_year + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32);
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month as usize - 1];
+        // Weekday of the 1st, Monday first.
+        let first = ((tm.tm_wday + 6 - (day as i32 - 1) % 7) % 7 + 7) as u32 % 7;
+        self.state.set_calendar(Some(cards.calendar(year, month, days, first, Some(day))));
+    }
+
+    /// Applies the night light for the current hour when it changed.
+    fn night_light(&mut self) {
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&now, &mut tm) };
+        let g = self.night.gamma(tm.tm_hour as u32);
+        if self.night_sent == Some(g) {
+            return;
+        }
+        self.night_sent = Some(g);
+        if let Backend::Drm(d) = &mut self.backend {
+            d.set_gamma(g);
+            self.state.needs_redraw = true;
+        }
+    }
+
+    /// The battery watch's minute tick.
+    fn battery_tick(&mut self) {
+        self.night_light();
+        let Some((level, discharging)) = services::battery() else { return };
+        match self.battery.check(level, discharging) {
+            services::BatteryAlert::None => return,
+            services::BatteryAlert::Low(l) => self.notifier.local("Batteria", &format!("{l}%: collega l'alimentatore"), "", false),
+            services::BatteryAlert::Critical(l) => self.notifier.local("Batteria", &format!("{l}%: tra poco il portatile si sospende"), "", true),
+            services::BatteryAlert::Suspend => {
+                log!("battery at {level}%: suspending");
+                self.jobs.push(Box::new(|| services::power(services::Power::Suspend).map(|_| worker::Done::Saved)));
+            }
+        }
+        self.sync_notices();
     }
 
     fn open_wifi(&mut self, nets: Vec<wifi::Network>) {
@@ -909,6 +1012,17 @@ impl App {
             ipc::Command::Cast(window) => return self.cast_now(window),
             ipc::Command::CastStop(id) => self.casts.stop(id),
             ipc::Command::Lock => self.lock(),
+            ipc::Command::Night(arg) => {
+                match arg.as_deref() {
+                    None => {}
+                    Some("on") => self.night = display::Night::On,
+                    Some("off") => self.night = display::Night::Off,
+                    Some("auto") => self.night = display::Night::Auto,
+                    Some(other) => return format!("error: night takes on, off or auto, not {other:?}\n"),
+                }
+                self.night_light();
+                return format!("{:?}\n", self.night).to_lowercase();
+            }
             ipc::Command::ClipboardImport(path) => {
                 let older = match std::fs::read(&path) {
                     Ok(b) => clipboard::History::decode(&b),
@@ -981,6 +1095,13 @@ impl App {
                 self.sync_notices();
             }
             bar::FromBar::Screenshot => self.shot_request = Some((0, true)),
+            bar::FromBar::Outputs(list) => {
+                let labels = list.iter().map(|(_, d, on)| if *on { format!("{d} · attiva") } else { d.clone() }).collect();
+                let names = list.into_iter().map(|(n, ..)| n).collect();
+                self.state.open_view(launcher::Launcher::picker(labels), Purpose::Outputs(names));
+            }
+            bar::FromBar::Bluetooth => self.jobs.push(Box::new(|| services::bt_devices().map(|(p, d)| worker::Done::Bluetooth(p, d)))),
+            bar::FromBar::Calendar => self.toggle_calendar(),
             bar::FromBar::CycleScreensaver => {
                 let mut ss = self.display.screensaver;
                 ss.cycle();
@@ -1243,6 +1364,11 @@ impl App {
                 _ => {}
             }
         }
+        if let Event::PointerButton(_, true) = e {
+            if self.state.calendar.is_some() && !self.state.in_bar(self.state.pointer.y) {
+                self.state.set_calendar(None);
+            }
+        }
         if let Event::PointerButton(b, true) = e {
             if let Some(id) = self.state.notice_at(self.state.pointer.x, self.state.pointer.y) {
                 const BTN_LEFT: u32 = 0x110;
@@ -1344,6 +1470,11 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         polkit_job: None,
         wifi_job: None,
         cpu_job: false,
+        jobs: Vec::new(),
+        battery_timer: event_loop::timer_fd().expect("timerfd"),
+        battery: services::BatteryWatch::default(),
+        night: display::Night::Auto,
+        night_sent: None,
     }
 }
 
@@ -1522,6 +1653,9 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
         ep.add(fd, TOKEN_PORTAL)?;
     }
     ep.add(app.osd_timer.as_raw_fd(), TOKEN_OSD)?;
+    event_loop::arm_periodic(&app.battery_timer, std::time::Duration::from_secs(60));
+    app.night_light();
+    ep.add(app.battery_timer.as_raw_fd(), TOKEN_BATTERY)?;
     if app.state.wallpaper.is_none() && !WALLPAPER.is_empty() {
         worker.run(|| {
             let mut img = jpeg::decode(WALLPAPER).map_err(|e| e.to_string())?;
@@ -1799,6 +1933,8 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                             Ok(worker::Done::Unlock(ok)) => app.unlocked(ok),
                             Ok(worker::Done::Polkit(ok)) => app.polkit_checked(ok),
                             Ok(worker::Done::Networks(nets)) => app.open_wifi(nets),
+                            Ok(worker::Done::Osd(text)) => app.show_osd(&text, None),
+                            Ok(worker::Done::Bluetooth(p, d)) => app.open_bluetooth(p, d),
                             Ok(worker::Done::Cpu(label)) => {
                                 app.notifier.local("CPU", &label, "", false);
                                 app.sync_notices();
@@ -1872,6 +2008,10 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                 TOKEN_AGENTS => {
                     let actions = app.agents.as_mut().map(|a| a.dispatch()).unwrap_or_default();
                     app.agent_actions(actions);
+                }
+                TOKEN_BATTERY => {
+                    event_loop::read_timer(&app.battery_timer);
+                    app.battery_tick();
                 }
                 TOKEN_OSD => {
                     event_loop::read_timer(&app.osd_timer);
@@ -1972,6 +2112,9 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         }
         if let Some((user, cookie, password)) = app.polkit_job.take() {
             worker.run(move || Ok(worker::Done::Polkit(agents::polkit_check(&user, &cookie, password))));
+        }
+        for job in std::mem::take(&mut app.jobs) {
+            worker.run(job);
         }
         if std::mem::take(&mut app.cpu_job) {
             worker.run(|| Ok(worker::Done::Cpu(cpu::cycle())));

@@ -20,6 +20,7 @@ pub mod keys {
     pub const BACKSLASH: u32 = 0x005c;
     pub const IGRAVE: u32 = 0x00ec;
     pub const DIGITS: [u32; 10] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30];
+    pub const A: u32 = 0x0061;
     pub const B: u32 = 0x0062;
     pub const C: u32 = 0x0063;
     pub const E: u32 = 0x0065;
@@ -43,10 +44,23 @@ pub mod keys {
     pub const AUDIO_MUTE: u32 = 0x1008ff12;
     pub const AUDIO_RAISE_VOLUME: u32 = 0x1008ff13;
     pub const AUDIO_MIC_MUTE: u32 = 0x1008ffb2;
+    pub const AUDIO_PLAY: u32 = 0x1008ff14;
+    pub const AUDIO_STOP: u32 = 0x1008ff15;
+    pub const AUDIO_PREV: u32 = 0x1008ff16;
+    pub const AUDIO_NEXT: u32 = 0x1008ff17;
+    pub const AUDIO_PAUSE: u32 = 0x1008ff31;
     pub const MON_BRIGHTNESS_UP: u32 = 0x1008ff02;
     pub const MON_BRIGHTNESS_DOWN: u32 = 0x1008ff03;
     /// F1; Fn is this plus n - 1.
     pub const F1: u32 = 0xffbe;
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Media {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -80,6 +94,12 @@ pub enum Action {
     Lock,
     /// The Wi-Fi network list.
     Wifi,
+    /// Lock, suspend, reboot, power off or quit, chosen in the launcher box.
+    PowerMenu,
+    /// Media keys, sent to the MPRIS player that is playing.
+    Media(Media),
+    /// The audio output list.
+    AudioOutputs,
     Exit,
 }
 
@@ -117,8 +137,13 @@ pub fn binds() -> Vec<Bind> {
         b(0, keys::MON_BRIGHTNESS_UP, Action::Brightness(BRIGHTNESS_STEP)),
         b(0, keys::PRINT, Action::Screenshot),
         b(MAIN | CTRL | ALT | SHIFT, keys::F12, Action::ToggleBar),
-        b(MAIN | SHIFT, keys::P, Action::Spawn("poweroff")),
-        b(MAIN | SHIFT, keys::R, Action::Spawn("reboot")),
+        b(MAIN | SHIFT, keys::P, Action::PowerMenu),
+        b(MAIN, keys::A, Action::AudioOutputs),
+        b(0, keys::AUDIO_PLAY, Action::Media(Media::PlayPause)),
+        b(0, keys::AUDIO_PAUSE, Action::Media(Media::PlayPause)),
+        b(0, keys::AUDIO_NEXT, Action::Media(Media::Next)),
+        b(0, keys::AUDIO_PREV, Action::Media(Media::Previous)),
+        b(0, keys::AUDIO_STOP, Action::Media(Media::Stop)),
         b(MAIN, keys::Q, Action::CloseWindow),
         b(MAIN, keys::R, Action::ToggleSpecial),
         b(MAIN | SHIFT, keys::F, Action::ToggleMaximize),
@@ -219,6 +244,14 @@ pub const NOTIFICATION_POPUPS: usize = 4;
 /// The PAM stack the lock screen checks passwords with (Arch's local
 /// login stack: pam_faillock, pam_unix).
 pub const LOCK_PAM_SERVICE: &str = "system-local-login";
+
+/// Night light: from this hour, until this hour, at this colour
+/// temperature (kelvin).
+pub const NIGHT_LIGHT: (u32, u32, u32) = (20, 7, 4000);
+
+/// Battery: warn at the first level, warn again at the second, suspend at
+/// the third (percent, while discharging).
+pub const BATTERY_THRESHOLDS: (u32, u32, u32) = (15, 5, 3);
 
 pub const VOLUME_STEP: i32 = 5;
 pub const BRIGHTNESS_STEP: i32 = 5;

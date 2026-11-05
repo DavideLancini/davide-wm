@@ -18,7 +18,10 @@ const CMD_ERROR: u32 = 0;
 const CMD_REPLY: u32 = 2;
 const CMD_AUTH: u32 = 8;
 const CMD_SET_CLIENT_NAME: u32 = 9;
+const CMD_GET_SERVER_INFO: u32 = 20;
 const CMD_GET_SINK_INFO: u32 = 21;
+const CMD_GET_SINK_INFO_LIST: u32 = 22;
+const CMD_SET_DEFAULT_SINK: u32 = 44;
 const CMD_GET_SOURCE_INFO: u32 = 23;
 const CMD_SUBSCRIBE: u32 = 35;
 /// Sets every channel of a sink: index, name, cvolume.
@@ -51,6 +54,13 @@ const TAG_SAMPLE_SPEC: u8 = b'a';
 const TAG_CHANNEL_MAP: u8 = b'm';
 const TAG_CVOLUME: u8 = b'v';
 const TAG_PROPLIST: u8 = b'P';
+const TAG_U8: u8 = b'B';
+const TAG_U64: u8 = b'R';
+const TAG_S64: u8 = b'r';
+const TAG_USEC: u8 = b'U';
+const TAG_VOLUME: u8 = b'V';
+const TAG_FORMAT_INFO: u8 = b'f';
+const TAG_TIMEVAL: u8 = b'T';
 
 /// Builds a tagstruct payload.
 #[derive(Default)]
@@ -162,6 +172,48 @@ impl<'a> Reader<'a> {
             max = max.max(u32::from_be_bytes(bytes.try_into().ok()?));
         }
         Some(max)
+    }
+
+    /// Skips one value of any type: enough to walk records whose layout
+    /// only matters in part.
+    fn skip(&mut self) -> Option<()> {
+        let tag = self.tag()?;
+        let fixed = match tag {
+            TAG_U32 | TAG_VOLUME => 4,
+            TAG_U8 => 1,
+            TAG_U64 | TAG_S64 | TAG_USEC | TAG_TIMEVAL => 8,
+            TAG_BOOL_TRUE | TAG_BOOL_FALSE | TAG_STRING_NULL => 0,
+            TAG_SAMPLE_SPEC => 6,
+            TAG_STRING => {
+                self.pos = self.buf[self.pos..].iter().position(|&b| b == 0)? + self.pos + 1;
+                return Some(());
+            }
+            TAG_ARBITRARY => {
+                let n = u32::from_be_bytes(self.buf.get(self.pos..self.pos + 4)?.try_into().ok()?) as usize;
+                4 + n
+            }
+            TAG_CHANNEL_MAP => 1 + *self.buf.get(self.pos)? as usize,
+            TAG_CVOLUME => 1 + 4 * *self.buf.get(self.pos)? as usize,
+            TAG_PROPLIST => {
+                // key, length, value; a null string ends it.
+                loop {
+                    if *self.buf.get(self.pos)? == TAG_STRING_NULL {
+                        self.pos += 1;
+                        return Some(());
+                    }
+                    self.skip()?;
+                    self.skip()?;
+                    self.skip()?;
+                }
+            }
+            TAG_FORMAT_INFO => {
+                self.skip()?;
+                return self.skip();
+            }
+            _ => return None,
+        };
+        self.pos += fixed;
+        (self.pos <= self.buf.len()).then_some(())
     }
 
     fn bool(&mut self) -> Option<bool> {
@@ -354,6 +406,64 @@ impl Pulse {
             req.extend_from_slice(&raw.to_be_bytes());
         }
         self.request(&req).map(|_| ())
+    }
+
+    /// Every sink: (name, description), in the server's order.
+    pub fn sinks(&mut self) -> Option<Vec<(String, String)>> {
+        let tag = self.next_tag();
+        let body = self.request(&Writer::default().u32(CMD_GET_SINK_INFO_LIST).u32(tag).finish())?;
+        let mut r = Reader::new(&body);
+        r.u32()?;
+        r.u32()?;
+        let mut out = Vec::new();
+        while r.pos < body.len() {
+            r.u32()?; // index
+            let name = r.string()?.unwrap_or_default();
+            let description = r.string()?.unwrap_or_default();
+            // sample spec, channel map, owner module, volume, mute, monitor
+            // source and its name, latency, driver, flags, proplist,
+            // configured latency, base volume, state, volume steps, card.
+            for _ in 0..16 {
+                r.skip()?;
+            }
+            let ports = r.u32()?;
+            for _ in 0..ports {
+                // name, description, priority, available, group, type
+                for _ in 0..6 {
+                    r.skip()?;
+                }
+            }
+            r.skip()?; // active port
+            let formats = {
+                (r.tag()? == TAG_U8).then_some(())?;
+                let n = *body.get(r.pos)?;
+                r.pos += 1;
+                n
+            };
+            for _ in 0..formats {
+                r.skip()?;
+            }
+            out.push((name, description));
+        }
+        Some(out)
+    }
+
+    /// The default sink's name.
+    pub fn default_sink_name(&mut self) -> Option<String> {
+        let tag = self.next_tag();
+        let body = self.request(&Writer::default().u32(CMD_GET_SERVER_INFO).u32(tag).finish())?;
+        let mut r = Reader::new(&body);
+        r.u32()?;
+        r.u32()?;
+        for _ in 0..5 {
+            r.skip()?;
+        }
+        r.string()?
+    }
+
+    pub fn set_default_sink(&mut self, name: &str) -> Option<()> {
+        let tag = self.next_tag();
+        self.request(&Writer::default().u32(CMD_SET_DEFAULT_SINK).u32(tag).string(name).finish()).map(|_| ())
     }
 
     /// Mutes or unmutes the sink at `index`.

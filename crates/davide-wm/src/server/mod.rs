@@ -257,6 +257,11 @@ pub enum Purpose {
     Wifi(Vec<crate::wifi::Network>),
     /// Countdown lengths in seconds; 0 stops the timer.
     Timer(Vec<u64>),
+    Power,
+    /// Sink names.
+    Outputs(Vec<String>),
+    /// Adapter power, then the paired devices.
+    Bluetooth(bool, Vec<crate::services::BtDevice>),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -432,6 +437,8 @@ pub struct State {
     pub notices: Vec<NoticeView>,
     /// The volume/brightness indicator.
     pub osd: Option<NoticeView>,
+    /// The month, shown under the clock.
+    pub calendar: Option<NoticeView>,
     pub shot: Option<ShotView>,
     /// The lock screen: while set, nothing but it is drawn or gets input.
     pub lock: Option<PromptView>,
@@ -489,6 +496,7 @@ impl State {
             launcher: None,
             notices: Vec::new(),
             osd: None,
+            calendar: None,
             shot: None,
             lock: None,
             prompt: None,
@@ -856,6 +864,19 @@ impl State {
         self.needs_redraw = true;
     }
 
+    /// Shows the calendar under the right end of the bar, or hides it.
+    pub fn set_calendar(&mut self, card: Option<Card>) {
+        if let Some(t) = self.calendar.take().and_then(|o| o.tex) {
+            self.dead_textures.push(t);
+        }
+        self.calendar = card.map(|(h, px)| {
+            let w = launcher::card::CALENDAR_WIDTH as i32;
+            let top = if self.bar.visible { self.bar.height } else { 0 } + 8;
+            NoticeView { id: 0, rect: Rect::new(self.output.width - w - 12, top, w, h as i32), pixels: Some(px), tex: None }
+        });
+        self.needs_redraw = true;
+    }
+
     pub fn notice_at(&self, x: f64, y: f64) -> Option<u32> {
         self.notices.iter().find(|n| n.rect.contains(x, y)).map(|n| n.id)
     }
@@ -1142,7 +1163,7 @@ impl State {
         for (key, origin) in xwm::floating(self) {
             self.draw_tree(r, key, origin);
         }
-        for n in self.notices.iter_mut().chain(self.osd.as_mut()) {
+        for n in self.notices.iter_mut().chain(self.osd.as_mut()).chain(self.calendar.as_mut()) {
             if let Some(px) = n.pixels.take() {
                 n.tex = Some(r.upload(n.tex.take(), n.rect.w, n.rect.h, n.rect.w * 4, &px));
             }

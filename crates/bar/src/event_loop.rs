@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::actions::{self, Target, Widget};
+use crate::actions::{Target, Widget};
 use crate::modules::layout::State;
 use crate::zones::Zones;
 use crate::{log, settings, Client, FromBar, ToBar, WsEntry};
@@ -384,6 +384,17 @@ impl<'a> Loop<'a> {
                 m.lid = if lid_inhibited { "LID:ON" } else { "LID:OFF" }.into();
                 true
             }
+            ToBar::ListOutputs => {
+                if let Some(list) = self.zones.modules.audio.outputs() {
+                    self.link.send(FromBar::Outputs(list));
+                }
+                false
+            }
+            ToBar::SetOutput(name) => {
+                self.zones.modules.audio.set_output(&name);
+                self.zones.modules.invalidate_cached();
+                true
+            }
             ToBar::Timer(secs) => {
                 self.zones.modules.timer.set(secs);
                 true
@@ -427,7 +438,8 @@ impl<'a> Loop<'a> {
             Widget::Microphone => {
                 m.audio.toggle_mic();
             }
-            Widget::Clock => m.clock_date = !m.clock_date,
+            Widget::Clock => self.link.send(FromBar::Calendar),
+            Widget::BtHeadphones => self.link.send(FromBar::Bluetooth),
             Widget::Spotify => self.link.send(FromBar::FocusApp("spotify".into())),
             // Compositor state: it answers with ToBar::Display.
             Widget::Blk => self.link.send(FromBar::Blank),
@@ -439,14 +451,8 @@ impl<'a> Loop<'a> {
             Widget::Backlight => self.link.send(FromBar::Brightness(0)),
             Widget::Timer => self.link.send(FromBar::Timer),
             Widget::Screenshot => self.link.send(FromBar::Screenshot),
-            _ => {
-                if let Some(command) = widget.command() {
-                    actions::run_detached(command);
-                }
-            }
         }
-        // A click ran a command that likely changed what a widget reports; the
-        // helpers cache their output, so drop it first.
+        // A click likely changed what a widget reports: drop cached values.
         self.zones.modules.invalidate_cached();
         true
     }

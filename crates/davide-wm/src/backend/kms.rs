@@ -42,6 +42,9 @@ struct Head {
     mode_blob: Option<u32>,
     /// False while powered down (DPMS off): the CRTC is disabled.
     on: bool,
+    /// The colour multipliers on the CRTC now, and their LUT blob.
+    gamma_sent: Option<(f32, f32, f32)>,
+    gamma_blob: Option<u32>,
 }
 
 pub struct Kms {
@@ -55,6 +58,10 @@ pub struct Kms {
     /// Framebuffers left by the process before a live upgrade, freed after
     /// the first page flip of this one.
     stale: Vec<(u32, u32)>,
+    /// GAMMA_LUT_SIZE of each CRTC that has a gamma LUT.
+    gamma_size: HashMap<u32, usize>,
+    /// Wanted colour multipliers (night light); `None` is neutral.
+    pub gamma: Option<(f32, f32, f32)>,
 }
 
 /// What survives a live upgrade.
@@ -85,8 +92,21 @@ fn vec_ptr<T>(v: &mut [T]) -> u64 {
     v.as_mut_ptr() as u64
 }
 
-fn prop_names() -> [&'static str; 14] {
-    ["CRTC_ID", "MODE_ID", "ACTIVE", "FB_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "type", "DPMS"]
+fn prop_names() -> [&'static str; 16] {
+    ["CRTC_ID", "MODE_ID", "ACTIVE", "FB_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H", "type", "DPMS", "GAMMA_LUT", "GAMMA_LUT_SIZE"]
+}
+
+/// A colour ramp scaled by `mul` (red, green, blue), as `struct drm_color_lut`.
+fn gamma_ramp(size: usize, mul: (f32, f32, f32)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size * 8);
+    for i in 0..size {
+        let v = i as f32 / (size.max(2) - 1) as f32 * 65535.0;
+        for m in [mul.0, mul.1, mul.2] {
+            out.extend_from_slice(&((v * m.clamp(0.0, 1.0)) as u16).to_ne_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+    }
+    out
 }
 
 fn same_mode(a: &ModeInfo, b: &ModeInfo) -> bool {
@@ -127,9 +147,14 @@ impl Kms {
             connectors_all: connectors.clone(),
             heads: Vec::new(),
             stale: Vec::new(),
+            gamma_size: HashMap::new(),
+            gamma: None,
         };
         for c in &crtcs {
-            kms.load_props(*c, drm::OBJECT_CRTC)?;
+            let values = kms.load_props(*c, drm::OBJECT_CRTC)?;
+            if let (Some(size), true) = (values.get("GAMMA_LUT_SIZE"), kms.props.contains_key(&(*c, "GAMMA_LUT"))) {
+                kms.gamma_size.insert(*c, *size as usize);
+            }
         }
         for c in &connectors {
             kms.load_props(*c, drm::OBJECT_CONNECTOR)?;
@@ -270,6 +295,12 @@ impl Kms {
         ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_ATOMIC, &mut a)
     }
 
+    fn create_blob_bytes(&self, data: &[u8]) -> io::Result<u32> {
+        let mut b = drm::CreateBlob { data: data.as_ptr() as u64, length: data.len() as u32, blob_id: 0 };
+        ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_CREATEPROPBLOB, &mut b)?;
+        Ok(b.blob_id)
+    }
+
     fn create_blob<T>(&self, data: &T) -> io::Result<u32> {
         let mut b = drm::CreateBlob { data: data as *const T as u64, length: std::mem::size_of::<T>() as u32, blob_id: 0 };
         ioctl(self.fd.as_raw_fd(), drm::IOCTL_MODE_CREATEPROPBLOB, &mut b)?;
@@ -350,7 +381,7 @@ impl Kms {
                 buffers.push(ScanBuffer { target, fb, handle });
             }
             log!("output {} ({}): {}x{}@{:.2}", o.name, o.model, size.0, size.1, o.mode.refresh_mhz() as f64 / 1000.0);
-            self.heads.push(Head { output: o, buffers, front: None, pending: None, modeset: true, mode_blob: None, on: true });
+            self.heads.push(Head { output: o, buffers, front: None, pending: None, modeset: true, mode_blob: None, on: true, gamma_sent: None, gamma_blob: None });
         }
         for h in old {
             log!("output {} released", h.output.name);
@@ -427,6 +458,19 @@ impl Kms {
             ],
         )];
         let mut flags = drm::MODE_PAGE_FLIP_EVENT;
+        // The night light rides along with the next frame of each head.
+        let want = self.gamma.unwrap_or((1.0, 1.0, 1.0));
+        let mut new_gamma = None;
+        // Never in a modeset: a refused LUT must not cost the output.
+        if h.gamma_sent != Some(want) && !h.modeset {
+            if let Some(size) = self.gamma_size.get(&o.crtc).copied() {
+                let blob = if self.gamma.is_some() { self.create_blob_bytes(&gamma_ramp(size, want))? } else { 0 };
+                objs.push((o.crtc, vec![("GAMMA_LUT", blob as u64)]));
+                new_gamma = Some(blob);
+            }
+        }
+        let h = &self.heads[head];
+        let o = &h.output;
         if h.modeset {
             let blob = self.create_blob(&o.mode)?;
             objs.push((o.connector, vec![("CRTC_ID", o.crtc as u64)]));
@@ -438,9 +482,32 @@ impl Kms {
                 self.destroy_blob(old);
             }
             res.map_err(|e| io::Error::other(format!("modeset of {name} failed: {e}")))?;
+            // The LUT goes with the next frame.
+            self.heads[head].gamma_sent = None;
         } else {
             flags |= drm::MODE_ATOMIC_NONBLOCK;
-            self.commit(objs, flags)?;
+            if let Err(e) = self.commit(objs.clone(), flags) {
+                if new_gamma.is_none() {
+                    return Err(e);
+                }
+                // A driver that refuses the LUT must not stop the frames.
+                let crtc = self.heads[head].output.crtc;
+                log!("night light refused on CRTC {crtc}: {e}");
+                self.gamma_size.remove(&crtc);
+                if let Some(blob) = new_gamma.take().filter(|b| *b != 0) {
+                    self.destroy_blob(blob);
+                }
+                objs.retain(|(obj, list)| !(*obj == crtc && list.iter().any(|(n, _)| *n == "GAMMA_LUT")));
+                self.commit(objs, flags)?;
+            }
+        }
+        if let Some(blob) = new_gamma {
+            let h = &mut self.heads[head];
+            h.gamma_sent = Some(want);
+            let old = std::mem::replace(&mut h.gamma_blob, (blob != 0).then_some(blob));
+            if let Some(old) = old {
+                self.destroy_blob(old);
+            }
         }
         let h = &mut self.heads[head];
         h.modeset = false;

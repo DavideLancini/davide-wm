@@ -358,6 +358,7 @@ impl State {
             launcher: _,
             notices: _,
             osd: _,
+            calendar: _,
             shot: _,
             lock,
             prompt: _,

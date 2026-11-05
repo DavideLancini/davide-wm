@@ -69,6 +69,14 @@ pub fn arm_timer(fd: &OwnedFd, after: std::time::Duration) {
     unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
 }
 
+/// Fires `fd` every `period`, the first time after one period.
+pub fn arm_periodic(fd: &OwnedFd, period: std::time::Duration) {
+    let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+    spec.it_value.tv_sec = period.as_secs() as libc::time_t;
+    spec.it_interval.tv_sec = period.as_secs() as libc::time_t;
+    unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+}
+
 /// Consumes an expiry so the fd stops being readable.
 pub fn read_timer(fd: &OwnedFd) {
     let mut n = 0u64;

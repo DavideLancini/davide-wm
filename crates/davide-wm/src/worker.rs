@@ -22,6 +22,9 @@ pub enum Done {
     Networks(Vec<crate::wifi::Network>),
     /// A CPU level was applied: its description.
     Cpu(String),
+    /// A line for the on-screen indicator.
+    Osd(String),
+    Bluetooth(bool, Vec<crate::services::BtDevice>),
     /// Connecting to a network: its name, or why not.
     WifiConnect(Result<String, String>),
     /// A Wayland selection read for an X client.

@@ -88,6 +88,36 @@ impl Screensaver {
     }
 }
 
+/// RGB multipliers for a colour temperature (Tanner Helland's fit of the
+/// black-body curve), daylight being 6500 K.
+pub fn kelvin(k: u32) -> (f32, f32, f32) {
+    let t = k.clamp(1000, 6500) as f32 / 100.0;
+    let g = (99.470_8 * t.ln() - 161.119_57) / 255.0;
+    let b = if t <= 19.0 { 0.0 } else { (138.517_73 * (t - 10.0).ln() - 305.044_8) / 255.0 };
+    (1.0, g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Night {
+    /// On between the hours of `config::NIGHT_LIGHT`.
+    Auto,
+    On,
+    Off,
+}
+
+impl Night {
+    /// The multipliers to use at `hour`, None for neutral colours.
+    pub fn gamma(self, hour: u32) -> Option<(f32, f32, f32)> {
+        let (start, end, k) = config::NIGHT_LIGHT;
+        let night = if start > end { hour >= start || hour < end } else { hour >= start && hour < end };
+        match self {
+            Night::On => Some(kelvin(k)),
+            Night::Auto if night => Some(kelvin(k)),
+            _ => None,
+        }
+    }
+}
+
 pub struct Display {
     pub screensaver: Screensaver,
     timer: OwnedFd,
@@ -221,6 +251,17 @@ mod tests {
         s.cycle();
         s.auto(false);
         assert_eq!((s.enabled, s.timeout), (true, 300));
+    }
+
+    #[test]
+    fn night_hours_and_colours() {
+        assert_eq!(Night::Auto.gamma(12), None);
+        assert!(Night::Auto.gamma(22).is_some() && Night::Auto.gamma(3).is_some());
+        assert_eq!(Night::Off.gamma(23), None);
+        let (r, g, b) = kelvin(4000);
+        assert!(r == 1.0 && g > 0.7 && g < 0.9 && b > 0.5 && b < 0.7, "{g} {b}");
+        let (_, g, b) = kelvin(6500);
+        assert!(g > 0.95 && b > 0.95);
     }
 
     #[test]

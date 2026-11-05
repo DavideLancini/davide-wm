@@ -110,6 +110,20 @@ impl Audio {
         self.ensure()?.default_source().map(|d| (d.volume_percent, d.muted))
     }
 
+    /// The outputs as (name, description, default).
+    pub fn outputs(&mut self) -> Option<Vec<(String, String, bool)>> {
+        let pulse = self.ensure()?;
+        let default = pulse.default_sink_name().unwrap_or_default();
+        Some(pulse.sinks()?.into_iter().map(|(n, d)| {
+            let on = n == default;
+            (n, d, on)
+        }).collect())
+    }
+
+    pub fn set_output(&mut self, name: &str) -> Option<()> {
+        self.ensure()?.set_default_sink(name)
+    }
+
     /// Whether the microphone is muted, for the widget that shows it.
     ///
     /// `None` when the server cannot be reached: the button then says it does

@@ -150,6 +150,47 @@ impl Cards {
     }
 }
 
+/// Width of the calendar.
+pub const CALENDAR_WIDTH: u32 = 7 * CELL + 2 * PAD;
+const CELL: u32 = 46;
+const MONTHS: [&str; 12] = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno", "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"];
+
+impl Cards {
+    /// A month: `first` is the weekday of day 1 (0 = Monday), `today` the
+    /// day to mark. Returns the height and ARGB pixels.
+    pub fn calendar(&self, year: i32, month: u32, days: u32, first: u32, today: Option<u32>) -> (u32, Vec<u8>) {
+        let rows = (first + days).div_ceil(7);
+        let w = CALENDAR_WIDTH;
+        let h = 2 * PAD + LINE * (2 + rows) + 8;
+        let stride = (w * 4) as usize;
+        let mut buf = vec![0u8; stride * h as usize];
+        fill_rect_opaque(&mut buf, stride, 0, 0, w, h, BORDER);
+        fill_rect_opaque(&mut buf, stride, 1, 1, w - 2, h - 2, 0);
+        let baseline = |row: u32| (PAD + LINE * row + LINE - 6) as i32;
+        let title = format!("{} {year}", MONTHS[(month as usize).clamp(1, 12) - 1]);
+        let tw = text_width_at(&self.font, &title, SIZE);
+        draw_text(&mut buf, stride, w as i32, h, &self.font, SIZE, (w as i32 - tw) / 2, baseline(0), &title, TITLE);
+        let centred = |buf: &mut Vec<u8>, col: u32, row: u32, text: &str, color: u32| {
+            let tw = text_width_at(&self.font, text, SIZE);
+            let x = (PAD + col * CELL) as i32 + (CELL as i32 - tw) / 2;
+            draw_text(buf, stride, w as i32, h, &self.font, SIZE, x, baseline(row) + 4, text, color);
+        };
+        for (i, d) in ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"].iter().enumerate() {
+            centred(&mut buf, i as u32, 1, d, BODY);
+        }
+        for day in 1..=days {
+            let cell = first + day - 1;
+            let (col, row) = (cell % 7, 2 + cell / 7);
+            if today == Some(day) {
+                fill_rect_opaque(&mut buf, stride, PAD + col * CELL + 4, PAD + LINE * row + 4, CELL - 8, LINE, TRACK);
+            }
+            let color = if col >= 5 { CRITICAL } else { TITLE };
+            centred(&mut buf, col, row, &day.to_string(), color);
+        }
+        (h, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +207,8 @@ mod tests {
         assert_eq!(px.len(), (CARD_WIDTH * h * 4) as usize);
         let (h, px) = c.osd("Volume 40%", Some(0.4));
         assert_eq!(px.len(), (OSD_WIDTH * h * 4) as usize);
+        let (h, px) = c.calendar(2026, 11, 30, 6, Some(5));
+        assert_eq!(px.len(), (CALENDAR_WIDTH * h * 4) as usize);
         let (h, px) = c.prompt("Autenticazione", "Serve la password per montare il disco", 5, "Password errata");
         assert_eq!(px.len(), (PROMPT_WIDTH * h * 4) as usize);
     }

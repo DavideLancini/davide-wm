@@ -64,6 +64,10 @@ pub enum ToBar {
     Audio(AudioKey),
     /// Starts a countdown of that many seconds, or stops it.
     Timer(Option<u64>),
+    /// List the audio outputs (answered with `FromBar::Outputs`).
+    ListOutputs,
+    /// Make this sink the default output.
+    SetOutput(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +104,12 @@ pub enum FromBar {
     /// The countdown ran out.
     TimerDone,
     Screenshot,
+    /// Audio outputs: (name, description, default).
+    Outputs(Vec<(String, String, bool)>),
+    /// The Bluetooth widgets: the device list.
+    Bluetooth,
+    /// The clock: show or hide the calendar.
+    Calendar,
     /// The audio state after a volume key, for the on-screen indicator:
     /// microphone or output, level and mute.
     Audio { mic: bool, level: u32, muted: bool },

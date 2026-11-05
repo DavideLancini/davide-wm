@@ -198,6 +198,7 @@
     - *Volume and brightness:* the keys change the volume through the bar's PulseAudio connection and the brightness of every panel (sysfs, DDC/CI for external monitors, absorbing dawn's `brightness`), with a level box at the bottom of the screen. No more `pactl` or `brightness` processes.
     - *Bar helpers:* the CPU widget cycles power levels from the compositor (dawn's `cpu-cycle`/`cpu-levels`; the privileged writes still go through `sudo -n` to `cpu-freq-set`, `ryzen-tdp-set` and the Huawei WMI interface), the Bluetooth battery is read over D-Bus and RFCOMM inside the bar (dawn's `bt-headphones-battery`), the timer is native (durations picked in the launcher box, end kept in `$XDG_STATE_HOME/davide-wm/timer`, a notification when it runs out), the backlight and screenshot widgets go through the compositor. Agents run on the DRM backend, or nested with `DAVIDE_WM_AGENTS=1`. Blob format 7.
   - **First days on davide-wm (2026-11-05):** moving a window (Main+Shift+arrow) works like Hyprland's dwindle `movewindow`: the window leaves its place and splits its neighbour's (no more swaps), and the pointer goes to the centre of the moved or newly focused window so focus-follows-mouse does not snap back. The clipboard history keeps 1000 entries and `davide-wm msg clipboard-import <file>` appends another history file below ours (used once to bring over cliphist's 750 entries).
+  - **Desktop services (2026-11-05, to test on the TTY):** Main+Shift+P opens a power menu in the launcher box (lock, suspend, reboot, power off, quit; logind calls; Main+Shift+R no longer reboots on the spot); media keys go to the MPRIS player that is playing (else the first one); Main+A lists the audio outputs (sinks over the bar's PulseAudio connection, the chosen one becomes the default); the Bluetooth widgets list paired devices to connect or disconnect and switch the adapter on or off (BlueZ; replaces blueman-manager); the clock opens the month under the bar (a click elsewhere closes it); a battery watch warns at 15 % and 5 % and suspends at 3 % while discharging (`config::BATTERY_THRESHOLDS`); the night light warms the colours from 20:00 to 07:00 at 4000 K through each CRTC's GAMMA_LUT (`config::NIGHT_LIGHT`, `davide-wm msg night [on|off|auto]`; never in a modeset, and dropped for a CRTC whose driver refuses it). The bar no longer runs any program.
   - **Switch-over (started 2026-11-05):** *done:* `~/.bash_profile` starts `davide-wm --session` on tty1 (the old line is kept in `~/.bash_profile.bak-hyprland`; `start-hyprland` still works from another tty), `dist/davide-wm-session.target` installed, `topbar.service` and `nwg-notifications.service` limited to Hyprland sessions by a `ConditionEnvironment=XDG_CURRENT_DESKTOP=Hyprland` drop-in, portal files installed, cliphist's history imported; the first live upgrade on DRM worked. *Still to do, after some days without problems:* remove Hyprland, xdg-desktop-portal-hyprland/-wlr, wf-recorder, awww, cliphist, wofi, nwg-notifications, grim, slurp, swappy, nm-applet, the topbar and super binaries and the absorbed dawn binaries; archive the `topbar`, `super` and `dawn` repos.
   - **Afterwards:** keep migrating the remaining `dawn` crates that touch the desktop (`cast`, see the backlog).
 
@@ -480,7 +481,14 @@ davide-wm/
 | 17 | Other external monitor mirroring the panel | to test |
 | 18 | New Wi-Fi network: password asked by the secret agent | to test |
 | 19 | Bluetooth headphone battery in the bar | to test |
-| 20 | `tools/measure.py davide-wm 60` against Hyprland's ~352 MiB PSS and ~5 % CPU (13 processes, measured 2026-11-05 while in use) | to measure |
+| 21 | Power menu (Main+Shift+P): every entry | to test |
+| 22 | Media keys with Spotify or a browser | to test |
+| 23 | Audio outputs (Main+A): switching between speakers and headphones | to test |
+| 24 | Bluetooth widget: list, connect/disconnect, adapter on/off | to test |
+| 25 | Calendar under the clock | to test |
+| 26 | Battery warnings at 15 % and 5 % | to test when it happens |
+| 27 | Night light: `davide-wm msg night on`, then `off`; automatic at 20:00 | to test |
+| 20 | `tools/measure.py davide-wm 60` against Hyprland's ~352 MiB PSS and ~5 % CPU (13 processes, measured 2026-11-05 while in use) | 2 processes, ~235 MiB PSS, ~5.6 % CPU while in use; to repeat at idle |
 
 ### 11.2 Backlog
 
@@ -488,7 +496,6 @@ davide-wm/
 |------|------|-------|
 | Screenshot folder | decision | `config::SCREENSHOT_DIR` is `~/Screenshots`; to be moved, folder not chosen yet. |
 | Smaller screenshots | improvement | Fixed-Huffman deflate makes a photo-heavy full screen about 10 MB (a good encoder: about 3 MB): add dynamic Huffman blocks and a PNG row filter. |
-| Night light | feature, deferred | Warmer colours in the evening through the CRTC gamma LUT. |
 | Move and resize floating windows with Main+drag | feature, deferred | |
 | `cast` (Miracast) | migration | Take frames from `davide-wm msg cast` instead of `wf-recorder`; its virtual output needs a headless output with its own workspaces. |
 | Hardware cursor | performance | Cursor plane, so pointer motion does not redraw the scene; DRM only, to test on the TTY. |
