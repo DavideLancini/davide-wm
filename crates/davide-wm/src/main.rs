@@ -1329,8 +1329,7 @@ impl App {
             bar::FromBar::OpenMixer(output) => self.open_mixer(output),
             bar::FromBar::Mixer(m) => {
                 if let Some(ui) = &mut self.mixer {
-                    ui.data = Some(m);
-                    ui.settle();
+                    ui.replace(m);
                     self.draw_mixer();
                 }
             }
@@ -1760,7 +1759,7 @@ impl App {
             Event::Swipe(step) => {
                 // Numbered workspaces only; from chat or special, start at 1.
                 let next = match self.state.active {
-                    wm::WsId::Num(n) => (n as i32 + step).clamp(1, 41) as u32,
+                    wm::WsId::Num(n) => (n as i32 - step).clamp(1, 41) as u32,
                     _ => 1,
                 };
                 workspaces::switch(&mut self.state, wm::WsId::Num(next));

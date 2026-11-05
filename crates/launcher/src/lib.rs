@@ -120,7 +120,9 @@ impl Launcher {
                     None => vec![("errore".into(), Action::Copy(String::new()))],
                 }
             }
-            ">" if !rest.is_empty() => vec![(format!("Esegui: {rest}"), Action::Launch(rest.to_string()))],
+            // In a terminal that stays open: `top` and friends need one,
+            // and the output of a plain command stays readable.
+            ">" if !rest.is_empty() => vec![(format!("Esegui nel terminale: {rest}"), Action::Launch(format!("{} --hold sh -c {}", settings::TERMINAL_CMD, quote(rest))))],
             ":" => {
                 let needle = rest.to_lowercase();
                 emoji::EMOJI
@@ -273,7 +275,7 @@ mod tests {
         for c in ">echo ciao".chars() {
             x.key(0, Some(c));
         }
-        assert!(matches!(x.key(keys::RETURN, None), Outcome::Launch(c) if c == "echo ciao"));
+        assert!(matches!(x.key(keys::RETURN, None), Outcome::Launch(c) if c == "foot --hold sh -c 'echo ciao'"));
         assert_eq!(quote("it's"), r"'it'\''s'");
     }
 

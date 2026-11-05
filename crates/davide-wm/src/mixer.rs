@@ -55,6 +55,40 @@ impl MixerUi {
         out
     }
 
+    /// What the selected row is, independent of its position.
+    fn selected_key(&self) -> Option<(u8, u32)> {
+        let m = self.data.as_ref()?;
+        Some(match *self.items().get(self.selected)? {
+            Item::Device(d) => (0, if self.output { &m.sinks } else { &m.sources }[d].index),
+            Item::Stream(s) => (1, if self.output { &m.playback } else { &m.recording }[s].index),
+            Item::Card(c) => (2, m.cards[c].index),
+            Item::Header(_) => return None,
+        })
+    }
+
+    /// New data from the server: the selection follows its row when
+    /// devices come and go (a card changing profile).
+    pub fn replace(&mut self, m: Mixer) {
+        let key = self.selected_key();
+        self.data = Some(m);
+        let items = self.items();
+        if let Some(key) = key {
+            let found = (0..items.len()).find(|i| {
+                let m = self.data.as_ref().unwrap();
+                match items[*i] {
+                    Item::Device(d) => key == (0, if self.output { &m.sinks } else { &m.sources }[d].index),
+                    Item::Stream(s) => key == (1, if self.output { &m.playback } else { &m.recording }[s].index),
+                    Item::Card(c) => key == (2, m.cards[c].index),
+                    Item::Header(_) => false,
+                }
+            });
+            if let Some(i) = found {
+                self.selected = i;
+            }
+        }
+        self.settle();
+    }
+
     /// Keeps the selection on a row that exists and is not a title.
     pub fn settle(&mut self) {
         let items = self.items();
