@@ -469,7 +469,7 @@ davide-wm/
 | 6 | Drag and drop between two Thunar windows | works |
 | 7 | Screen sharing from Chromium / Meet through the portal | to test |
 | 8 | CPU widget: next level and notification | works |
-| 9 | Timer widget: countdown and notification at the end | started, result pending |
+| 9 | Timer widget: countdown and notification at the end (a critical one, it stays) | works |
 | 10 | Network widget and Main+W: Wi-Fi list | works |
 | 11 | Backlight widget | works |
 | 12 | Screensaver widget: the cycle works; the screen actually blanking (laptop and external monitors) | partly tested |
