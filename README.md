@@ -497,6 +497,11 @@ davide-wm/
 
 | Item | Kind | Notes |
 |------|------|-------|
+| Do not disturb | feature, next (1) | A click on the bell silences the popups; notifications still go to the list. |
+| Richer launcher | feature, next (2) | Emoji, file search, shell commands after `>`, unit conversion. |
+| Battery menu | feature, next (3) | Opened from the battery widget: charge, power draw, estimated time, health, cycles; charge limit at 80 % on/off (Huawei WMI); CPU level by hand or automatic (low on battery, high on AC). |
+| Touchpad gestures | feature, next (4) | Three fingers left/right switch workspace. Low priority. |
+| Audio menu | feature, next (5) | Replaces pavucontrol: two tabs, output and input; every device and every stream always shown, with everything pavucontrol offers (volume per channel, mute, default device, ports, profiles, moving streams). |
 | Screenshot folder | decision | `config::SCREENSHOT_DIR` is `~/Screenshots`; to be moved, folder not chosen yet. |
 | Smaller screenshots | improvement | Fixed-Huffman deflate makes a photo-heavy full screen about 10 MB (a good encoder: about 3 MB): add dynamic Huffman blocks and a PNG row filter. |
 | Move and resize floating windows with Main+drag | feature, deferred | |
