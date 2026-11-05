@@ -261,6 +261,14 @@ pub fn pointer_motion(s: &mut State, x: f64, y: f64) {
     }
 }
 
+/// Puts the pointer at the centre of a window on screen, so focus follows
+/// the keyboard action rather than snapping back on the next motion.
+pub fn warp_to(s: &mut State, key: SKey) {
+    let Some((_, r)) = s.layout.iter().find(|(k, _)| *k == key).copied() else { return };
+    let (x, y) = ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
+    update_pointer(s, x, y);
+}
+
 /// Re-targets the pointer after the windows under it changed (workspace
 /// switch, new layout) without moving the keyboard focus.
 pub fn refresh_pointer(s: &mut State) {

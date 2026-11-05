@@ -69,28 +69,35 @@ impl<T: Copy + PartialEq> Dwindle<T> {
     /// Inserts `w` by splitting `target`, or the last inserted window when
     /// `target` is `None` or not in the tree.
     pub fn insert(&mut self, w: T, target: Option<T>) {
+        self.insert_beside(w, target, false);
+    }
+
+    /// Like `insert`; with `first` the new window takes the left (or top)
+    /// half of the split instead of the right (or bottom) one.
+    pub fn insert_beside(&mut self, w: T, target: Option<T>, first: bool) {
         let target = target.filter(|t| self.contains(*t)).or(self.last.filter(|t| self.contains(*t)));
         self.last = Some(w);
         let Some(root) = self.root.take() else {
             self.root = Some(Node::Leaf(w));
             return;
         };
-        fn split<T: Copy + PartialEq>(n: Node<T>, target: Option<T>, w: T, done: &mut bool) -> Node<T> {
+        fn split<T: Copy + PartialEq>(n: Node<T>, target: Option<T>, w: T, first: bool, done: &mut bool) -> Node<T> {
             match n {
                 Node::Leaf(t) if !*done && (target.is_none() || target == Some(t)) => {
                     *done = true;
-                    Node::Split { ratio: 0.5, a: Box::new(Node::Leaf(t)), b: Box::new(Node::Leaf(w)) }
+                    let (a, b) = if first { (w, t) } else { (t, w) };
+                    Node::Split { ratio: 0.5, a: Box::new(Node::Leaf(a)), b: Box::new(Node::Leaf(b)) }
                 }
                 Node::Leaf(t) => Node::Leaf(t),
                 Node::Split { ratio, a, b } => {
-                    let a = split(*a, target, w, done);
-                    let b = split(*b, target, w, done);
+                    let a = split(*a, target, w, first, done);
+                    let b = split(*b, target, w, first, done);
                     Node::Split { ratio, a: Box::new(a), b: Box::new(b) }
                 }
             }
         }
         let mut done = false;
-        self.root = Some(split(root, target, w, &mut done));
+        self.root = Some(split(root, target, w, first, &mut done));
     }
 
     pub fn remove(&mut self, w: T) {
@@ -111,6 +118,17 @@ impl<T: Copy + PartialEq> Dwindle<T> {
         if self.last == Some(w) {
             self.last = None;
         }
+    }
+
+    /// Moves `w` next to `target`, as Hyprland's dwindle `movewindow` does:
+    /// `w` leaves its place and splits `target`, on the side it came from
+    /// when moving left or up.
+    pub fn move_next_to(&mut self, w: T, target: T, dir: Direction) {
+        if w == target || !self.contains(w) || !self.contains(target) {
+            return;
+        }
+        self.remove(w);
+        self.insert_beside(w, Some(target), matches!(dir, Direction::Left | Direction::Up));
     }
 
     /// Exchanges the positions of two windows.
@@ -395,6 +413,27 @@ mod tests {
         ws.remove(3);
         ws.remove(1);
         assert!(ws.is_empty());
+    }
+
+    #[test]
+    fn move_joins_the_neighbour() {
+        // 1 on the left, 2 above 3 on the right.
+        let mut d = Dwindle::default();
+        d.insert(1, None);
+        d.insert(2, Some(1));
+        d.insert(3, Some(2));
+        d.move_next_to(3, 1, Direction::Left);
+        // 1's half splits (taller than wide): 3 on top, 1 below; 2 alone right.
+        assert_eq!(
+            d.layout(Rect::new(0, 0, 1200, 1000)),
+            vec![(3, Rect::new(0, 0, 600, 500)), (1, Rect::new(0, 500, 600, 500)), (2, Rect::new(600, 0, 600, 1000))]
+        );
+        // Two side by side: moving the right one left swaps them.
+        let mut e = Dwindle::default();
+        e.insert(1, None);
+        e.insert(2, Some(1));
+        e.move_next_to(2, 1, Direction::Left);
+        assert_eq!(e.windows(), vec![2, 1]);
     }
 
     #[test]

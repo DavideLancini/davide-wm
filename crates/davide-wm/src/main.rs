@@ -909,6 +909,15 @@ impl App {
             ipc::Command::Cast(window) => return self.cast_now(window),
             ipc::Command::CastStop(id) => self.casts.stop(id),
             ipc::Command::Lock => self.lock(),
+            ipc::Command::ClipboardImport(path) => {
+                let older = match std::fs::read(&path) {
+                    Ok(b) => clipboard::History::decode(&b),
+                    Err(e) => return format!("error: {e}\n"),
+                };
+                let n = self.state.selection.history.import(older);
+                self.clipboard_dirty = true;
+                return format!("{n} entries added, {} in total\n", self.state.selection.history.entries.len());
+            }
             ipc::Command::Exit => self.running = false,
         }
         "ok\n".into()

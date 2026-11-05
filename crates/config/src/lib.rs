@@ -209,7 +209,7 @@ pub const OUTPUT_BLANK_BLACK: &[&str] = &["273Q"];
 pub const LINK_CHECK_DELAY_MS: u64 = 3000;
 
 /// Clipboard history: entries kept (newest first) and the largest one stored.
-pub const CLIPBOARD_HISTORY: usize = 200;
+pub const CLIPBOARD_HISTORY: usize = 1000;
 pub const CLIPBOARD_MAX_BYTES: usize = 16 << 20;
 
 /// Notifications: how long a popup stays when the app does not say, how many

@@ -111,18 +111,23 @@ pub fn move_to(s: &mut State, target: WsId) {
 pub fn focus_dir(s: &mut State, dir: Direction) {
     if let Some(next) = s.focus.and_then(|f| wm::neighbor(&visible_tiles(s), f, dir)) {
         seat::set_focus(s, Some(next));
+        seat::warp_to(s, next);
     }
 }
 
-/// Swaps the focused window with its neighbour in `dir`.
+/// Moves the focused window next to its neighbour in `dir` (it splits that
+/// neighbour's place, like Hyprland's dwindle), and the pointer with it.
 pub fn move_dir(s: &mut State, dir: Direction) {
     let Some(key) = s.focus else { return };
     let Some(other) = wm::neighbor(&visible_tiles(s), key, dir) else { return };
     let Some(ws_id) = s.window_ws.get(&key).copied() else { return };
     if let Some(ws) = s.workspaces.get_mut(&ws_id) {
-        ws.tiling.swap(key, other);
+        if ws.tiling.contains(key) && ws.tiling.contains(other) {
+            ws.tiling.move_next_to(key, other, dir);
+        }
     }
     s.relayout();
+    seat::warp_to(s, key);
 }
 
 /// Tiles of the focused workspace only (the special one hides the rest).

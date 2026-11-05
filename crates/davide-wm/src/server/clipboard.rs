@@ -103,6 +103,20 @@ impl History {
         self.entries.truncate(config::CLIPBOARD_HISTORY);
     }
 
+    /// Appends older entries (from another history) below ours, skipping
+    /// what we already have; returns how many were added.
+    pub fn import(&mut self, older: History) -> usize {
+        let before = self.entries.len();
+        for clip in older.entries {
+            let dup = self.entries.iter().any(|c| c.data == clip.data && is_text(&c.mime) == is_text(&clip.mime));
+            if !dup && !clip.data.is_empty() && clip.data.len() <= config::CLIPBOARD_MAX_BYTES {
+                self.entries.push(clip);
+            }
+        }
+        self.entries.truncate(config::CLIPBOARD_HISTORY);
+        self.entries.len().saturating_sub(before)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         for c in &self.entries {

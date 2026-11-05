@@ -80,6 +80,8 @@ pub enum Command {
     Cast(bool),
     CastStop(u32),
     Lock,
+    /// Appends the entries of a history file (same format) below ours.
+    ClipboardImport(String),
     Exit,
 }
 
@@ -138,8 +140,9 @@ fn parse(line: &str) -> Result<Command, String> {
         "cast" => Ok(Command::Cast(arg == "window")),
         "cast-stop" => arg.parse().map(Command::CastStop).map_err(|_| format!("bad cast id {arg:?}")),
         "lock" => Ok(Command::Lock),
+        "clipboard-import" if !arg.is_empty() => Ok(Command::ClipboardImport(arg.to_string())),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, clipboard-import <file>, exit".into()),
     }
 }
 
