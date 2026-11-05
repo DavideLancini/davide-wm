@@ -68,6 +68,40 @@ impl Value {
         }
     }
 
+    /// The value of `key` in a dictionary (`a{s…}`), variants unwrapped.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        let Value::Array(_, entries) = self.unwrap_variant() else { return None };
+        entries.iter().find_map(|e| match e {
+            Value::DictEntry(k, v) if k.as_str() == Some(key) => Some(v.unwrap_variant()),
+            _ => None,
+        })
+    }
+
+    pub fn unwrap_variant(&self) -> &Value {
+        match self {
+            Value::Variant(v) => v.unwrap_variant(),
+            v => v,
+        }
+    }
+
+    /// The bytes of an `ay`.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        let Value::Array(_, items) = self.unwrap_variant() else { return None };
+        items.iter().map(|b| match b {
+            Value::Byte(b) => Some(*b),
+            _ => None,
+        }).collect()
+    }
+
+    /// An `a{sv}` from pairs.
+    pub fn dict(entries: Vec<(&str, Value)>) -> Value {
+        Value::Array("{sv}".into(), entries.into_iter().map(|(k, v)| Value::DictEntry(Box::new(Value::Str(k.into())), Box::new(Value::Variant(Box::new(v))))).collect())
+    }
+
+    pub fn byte_array(b: &[u8]) -> Value {
+        Value::Array("y".into(), b.iter().map(|b| Value::Byte(*b)).collect())
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),

@@ -254,6 +254,7 @@ pub enum Purpose {
     Notifications(Vec<u32>),
     /// Sources for a screen cast asked by the portal (`request`, 0 for none).
     Cast(u32, Vec<CastChoice>),
+    Wifi(Vec<crate::wifi::Network>),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

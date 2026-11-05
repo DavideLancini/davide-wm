@@ -49,7 +49,6 @@ impl Widget {
         use Widget::*;
         Some(match self {
             CpuFreq => "/home/davidelancini/7Scripts/cpu-cycle",
-            Network => "nmgui",
             BtHeadphones => "blueman-manager",
             // Through `brightness`, not a write to sysfs: that only reached
             // the laptop panel, leaving any external monitor lit. The helper
@@ -61,7 +60,7 @@ impl Widget {
             Screenshot => "grim -g \"$(slurp)\" - | swappy -f -",
             // Handled by the bar thread or the compositor: these change state
             // rather than running anything.
-            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid | Notifications => return None,
+            Volume | Microphone | Clock | Spotify | Blk | Screensaver | Lid | Notifications | Network => return None,
         })
     }
 }

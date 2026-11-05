@@ -78,6 +78,8 @@ pub enum Action {
     /// Brightness change in points, on every panel.
     Brightness(i32),
     Lock,
+    /// The Wi-Fi network list.
+    Wifi,
     Exit,
 }
 
@@ -101,7 +103,7 @@ pub fn binds() -> Vec<Bind> {
         b(MAIN, keys::B, Action::Spawn(BROWSER)),
         b(MAIN, keys::C, Action::Spawn("code")),
         b(MAIN, keys::F, Action::Spawn("thunar")),
-        b(MAIN, keys::W, Action::Spawn("nmgui")),
+        b(MAIN, keys::W, Action::Wifi),
         b(MAIN, keys::N, Action::Notifications),
         b(MAIN, keys::P, Action::ClipboardHistory),
         b(MAIN, keys::S, Action::Spawn("~/7Scripts/tts --clipboard")),

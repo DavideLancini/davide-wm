@@ -2,6 +2,7 @@ macro_rules! log {
     ($($t:tt)*) => { eprintln!("davide-wm: {}", format_args!($($t)*)) };
 }
 
+mod agents;
 mod backend;
 mod brightness;
 mod cast;
@@ -14,6 +15,7 @@ mod notify;
 mod png;
 mod portal;
 mod server;
+mod wifi;
 mod worker;
 mod xwayland;
 
@@ -50,6 +52,7 @@ const TOKEN_XWM: u64 = 16;
 const TOKEN_PIPEWIRE: u64 = 17;
 const TOKEN_PORTAL: u64 = 18;
 const TOKEN_OSD: u64 = 19;
+const TOKEN_AGENTS: u64 = 20;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -195,6 +198,13 @@ struct App {
     sleep_inhibitor: Option<OwnedFd>,
     /// Release `sleep_inhibitor` after the next frame.
     sleep_after_frame: bool,
+    /// polkit and NetworkManager password agents (on DRM, or nested with
+    /// `DAVIDE_WM_AGENTS=1`).
+    agents: Option<agents::Agents>,
+    /// A polkit password to check: user, cookie, password.
+    polkit_job: Option<(String, String, String)>,
+    /// Background Wi-Fi work: true lists networks; a network connects.
+    wifi_job: Option<Option<wifi::Network>>,
 }
 
 impl App {
@@ -328,6 +338,7 @@ impl App {
             Action::ToggleMic => self.audio_key(bar::AudioKey::ToggleMic),
             Action::Brightness(d) => self.change_brightness(d),
             Action::Lock => self.lock(),
+            Action::Wifi => self.wifi_job = Some(None),
             Action::Exit => self.running = false,
         }
     }
@@ -360,6 +371,12 @@ impl App {
         self.state.abandoned.retain(|p| *p != purpose);
         match purpose {
             Purpose::Apps => {}
+            Purpose::Wifi(nets) => {
+                if let Some(n) = nets.get(i) {
+                    self.show_osd(&format!("Wi-Fi: connessione a {}…", n.ssid), None);
+                    self.wifi_job = Some(Some(n.clone()));
+                }
+            }
             Purpose::Cast(request, choices) => match choices.get(i) {
                 Some(c) => {
                     self.start_cast(request, *c);
@@ -387,7 +404,7 @@ impl App {
     /// Delete in a picker.
     fn deleted(&mut self, purpose: Purpose, i: usize) {
         match purpose {
-            Purpose::Apps | Purpose::Cast(..) => {}
+            Purpose::Apps | Purpose::Cast(..) | Purpose::Wifi(_) => {}
             Purpose::Clipboard(hashes) => {
                 if let Some(j) = self.clip_index(&hashes, i) {
                     self.state.selection.history.entries.remove(j);
@@ -465,9 +482,60 @@ impl App {
 
     /// The prompt over the desktop was answered (None: cancelled).
     fn prompt_done(&mut self, password: Option<String>) {
-        let _ = password;
-        self.state.drop_prompt(false);
-        workspaces::refocus(&mut self.state);
+        let Some(agents) = &mut self.agents else {
+            self.state.drop_prompt(false);
+            workspaces::refocus(&mut self.state);
+            return;
+        };
+        let actions = match password {
+            Some(p) => {
+                let (actions, job) = agents.answered(p);
+                self.polkit_job = job;
+                actions
+            }
+            None => agents.dismissed(),
+        };
+        self.agent_actions(actions);
+    }
+
+    fn agent_actions(&mut self, actions: Vec<agents::Action>) {
+        for a in actions {
+            match a {
+                agents::Action::Prompt => {
+                    let Some((title, message)) = self.agents.as_ref().and_then(|g| g.queue.front()).map(|r| r.texts()) else { continue };
+                    self.state.close_launcher();
+                    seat::set_focus(&mut self.state, None);
+                    self.state.drop_prompt(false);
+                    self.state.prompt = Some(server::PromptView::new(&title, &message));
+                    self.state.pointer_dirty = true;
+                }
+                agents::Action::Close => {
+                    self.state.drop_prompt(false);
+                    workspaces::refocus(&mut self.state);
+                }
+            }
+        }
+    }
+
+    fn polkit_checked(&mut self, ok: bool) {
+        let Some(agents) = &mut self.agents else { return };
+        let (actions, closed) = agents.polkit_result(ok);
+        if !closed {
+            if let Some(p) = &mut self.state.prompt {
+                p.failed("Password errata");
+            }
+            self.state.needs_redraw = true;
+        }
+        self.agent_actions(actions);
+    }
+
+    fn open_wifi(&mut self, nets: Vec<wifi::Network>) {
+        if nets.is_empty() {
+            self.show_osd("Wi-Fi: nessuna rete", None);
+            return;
+        }
+        let labels = nets.iter().map(wifi::Network::label).collect();
+        self.state.open_view(launcher::Launcher::picker(labels), Purpose::Wifi(nets));
     }
 
     fn unlocked(&mut self, ok: bool) {
@@ -868,6 +936,7 @@ impl App {
             }
             bar::FromBar::Blank => self.blank(),
             bar::FromBar::ToggleNotifications => self.open_notifications(),
+            bar::FromBar::Wifi => self.wifi_job = Some(None),
             bar::FromBar::CycleScreensaver => {
                 let mut ss = self.display.screensaver;
                 ss.cycle();
@@ -1227,6 +1296,9 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         unlock: None,
         sleep_inhibitor: None,
         sleep_after_frame: false,
+        agents: None,
+        polkit_job: None,
+        wifi_job: None,
     }
 }
 
@@ -1394,6 +1466,13 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     }
     app.watch_xwayland(&ep)?;
     app.take_sleep_inhibitor();
+    let agents_wanted = matches!(app.backend, Backend::Drm(_)) || std::env::var_os("DAVIDE_WM_AGENTS").is_some();
+    if agents_wanted && app.agents.is_none() {
+        app.agents = Some(agents::Agents::start());
+    }
+    if let Some(fd) = app.agents.as_ref().and_then(|a| a.bus_fd()) {
+        ep.add(fd, TOKEN_AGENTS)?;
+    }
     if let Some(fd) = app.portal.bus_fd() {
         ep.add(fd, TOKEN_PORTAL)?;
     }
@@ -1673,6 +1752,15 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                             }
                             Ok(worker::Done::Saved) => {}
                             Ok(worker::Done::Unlock(ok)) => app.unlocked(ok),
+                            Ok(worker::Done::Polkit(ok)) => app.polkit_checked(ok),
+                            Ok(worker::Done::Networks(nets)) => app.open_wifi(nets),
+                            Ok(worker::Done::WifiConnect(r)) => match r {
+                                Ok(ssid) => app.show_osd(&format!("Wi-Fi: {ssid}"), None),
+                                Err(e) => {
+                                    log!("wifi: {e}");
+                                    app.show_osd("Wi-Fi: connessione non riuscita", None);
+                                }
+                            },
                             Ok(worker::Done::Screenshot { request, path, png }) => match request {
                                 0 => {
                                     match &path {
@@ -1731,6 +1819,10 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                     if wake {
                         app.state.needs_redraw = true;
                     }
+                }
+                TOKEN_AGENTS => {
+                    let actions = app.agents.as_mut().map(|a| a.dispatch()).unwrap_or_default();
+                    app.agent_actions(actions);
                 }
                 TOKEN_OSD => {
                     event_loop::read_timer(&app.osd_timer);
@@ -1828,6 +1920,14 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         }
         if let Some((request, interactive)) = app.shot_request.take() {
             app.take_screenshot(renderer, request, interactive);
+        }
+        if let Some((user, cookie, password)) = app.polkit_job.take() {
+            worker.run(move || Ok(worker::Done::Polkit(agents::polkit_check(&user, &cookie, password))));
+        }
+        match app.wifi_job.take() {
+            Some(None) => worker.run(|| wifi::scan().map(worker::Done::Networks)),
+            Some(Some(net)) => worker.run(move || Ok(worker::Done::WifiConnect(wifi::connect(&net)))),
+            None => {}
         }
         if let Some(password) = app.unlock.take() {
             worker.run(move || Ok(worker::Done::Unlock(lock::authenticate(password))));

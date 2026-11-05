@@ -427,6 +427,7 @@ impl<'a> Loop<'a> {
             Widget::Screensaver => self.link.send(FromBar::CycleScreensaver),
             Widget::Lid => self.link.send(FromBar::ToggleLid),
             Widget::Notifications => self.link.send(FromBar::ToggleNotifications),
+            Widget::Network => self.link.send(FromBar::Wifi),
             _ => {
                 if let Some(command) = widget.command() {
                     actions::run_detached(command);

@@ -87,6 +87,8 @@ pub enum FromBar {
     CycleScreensaver,
     ToggleLid,
     ToggleNotifications,
+    /// The network widget: the Wi-Fi list.
+    Wifi,
     /// The audio state after a volume key, for the on-screen indicator:
     /// microphone or output, level and mute.
     Audio { mic: bool, level: u32, muted: bool },

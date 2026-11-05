@@ -17,6 +17,11 @@ pub enum Done {
     Screenshot { request: u32, path: Result<String, String>, png: Vec<u8> },
     /// The lock screen's password check.
     Unlock(bool),
+    /// polkit's verdict on a password.
+    Polkit(bool),
+    Networks(Vec<crate::wifi::Network>),
+    /// Connecting to a network: its name, or why not.
+    WifiConnect(Result<String, String>),
     /// A Wayland selection read for an X client.
     XSelection { request: crate::server::xwm::selection::Request, data: Result<Vec<u8>, String> },
 }
