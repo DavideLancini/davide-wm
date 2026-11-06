@@ -1237,6 +1237,17 @@ impl App {
                     mib(heap.uordblks + heap.hblkhd),
                     mib(heap.fordblks),
                 );
+                if let Some(t) = &s.terms {
+                    let (windows, glyphs) = t.usage();
+                    out += &format!(
+                        "terms: {} windows {:.1} MiB glyphs {} (atlas {:.1} MiB) {}\n",
+                        windows.len(),
+                        mib(windows.iter().map(|w| w.1).sum()),
+                        glyphs,
+                        if glyphs > 0 { mib((terminal::glyphs::ATLAS * terminal::glyphs::ATLAS) as usize) } else { 0.0 },
+                        windows.iter().map(|(l, b)| format!("[{l} lines {:.1} MiB]", mib(*b))).collect::<Vec<_>>().join(" "),
+                    );
+                }
                 out += &format!("frames: {:?}\n", self.damage_log.iter().map(|(_, r)| r.map(|r| (r.x, r.y, r.w, r.h))).collect::<Vec<_>>());
                 return out;
             }

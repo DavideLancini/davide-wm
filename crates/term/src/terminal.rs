@@ -458,6 +458,14 @@ impl Terminal {
         self.sb.bytes()
     }
 
+    /// Heap bytes held, roughly: both screens, the scrollback, grapheme
+    /// clusters and pending output (allocator overhead excluded).
+    pub fn heap_bytes(&self) -> usize {
+        let rows = |g: &Vec<Row>| g.capacity() * std::mem::size_of::<Row>() + g.iter().map(|r| r.cells.capacity() * std::mem::size_of::<Cell>()).sum::<usize>();
+        let clusters = self.clusters.list.iter().map(|s| 2 * (s.len() + 16)).sum::<usize>();
+        rows(&self.main) + rows(&self.alt) + self.sb.bytes() + clusters + self.responses.capacity() + self.title.capacity()
+    }
+
     /// Scrolls the view into history: positive goes back. While scrolled
     /// back, new output keeps the view on the same lines.
     pub fn scroll_view(&mut self, lines: i32) {

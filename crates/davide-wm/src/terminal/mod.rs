@@ -160,6 +160,13 @@ impl Terms {
         v
     }
 
+    /// Per window: scrollback lines and heap bytes of the engine; then the
+    /// glyph cache entries.
+    pub fn usage(&self) -> (Vec<(usize, usize)>, usize) {
+        let windows = self.windows.iter().map(|w| (w.engine.scrollback_len(), w.engine.heap_bytes() + w.out.capacity())).collect();
+        (windows, self.glyphs.borrow().as_ref().map_or(0, |g| g.cached()))
+    }
+
     pub fn is_ours(&self, key: SKey) -> bool {
         key.client == self.client && self.windows.iter().any(|w| w.surface == key.id)
     }

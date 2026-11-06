@@ -112,8 +112,6 @@ pub struct Bind {
     pub action: Action,
 }
 
-/// Falls back to a standalone foot when the server is not up yet.
-pub const TERMINAL: &str = "footclient || foot";
 const BROWSER: &str = "chromium --disable-sync";
 
 /// Every key binding. Built at startup from the tables below.
@@ -122,7 +120,6 @@ pub fn binds() -> Vec<Bind> {
     let b = |mods, key, action| Bind { mods, key, action };
     let mut v = vec![
         b(MAIN, keys::T, Action::Terminal),
-        b(MAIN | SHIFT, keys::T, Action::Spawn(TERMINAL)),
         b(MAIN, keys::B, Action::Spawn(BROWSER)),
         b(MAIN, keys::C, Action::Spawn("code")),
         b(MAIN, keys::F, Action::Spawn("thunar")),
@@ -198,7 +195,7 @@ pub const RULES: &[Rule] = &[
 ];
 
 /// Started once, in every mode.
-pub const AUTOSTART: &[&str] = &["foot --server"];
+pub const AUTOSTART: &[&str] = &[];
 
 pub const KEYBOARD_LAYOUT: &str = "it";
 /// A keyboard (USB vendor and product, or `None` for every keyboard

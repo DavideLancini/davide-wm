@@ -49,7 +49,7 @@ pub struct Slot {
     pub dy: f32,
 }
 
-const ATLAS: i32 = 2048;
+pub const ATLAS: i32 = 2048;
 
 pub struct Glyphs {
     faces: Vec<Face>,
@@ -86,6 +86,10 @@ impl Glyphs {
 
     pub fn atlas(&self) -> Option<&Texture> {
         self.atlas.as_ref()
+    }
+
+    pub fn cached(&self) -> usize {
+        self.cache.len()
     }
 
     /// The atlas went with the GL context (live upgrade): start again.
