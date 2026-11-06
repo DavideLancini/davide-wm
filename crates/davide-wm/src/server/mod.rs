@@ -1474,6 +1474,11 @@ impl State {
         r.finish();
     }
 
+    /// Something is drawn for the surface: a buffer or terminal cells.
+    pub fn has_content(&self, key: SKey) -> bool {
+        self.texture(key).is_some() || self.surfaces.get(&key).is_some_and(|s| matches!(s.content, Content::Term))
+    }
+
     fn texture(&self, key: SKey) -> Option<&Texture> {
         match &self.surfaces.get(&key)?.content {
             Content::None | Content::Term => None,
