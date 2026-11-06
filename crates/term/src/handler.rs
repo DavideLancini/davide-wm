@@ -7,6 +7,8 @@ use crate::parser::{Params, Perform};
 use crate::terminal::{Charset, CursorShape, MouseEncoding, MouseMode, Terminal};
 
 const MAX_TITLE: usize = 4096;
+/// Kitty keyboard flags we honour: disambiguate escape codes.
+const KBD_SUPPORTED: u8 = 1;
 
 macro_rules! reply {
     ($t:expr, $($a:tt)*) => {{
@@ -163,7 +165,30 @@ impl Perform for Terminal {
                 };
             }
             ([b'>'], b'q') => reply!(self, "\x1bP>|davide-term {}\x1b\\", env!("CARGO_PKG_VERSION")),
-            ([b'?'], b'u') => reply!(self, "\x1b[?0u"),
+            ([b'?'], b'u') => reply!(self, "\x1b[?{}u", self.kbd_flags()),
+            ([b'>'], b'u') => {
+                if self.kbd.len() >= 16 {
+                    self.kbd.remove(0);
+                }
+                self.kbd.push(p.get(0, 0) as u8 & KBD_SUPPORTED);
+            }
+            ([b'<'], b'u') => {
+                let n = (p.get(0, 1) as usize).min(self.kbd.len());
+                self.kbd.truncate(self.kbd.len() - n);
+            }
+            ([b'='], b'u') => {
+                let f = p.get(0, 0) as u8 & KBD_SUPPORTED;
+                let cur = self.kbd_flags();
+                let new = match p.get(1, 1) {
+                    2 => cur | f,
+                    3 => cur & !f,
+                    _ => f,
+                };
+                match self.kbd.last_mut() {
+                    Some(top) => *top = new,
+                    None => self.kbd.push(new),
+                }
+            }
             ([b'?', b'$'], b'p') => {
                 let m = p.get(0, 0);
                 let v = self.private_mode_state(m);

@@ -659,3 +659,20 @@ fn reset_and_rep() {
     feed(&mut t, "\x1b#8");
     assert_eq!(row_text(&t, 2), "EEEEEEEEEE");
 }
+
+#[test]
+fn kitty_keyboard_disambiguates_shift_enter() {
+    use crate::{Key, Mods};
+    let mut t = term(10, 3);
+    let shift = Mods { shift: true, ..Mods::default() };
+    assert_eq!(t.encode_key(Key::Enter, shift).unwrap(), b"\r");
+    feed(&mut t, "\x1b[>1u\x1b[?u");
+    assert_eq!(t.take_responses(), b"\x1b[?1u");
+    assert_eq!(t.encode_key(Key::Enter, shift).unwrap(), b"\x1b[13;2u");
+    assert_eq!(t.encode_key(Key::Enter, Mods::default()).unwrap(), b"\r");
+    assert_eq!(t.encode_key(Key::Escape, Mods::default()).unwrap(), b"\x1b[27u");
+    assert_eq!(t.encode_key(Key::Char('c'), Mods { ctrl: true, ..Mods::default() }).unwrap(), b"\x1b[99;5u");
+    assert_eq!(t.encode_key(Key::Char('a'), Mods::default()).unwrap(), b"a");
+    feed(&mut t, "\x1b[<u");
+    assert_eq!(t.encode_key(Key::Enter, shift).unwrap(), b"\r");
+}

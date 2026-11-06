@@ -89,8 +89,27 @@ pub struct MouseEvent {
 }
 
 impl Terminal {
+    /// Kitty keyboard flags in force.
+    pub(crate) fn kbd_flags(&self) -> u8 {
+        self.kbd.last().copied().unwrap_or(0)
+    }
+
     pub fn encode_key(&self, key: Key, mods: Mods) -> Option<Vec<u8>> {
         let m = mods.param();
+        if self.kbd_flags() & 1 != 0 {
+            // Disambiguate: keys whose legacy bytes collide get CSI u.
+            let code = match key {
+                Key::Escape => Some(27),
+                Key::Enter if mods.any() => Some(13),
+                Key::Tab if mods.any() => Some(9),
+                Key::Backspace if mods.any() => Some(127),
+                Key::Char(c) if mods.ctrl || mods.alt => Some(if mods.shift { c.to_lowercase().next().unwrap_or(c) } else { c } as u32),
+                _ => None,
+            };
+            if let Some(code) = code {
+                return Some(if m > 1 { format!("\x1b[{code};{m}u") } else { format!("\x1b[{code}u") }.into_bytes());
+            }
+        }
         let alt = |mut v: Vec<u8>| {
             if mods.alt {
                 v.insert(0, 0x1b);

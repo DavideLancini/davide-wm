@@ -9,7 +9,7 @@ use crate::parser::Parser;
 use crate::scrollback::Scrollback;
 use crate::terminal::{Charset, Cursor, CursorShape, Link, Modes, MouseEncoding, MouseMode, Terminal};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 persist_struct!(Rgb { r, g, b });
 
@@ -117,11 +117,12 @@ impl Persist for Terminal {
         self.clusters.list.iter().map(|s| s.to_string()).collect::<Vec<_>>().save(e);
         self.links.iter().map(|l| (l.id.to_string(), l.uri.to_string())).collect::<Vec<_>>().save(e);
         (self.cell_px.0, self.cell_px.1).save(e);
+        self.kbd.save(e);
     }
 
     fn load(d: &mut Dec) -> Result<Self> {
         let v = u8::load(d)?;
-        if v != VERSION {
+        if v == 0 || v > VERSION {
             return Err(Error(format!("terminal version {v}")));
         }
         let (cols, rows, alt_active, base): (usize, usize, bool, u64) = Persist::load(d)?;
@@ -147,6 +148,7 @@ impl Persist for Terminal {
         let clusters = Clusters::from_list(Vec::<String>::load(d)?.into_iter().map(String::into_boxed_str).collect());
         let links = Vec::<(String, String)>::load(d)?.into_iter().map(|(id, uri)| Link { id: id.into(), uri: uri.into() }).collect();
         let cell_px = Persist::load(d)?;
+        let kbd = if v >= 2 { Persist::load(d)? } else { Vec::new() };
         let ok = |c: &Cursor| c.x < cols && c.y < rows;
         if !ok(&cur) || !ok(&s0) || !ok(&s1) || top >= bottom || bottom >= rows || tabs.len() != cols || base < sb.len() as u64 {
             return Err(Error("terminal cursor".into()));
@@ -164,6 +166,7 @@ impl Persist for Terminal {
         t.bottom = bottom;
         t.tabs = tabs;
         t.modes = modes;
+        t.kbd = kbd;
         t.title = title;
         t.cwd = cwd;
         t.title_stack = title_stack;

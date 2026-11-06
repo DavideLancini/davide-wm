@@ -212,6 +212,9 @@ pub struct Terminal {
     pub(crate) selection: Option<(Point, Point)>,
     pub(crate) cell_px: (u16, u16),
     pub(crate) mouse_last: Option<(usize, usize)>,
+    /// Kitty keyboard protocol flags, a stack pushed and popped by the
+    /// application; only "disambiguate" (1) changes what keys send.
+    pub(crate) kbd: Vec<u8>,
 }
 
 impl Terminal {
@@ -254,6 +257,7 @@ impl Terminal {
             selection: None,
             cell_px: (8, 16),
             mouse_last: None,
+            kbd: Vec::new(),
         }
     }
 
@@ -800,6 +804,7 @@ impl Terminal {
     pub(crate) fn full_reset(&mut self) {
         self.set_alt(false, false);
         self.modes = Modes::default();
+        self.kbd.clear();
         self.cur = Cursor::default();
         self.saved = [Cursor::default(); 2];
         self.top = 0;
