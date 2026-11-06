@@ -54,6 +54,7 @@ pub struct Drm {
     lid_closed: bool,
     /// Blanked: heads that cannot show black frames are powered down.
     blanked: bool,
+    powered_down: bool,
     /// Connectors whose link failed to train; skipped until unplugged.
     failed: Vec<String>,
     /// An exclusive output was just modeset: (connector name, epoch seconds)
@@ -166,6 +167,7 @@ impl Drm {
             active,
             lid_closed: outputs::lid_closed_now(),
             blanked: false,
+            powered_down: false,
             failed,
             link_check: None,
         })
@@ -232,7 +234,7 @@ impl Drm {
         let heads: Vec<(String, String)> = self.kms.outputs().map(|o| (o.name.clone(), o.model.clone())).collect();
         for (i, (name, model)) in heads.iter().enumerate() {
             let lid_off = self.lid_closed && name == config::INTERNAL_OUTPUT;
-            let blank_off = self.blanked && !outputs::blanks_black(name, model);
+            let blank_off = self.blanked && (self.powered_down || !outputs::blanks_black(name, model));
             self.kms.set_power(i, !(lid_off || blank_off))?;
         }
         Ok(())
@@ -281,8 +283,10 @@ impl Drm {
         self.kms.gamma = g;
     }
 
-    pub fn set_blank(&mut self, blanked: bool) -> io::Result<()> {
+    /// `powered_down` turns off the monitors blanked with black frames too.
+    pub fn set_blank(&mut self, blanked: bool, powered_down: bool) -> io::Result<()> {
         self.blanked = blanked;
+        self.powered_down = blanked && powered_down;
         self.apply_power()
     }
 

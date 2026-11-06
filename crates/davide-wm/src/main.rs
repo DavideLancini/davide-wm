@@ -1475,7 +1475,7 @@ impl App {
         self.display.blank();
         self.state.close_launcher();
         if let Backend::Drm(d) = &mut self.backend {
-            if let Err(e) = d.set_blank(true) {
+            if let Err(e) = d.set_blank(true, false) {
                 log!("blank: {e}");
             }
         }
@@ -1488,7 +1488,7 @@ impl App {
         log!("wake");
         self.display.wake();
         if let Backend::Drm(d) = &mut self.backend {
-            if let Err(e) = d.set_blank(false) {
+            if let Err(e) = d.set_blank(false, false) {
                 log!("wake: {e}");
             }
         }
@@ -1499,15 +1499,23 @@ impl App {
 
     /// The idle timer fired.
     fn idle(&mut self) {
-        if !self.display.timer_fired() {
-            return;
+        match self.display.timer_fired() {
+            None => {}
+            Some(display::Idle::Blank) if self.state.idle_inhibited() => self.display.activity(),
+            Some(display::Idle::Blank) => {
+                log!("idle for {}s", self.display.screensaver.timeout);
+                self.blank();
+            }
+            Some(display::Idle::PowerDown) => {
+                log!("blanked for {}s: powering down", self.display.screensaver.power_off_after());
+                self.display.power_down();
+                if let Backend::Drm(d) = &mut self.backend {
+                    if let Err(e) = d.set_blank(true, true) {
+                        log!("power down: {e}");
+                    }
+                }
+            }
         }
-        if self.state.idle_inhibited() {
-            self.display.activity();
-            return;
-        }
-        log!("idle for {}s", self.display.screensaver.timeout);
-        self.blank();
     }
 
     /// The set of lit outputs changed: the automatic screensaver policy and

@@ -7,6 +7,14 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// What the idle timer is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Idle {
+    Blank,
+    /// Power down the monitors kept on with black frames.
+    PowerDown,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Screensaver {
     pub enabled: bool,
@@ -55,6 +63,12 @@ impl Screensaver {
     }
 
     /// "OFF", or the timeout: "1m", "90s".
+    /// Seconds after blanking before black-blanked monitors power down too.
+    pub fn power_off_after(&self) -> u64 {
+        let t = self.timeout;
+        config::BLANK_POWER_OFF.iter().find(|(k, _)| *k == t).map_or(900, |(_, total)| total.saturating_sub(t)) as u64
+    }
+
     pub fn label(&self) -> String {
         match self.timeout {
             _ if !self.enabled => "OFF".into(),
@@ -123,6 +137,9 @@ pub struct Display {
     timer: OwnedFd,
     last_input: Instant,
     pub blanked: bool,
+    blanked_at: Instant,
+    /// Blanked long enough that every monitor is powered down.
+    pub powered_down: bool,
     grace_until: Instant,
     /// Heads that already show their black frame while blanked.
     pub black_shown: Vec<usize>,
@@ -141,6 +158,8 @@ impl Display {
             timer: unsafe { OwnedFd::from_raw_fd(fd) },
             last_input: Instant::now(),
             blanked: false,
+            blanked_at: Instant::now(),
+            powered_down: false,
             grace_until: Instant::now(),
             black_shown: Vec::new(),
             lid_inhibitor,
@@ -153,10 +172,19 @@ impl Display {
         self.timer.as_raw_fd()
     }
 
+    /// What the idle timer waits for, and how long is left.
+    fn next(&self) -> Option<(Idle, Duration)> {
+        let left = |total: u64, since: Instant| Duration::from_secs(total).saturating_sub(since.elapsed());
+        match (self.blanked, self.powered_down) {
+            (false, _) if self.screensaver.enabled => Some((Idle::Blank, left(self.screensaver.timeout as u64, self.last_input))),
+            (true, false) => Some((Idle::PowerDown, left(self.screensaver.power_off_after(), self.blanked_at))),
+            _ => None,
+        }
+    }
+
     /// Arms the idle timer for the remaining time, or disarms it.
     fn arm(&self) {
-        let due = (self.screensaver.enabled && !self.blanked)
-            .then(|| Duration::from_secs(self.screensaver.timeout as u64).saturating_sub(self.last_input.elapsed()).max(Duration::from_millis(10)));
+        let due = self.next().map(|(_, d)| d.max(Duration::from_millis(10)));
         let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
         if let Some(d) = due {
             spec.it_value.tv_sec = d.as_secs() as libc::time_t;
@@ -165,15 +193,22 @@ impl Display {
         unsafe { libc::timerfd_settime(self.timer.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
     }
 
-    /// The idle timer fired: true when the screen should blank now.
-    pub fn timer_fired(&mut self) -> bool {
+    /// The idle timer fired: what is due now, if anything.
+    pub fn timer_fired(&mut self) -> Option<Idle> {
         let mut n = 0u64;
         unsafe { libc::read(self.timer.as_raw_fd(), (&mut n as *mut u64).cast(), 8) };
-        let due = self.screensaver.enabled && !self.blanked && self.last_input.elapsed() >= Duration::from_secs(self.screensaver.timeout as u64);
-        if !due {
-            self.arm();
+        match self.next() {
+            Some((what, left)) if left.is_zero() => Some(what),
+            _ => {
+                self.arm();
+                None
+            }
         }
-        due
+    }
+
+    pub fn power_down(&mut self) {
+        self.powered_down = true;
+        self.arm();
     }
 
     /// Input arrived. Returns true when it must not reach anyone: the screen
@@ -191,6 +226,7 @@ impl Display {
 
     pub fn blank(&mut self) {
         self.blanked = true;
+        self.blanked_at = Instant::now();
         self.black_shown.clear();
         self.grace_until = Instant::now() + Duration::from_millis(config::BLANK_GRACE_MS);
         self.arm();
@@ -203,6 +239,7 @@ impl Display {
 
     pub fn wake(&mut self) {
         self.blanked = false;
+        self.powered_down = false;
         self.black_shown.clear();
         self.last_input = Instant::now();
         self.arm();
@@ -262,6 +299,13 @@ mod tests {
         assert!(r == 1.0 && g > 0.7 && g < 0.9 && b > 0.5 && b < 0.7, "{g} {b}");
         let (_, g, b) = kelvin(6500);
         assert!(g > 0.95 && b > 0.95);
+    }
+
+    #[test]
+    fn power_off_follows_the_timeout() {
+        let at = |timeout| Screensaver { enabled: true, manual: true, timeout }.power_off_after() + timeout as u64;
+        assert_eq!((at(60), at(300), at(1800)), (600, 1800, 2700));
+        assert_eq!(at(90), 990);
     }
 
     #[test]

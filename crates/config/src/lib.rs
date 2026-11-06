@@ -310,6 +310,11 @@ pub const NOTIFICATION_HISTORY: usize = 50;
 /// connected (unless chosen by hand), and the cycle of the bar's click.
 pub const SCREENSAVER_AUTO_TIMEOUT: u32 = 60;
 pub const SCREENSAVER_CYCLE: &[u32] = &[60, 300, 1800];
+/// Monitors blanked with black frames (`OUTPUT_BLANK_BLACK`) are powered
+/// down after this long without input, by screensaver timeout (seconds):
+/// they take a while to come back, so not at once, but an OLED left on
+/// for hours is not wanted either. Other timeouts: 15 minutes after blanking.
+pub const BLANK_POWER_OFF: &[(u32, u32)] = &[(60, 600), (300, 1800), (1800, 2700)];
 /// Input is ignored this long after blanking, so the click or key that asked
 /// for it (and its release) does not wake the screen straight away.
 pub const BLANK_GRACE_MS: u64 = 700;
