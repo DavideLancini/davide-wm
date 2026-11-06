@@ -90,6 +90,10 @@ pub enum Command {
     HwCursor(bool),
     /// Shows the night light mode, or sets it: on, off, auto.
     Night(Option<String>),
+    /// Opens a built-in terminal, in a directory if given.
+    Term(Option<String>),
+    /// Runs a shell command in a new built-in terminal.
+    TermRun(String),
     /// Appends the entries of a history file (same format) below ours.
     ClipboardImport(String),
     Exit,
@@ -159,9 +163,11 @@ fn parse(line: &str) -> Result<Command, String> {
         "damage" if arg == "on" || arg == "off" => Ok(Command::Damage(arg == "on")),
         "cursor" if arg == "hw" || arg == "sw" => Ok(Command::HwCursor(arg == "hw")),
         "night" => Ok(Command::Night((!arg.is_empty()).then(|| arg.to_string()))),
+        "term" => Ok(Command::Term((!arg.is_empty()).then(|| arg.to_string()))),
+        "term-run" if !arg.is_empty() => Ok(Command::TermRun(arg.to_string())),
         "clipboard-import" if !arg.is_empty() => Ok(Command::ClipboardImport(arg.to_string())),
         "exit" => Ok(Command::Exit),
-        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, dnd [on|off], damage on|off, cursor hw|sw, night [on|off|auto], clipboard-import <file>, exit".into()),
+        _ => Err("commands: workspace <1-41|chat|special>, exec <cmd>, close, windows, focus-app <app-id>, upgrade, pointer <x> <y>, click, press, release, key <code>..., focused, blank, wake, screensaver [cycle|on|off|auto|<secs>], lid-inhibit [toggle], outputs, clipboard, notifications, screenshot <file.png>, cast [window], cast-stop <id>, lock, dnd [on|off], damage on|off, cursor hw|sw, night [on|off|auto], term [dir], term-run <cmd>, clipboard-import <file>, exit".into()),
     }
 }
 

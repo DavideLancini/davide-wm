@@ -1321,6 +1321,8 @@ impl App {
                 self.night_light();
                 return format!("{:?}\n", self.night).to_lowercase();
             }
+            ipc::Command::Term(cwd) => self.term_open.push(terminal::Open { cwd, ..Default::default() }),
+            ipc::Command::TermRun(cmd) => self.term_open.push(terminal::Open { cwd: None, cmd: Some(cmd), hold: false }),
             ipc::Command::ClipboardImport(path) => {
                 let older = match std::fs::read(&path) {
                     Ok(b) => clipboard::decode_v1(&b),
