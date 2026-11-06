@@ -480,7 +480,7 @@ davide-wm/
 | 9 | Timer widget: countdown and notification at the end (a critical one, it stays) | works |
 | 10 | Network widget and Main+W: Wi-Fi list | works |
 | 11 | Backlight widget | works |
-| 12 | Screensaver widget: the cycle works; the screen actually blanking (laptop and external monitors) | partly tested |
+| 12 | Screensaver widget: the cycle works; the screen actually blanking (laptop and external monitors) | works (MSI blanked after a minute, 2026-11-07) |
 | 13 | blk widget | works |
 | 14 | Lid widget | works |
 | 15 | Closing the lid without the inhibitor: suspend, locked on resume | to test |
