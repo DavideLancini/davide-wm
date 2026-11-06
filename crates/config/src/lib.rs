@@ -121,8 +121,8 @@ pub fn binds() -> Vec<Bind> {
     use mods::{ALT, CTRL, MAIN, SHIFT};
     let b = |mods, key, action| Bind { mods, key, action };
     let mut v = vec![
-        b(MAIN, keys::T, Action::Spawn(TERMINAL)),
-        b(MAIN | SHIFT, keys::T, Action::Terminal),
+        b(MAIN, keys::T, Action::Terminal),
+        b(MAIN | SHIFT, keys::T, Action::Spawn(TERMINAL)),
         b(MAIN, keys::B, Action::Spawn(BROWSER)),
         b(MAIN, keys::C, Action::Spawn("code")),
         b(MAIN, keys::F, Action::Spawn("thunar")),
