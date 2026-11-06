@@ -1605,6 +1605,11 @@ impl App {
     fn render(&mut self, r: &mut Renderer) -> io::Result<()> {
         let heads = self.backend.heads().len();
         self.update_cursor(r);
+        // Even with nothing to draw (blanked, locked, hidden windows): a
+        // client waiting for its buffer back would spin.
+        if self.state.uploads_pending {
+            self.state.upload_pending(r);
+        }
         if self.display.blanked {
             self.forget_buffers();
             for h in 0..heads {
@@ -1646,20 +1651,15 @@ impl App {
                 self.casts.catch_up = true;
                 self.state.needs_redraw = true;
             }
-        } else {
-            if self.state.uploads_pending && self.state.lock.is_none() {
-                self.state.upload_pending(r);
-            }
-            if self.cursor_moved {
-                if let Backend::Drm(d) = &mut self.backend {
-                    match d.commit_cursor() {
-                        Ok(true) => self.cursor_moved = false,
-                        // A flip is pending: again after it.
-                        Ok(false) => {}
-                        Err(e) => {
-                            log!("cursor: {e}");
-                            self.cursor_moved = false;
-                        }
+        } else if self.cursor_moved {
+            if let Backend::Drm(d) = &mut self.backend {
+                match d.commit_cursor() {
+                    Ok(true) => self.cursor_moved = false,
+                    // A flip is pending: again after it.
+                    Ok(false) => {}
+                    Err(e) => {
+                        log!("cursor: {e}");
+                        self.cursor_moved = false;
                     }
                 }
             }
