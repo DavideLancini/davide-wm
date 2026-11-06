@@ -20,8 +20,9 @@ fn check(r: i32) -> io::Result<i32> {
     }
 }
 
-/// Starts the user's shell on a new pseudo-terminal of `cols`×`rows`.
-pub fn spawn(cols: u16, rows: u16, cell: (i32, i32), cwd: Option<&str>) -> io::Result<Pty> {
+/// Starts the user's shell, or a command through it, on a new
+/// pseudo-terminal of `cols`×`rows`.
+pub fn spawn(cols: u16, rows: u16, cell: (i32, i32), o: &super::Open) -> io::Result<Pty> {
     let master = unsafe { check(libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK))? };
     let master = unsafe { OwnedFd::from_raw_fd(master) };
     let mut name = [0 as libc::c_char; 128];
@@ -37,13 +38,18 @@ pub fn spawn(cols: u16, rows: u16, cell: (i32, i32), cwd: Option<&str>) -> io::R
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = Command::new(&shell);
+    match (&o.cmd, o.hold) {
+        (Some(c), true) => cmd.arg("-c").arg(format!("{c}\nexec \"$SHELL\"")),
+        (Some(c), false) => cmd.arg("-c").arg(c),
+        (None, _) => &mut cmd,
+    };
     // A login-style argv[0] would read the profile again; foot does not either.
     cmd.stdin(Stdio::from(slave.try_clone()?)).stdout(Stdio::from(slave.try_clone()?)).stderr(Stdio::from(slave));
     for (k, v) in config::TERM_ENV {
         cmd.env(k, v);
     }
     cmd.env_remove("WAYLAND_SOCKET");
-    if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+    if let Some(dir) = o.cwd.as_deref().filter(|d| std::path::Path::new(d).is_dir()) {
         cmd.current_dir(dir);
     } else if let Some(home) = std::env::var_os("HOME") {
         cmd.current_dir(home);

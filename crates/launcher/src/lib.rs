@@ -24,6 +24,9 @@ pub enum Outcome {
     Close,
     /// Close and run this shell command.
     Launch(String),
+    /// Close and run this shell command in a terminal; with `hold` the
+    /// terminal stays open on a shell afterwards.
+    Terminal { cmd: String, hold: bool },
     /// Picker: this item (index in the list given to `picker`) was chosen.
     Pick(usize),
     /// Picker: delete this item; it is already gone from the list.
@@ -35,6 +38,7 @@ pub enum Outcome {
 /// A row of a special mode and what Enter does with it.
 enum Action {
     Launch(String),
+    Terminal(String),
     Copy(String),
 }
 
@@ -122,7 +126,7 @@ impl Launcher {
             }
             // In a terminal that stays open: `top` and friends need one,
             // and the output of a plain command stays readable.
-            ">" if !rest.is_empty() => vec![(format!("Esegui nel terminale: {rest}"), Action::Launch(format!("{} --hold sh -c {}", settings::TERMINAL_CMD, quote(rest))))],
+            ">" if !rest.is_empty() => vec![(format!("Esegui nel terminale: {rest}"), Action::Terminal(rest.to_string()))],
             ":" => {
                 let needle = rest.to_lowercase();
                 emoji::EMOJI
@@ -162,15 +166,15 @@ impl Launcher {
         self.selected.saturating_sub(page - 1).min(self.filtered.len() - page)
     }
 
-    fn command(app: &apps::App) -> Option<String> {
+    fn command(app: &apps::App) -> Outcome {
         if app.is_exit {
-            None
+            Outcome::Close
         } else if let Some(url) = &app.url {
-            Some(format!("{} {}", settings::BROWSER_CMD, quote(url)))
+            Outcome::Launch(format!("{} {}", settings::BROWSER_CMD, quote(url)))
         } else if app.terminal {
-            Some(format!("{} -e sh -c {}", settings::TERMINAL_CMD, quote(&app.exec)))
+            Outcome::Terminal { cmd: app.exec.clone(), hold: false }
         } else {
-            Some(app.exec.clone())
+            Outcome::Launch(app.exec.clone())
         }
     }
 
@@ -182,6 +186,7 @@ impl Launcher {
                 if self.is_special() {
                     return match self.filtered.get(self.selected).and_then(|i| self.special.get(*i)).map(|(_, a)| a) {
                         Some(Action::Launch(cmd)) => Outcome::Launch(cmd.clone()),
+                        Some(Action::Terminal(cmd)) => Outcome::Terminal { cmd: cmd.clone(), hold: true },
                         Some(Action::Copy(text)) if !text.is_empty() => Outcome::Copy(text.clone()),
                         _ => Outcome::Nothing,
                     };
@@ -189,10 +194,7 @@ impl Launcher {
                 if let Some(picks) = &self.picks {
                     return self.filtered.get(self.selected).map_or(Outcome::Nothing, |i| Outcome::Pick(picks[*i]));
                 }
-                match self.filtered.get(self.selected).and_then(|i| Self::command(&self.apps[*i])) {
-                    Some(cmd) => Outcome::Launch(cmd),
-                    None => Outcome::Close,
-                }
+                self.filtered.get(self.selected).map_or(Outcome::Close, |i| Self::command(&self.apps[*i]))
             }
             keys::DELETE if self.picks.is_some() => {
                 let Some(&i) = self.filtered.get(self.selected) else { return Outcome::Nothing };
@@ -275,7 +277,7 @@ mod tests {
         for c in ">echo ciao".chars() {
             x.key(0, Some(c));
         }
-        assert!(matches!(x.key(keys::RETURN, None), Outcome::Launch(c) if c == "foot --hold sh -c 'echo ciao'"));
+        assert!(matches!(x.key(keys::RETURN, None), Outcome::Terminal { cmd, hold: true } if cmd == "echo ciao"));
         assert_eq!(quote("it's"), r"'it'\''s'");
     }
 

@@ -31,6 +31,15 @@ const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// compositor.
 const READ_BUDGET: usize = 256 << 10;
 
+/// A terminal window to open: where, and what to run instead of a shell.
+#[derive(Clone, Default)]
+pub struct Open {
+    pub cwd: Option<String>,
+    pub cmd: Option<String>,
+    /// After `cmd`, the window stays open on a shell.
+    pub hold: bool,
+}
+
 pub struct Window {
     pub surface: u32,
     xdg: u32,
@@ -76,7 +85,7 @@ pub struct Terms {
     clipboard: Option<u32>,
     pub windows: Vec<Window>,
     /// Windows asked for before the globals were bound: working directory.
-    queued: Vec<Option<String>>,
+    queued: Vec<Open>,
     mouse: Mouse,
     /// Pastes being read: pipe, window.
     pastes: Vec<(OwnedFd, u32, Vec<u8>)>,
@@ -186,14 +195,14 @@ impl Terms {
         (cols as u16, rows as u16)
     }
 
-    /// A new window, its shell started in `cwd`.
-    pub fn open(&mut self, cwd: Option<String>) {
+    /// A new window, its shell (or command) started in `o.cwd`.
+    pub fn open(&mut self, o: Open) {
         if self.compositor == 0 || self.wm_base == 0 {
-            self.queued.push(cwd);
+            self.queued.push(o);
             return;
         }
         let (cols, rows) = (80, 24);
-        let pty = match pty::spawn(cols, rows, self.cell(), cwd.as_deref()) {
+        let pty = match pty::spawn(cols, rows, self.cell(), &o) {
             Ok(p) => p,
             Err(e) => {
                 log!("terminal: cannot start the shell: {e}");
@@ -281,8 +290,8 @@ impl Terms {
                         self.send(Msg::new(self.data_manager, wl_data_device_manager::req::GET_DATA_DEVICE).obj(self.data_device).obj(self.seat));
                     }
                     if self.compositor != 0 && self.wm_base != 0 {
-                        for cwd in std::mem::take(&mut self.queued) {
-                            self.open(cwd);
+                        for o in std::mem::take(&mut self.queued) {
+                            self.open(o);
                         }
                     }
                 }
@@ -558,7 +567,7 @@ impl Terms {
                 Some(0x76) => return self.paste(i),
                 Some(0x6e) => {
                     let cwd = pty::cwd(self.windows[i].pty.pid);
-                    return self.open(cwd);
+                    return self.open(Open { cwd, ..Default::default() });
                 }
                 _ => {}
             }
@@ -948,7 +957,8 @@ impl state::Persist for Terms {
         (self.data_device, self.data_manager, self.clipboard).save(e);
         self.offers.save(e);
         self.windows.save(e);
-        self.queued.save(e);
+        // Only where they open: a command waiting across an upgrade is lost.
+        self.queued.iter().map(|o| o.cwd.clone()).collect::<Vec<_>>().save(e);
     }
     fn load(d: &mut state::Dec) -> state::Result<Self> {
         use state::Persist;
@@ -960,7 +970,8 @@ impl state::Persist for Terms {
         let (data_device, data_manager, clipboard) = Persist::load(d)?;
         let offers = Persist::load(d)?;
         let windows = Persist::load(d)?;
-        let queued = Persist::load(d)?;
+        let cwds: Vec<Option<String>> = Persist::load(d)?;
+        let queued = cwds.into_iter().map(|cwd| Open { cwd, ..Default::default() }).collect();
         Ok(Terms {
             conn,
             client,

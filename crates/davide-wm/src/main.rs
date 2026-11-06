@@ -246,7 +246,7 @@ struct App {
     /// The audio mixer while it is open; it has the keyboard.
     mixer: Option<mixer::MixerUi>,
     /// Terminal windows asked for: working directory.
-    term_open: Vec<Option<String>>,
+    term_open: Vec<terminal::Open>,
     /// Terminal fds in the epoll set, with their tokens.
     term_watched: HashMap<RawFd, u64>,
 }
@@ -328,6 +328,10 @@ impl App {
                     launcher::Outcome::Launch(cmd) => {
                         self.state.close_launcher();
                         self.spawn(&cmd);
+                    }
+                    launcher::Outcome::Terminal { cmd, hold } => {
+                        self.state.close_launcher();
+                        self.term_open.push(terminal::Open { cwd: None, cmd: Some(cmd), hold });
                     }
                     launcher::Outcome::Copy(text) => {
                         self.state.close_launcher();
@@ -414,7 +418,7 @@ impl App {
             Action::AudioOutputs => self.open_mixer(true),
             Action::Terminal => {
                 let cwd = self.state.focus.and_then(|f| self.state.terms.as_ref().filter(|t| t.is_ours(f)).and_then(|t| t.cwd_of(f.id)));
-                self.term_open.push(cwd);
+                self.term_open.push(terminal::Open { cwd, ..Default::default() });
             }
             Action::Exit => self.running = false,
         }
@@ -2053,8 +2057,8 @@ impl App {
                 }
             }
         }
-        for cwd in std::mem::take(&mut self.term_open) {
-            self.with_terms(|t, _| t.open(cwd));
+        for o in std::mem::take(&mut self.term_open) {
+            self.with_terms(|t, _| t.open(o));
         }
         let wanted: HashMap<RawFd, u64> = match &self.state.terms {
             Some(t) => t

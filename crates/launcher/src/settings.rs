@@ -13,8 +13,6 @@ pub const BORDER_COLOR: u32 = 0xFF_FF_FF;
 /// Same size as the bar.
 pub const FONT_SIZE: f32 = 24.0;
 
-/// Runs entries with Terminal=true.
-pub const TERMINAL_CMD: &str = "foot";
 
 /// Opens bookmark (Type=Link) entries; `--new-window` forces a window
 /// instead of a tab in one that is already open.
