@@ -1066,6 +1066,7 @@ impl App {
                 };
                 s.pointer.x = x.clamp(0.0, (s.output.width - 1) as f64);
                 s.pointer.y = y.clamp(0.0, (s.output.height - 1) as f64);
+                s.cursor_changed = true;
                 s.needs_redraw = true;
             }
             Event::PointerButton(BTN_LEFT, true) => {
