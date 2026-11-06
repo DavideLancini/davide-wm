@@ -64,6 +64,13 @@ impl Casts {
         self.list.is_empty()
     }
 
+    pub fn windows(&self) -> Vec<SKey> {
+        self.list.iter().filter_map(|c| match c.source {
+            Source::Window(k) => Some(k),
+            Source::Output => None,
+        }).collect()
+    }
+
     /// Some consumer is reading.
     pub fn streaming(&self) -> bool {
         self.list.iter().any(|c| c.streaming)

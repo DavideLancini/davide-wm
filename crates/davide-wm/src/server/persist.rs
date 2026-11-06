@@ -394,6 +394,7 @@ impl State {
             start,
             needs_redraw: _,
             uploads_pending: _,
+            cast_windows: _,
             damage: _,
             cursor_changed: _,
             cursor_image_dirty: _,

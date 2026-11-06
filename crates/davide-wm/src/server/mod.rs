@@ -482,6 +482,8 @@ pub struct State {
     /// A surface committed a buffer not uploaded yet: hidden windows too,
     /// whose clients wait for the buffer back.
     pub uploads_pending: bool,
+    /// Windows being cast: they keep drawing even when not on screen.
+    pub cast_windows: Vec<SKey>,
     /// Areas to draw again when `needs_redraw` is not set.
     pub damage: Vec<Rect>,
     /// The pointer moved or changed image.
@@ -547,6 +549,7 @@ impl State {
             start: Instant::now(),
             needs_redraw: true,
             uploads_pending: false,
+            cast_windows: Vec::new(),
             damage: Vec::new(),
             cursor_changed: false,
             cursor_image_dirty: false,
@@ -1021,6 +1024,20 @@ impl State {
     }
 
     /// A window that is on screen (as far as its role is concerned).
+    /// True for a surface of a window that is not on screen (another
+    /// workspace): it gets no frame callbacks, so it stops drawing until
+    /// it shows again.
+    fn offscreen(&self, key: SKey) -> bool {
+        let mut k = key;
+        while let Some(s) = self.surfaces.get(&k) {
+            match (&s.role, s.xdg.as_ref().map(|x| &x.role)) {
+                (Role::Subsurface { parent, .. }, _) | (_, Some(XdgRole::Popup { parent, .. })) => k.id = *parent,
+                _ => break,
+            }
+        }
+        self.window_ws.contains_key(&k) && !self.layout.iter().any(|(w, _)| *w == k) && !self.cast_windows.contains(&k)
+    }
+
     pub fn shown(&self, key: SKey) -> bool {
         self.surfaces.get(&key).and_then(|s| s.xdg.as_ref()).is_some_and(|x| x.mapped) || xwm::window(self, key).is_some_and(|w| w.shown)
     }
@@ -1373,9 +1390,12 @@ impl State {
         }
         r.finish();
         let time = self.time_ms();
+        let waiting: Vec<SKey> = self.surfaces.iter().filter(|(_, s)| !s.frames.is_empty()).map(|(k, _)| *k).collect();
         let mut done = Vec::new();
-        for (k, s) in self.surfaces.iter_mut() {
-            done.extend(s.frames.drain(..).map(|f| (k.client, f)));
+        for k in waiting {
+            if !self.offscreen(k) {
+                done.extend(self.surfaces.get_mut(&k).unwrap().frames.drain(..).map(|f| (k.client, f)));
+            }
         }
         for (c, f) in done {
             self.send_callback_done(c, f, time);

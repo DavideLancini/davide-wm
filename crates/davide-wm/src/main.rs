@@ -1604,6 +1604,7 @@ impl App {
 
     fn render(&mut self, r: &mut Renderer) -> io::Result<()> {
         let heads = self.backend.heads().len();
+        self.state.cast_windows = self.casts.windows();
         self.update_cursor(r);
         // Even with nothing to draw (blanked, locked, hidden windows): a
         // client waiting for its buffer back would spin.
