@@ -344,6 +344,12 @@ impl Kms {
         Ok(Some(Cursor { plane, fb: cmd.fb_id, handle: dumb.handle, map: ptr.cast(), len, pitch: dumb.pitch, size }))
     }
 
+    /// The framebuffer of `head`'s cursor: a new one (another output) starts
+    /// blank and needs the image again.
+    pub fn cursor_fb(&self, head: usize) -> Option<u32> {
+        self.heads.get(head)?.cursor.as_ref().map(|c| c.fb)
+    }
+
     /// Size of the hardware cursor of `head`, if it has one.
     pub fn cursor_size(&self, head: usize) -> Option<(u32, u32)> {
         self.heads.get(head)?.cursor.as_ref().map(|c| c.size)

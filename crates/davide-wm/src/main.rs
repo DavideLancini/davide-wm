@@ -240,7 +240,8 @@ struct App {
     /// Hardware cursor (`davide-wm msg cursor sw` draws it in the scene).
     hw_cursor_enabled: bool,
     /// The image on the cursor plane, and whether it fit.
-    cursor_image: Option<(server::CursorImage, bool)>,
+    /// Image on the cursor plane, whether it fit, and the plane's buffer.
+    cursor_image: Option<(server::CursorImage, bool, Option<u32>)>,
     /// The cursor plane must move without a frame.
     cursor_moved: bool,
     /// The audio mixer while it is open; it has the keyboard.
@@ -1520,6 +1521,8 @@ impl App {
         self.last_frame = None;
         self.forget_buffers();
         self.mirrors_stale.clear();
+        // Another output means another cursor plane, blank until written.
+        self.cursor_image = None;
         self.state.needs_redraw = true;
         self.sync_notices();
     }
@@ -1594,17 +1597,18 @@ impl App {
         if let (Backend::Drm(d), true) = (&mut self.backend, usable) {
             if let Some(max) = d.cursor_size() {
                 let image = self.state.pointer.cursor;
-                if self.state.cursor_image_dirty || self.cursor_image.is_none_or(|(i, _)| i != image) {
+                let fb = d.cursor_fb();
+                if self.state.cursor_image_dirty || self.cursor_image.is_none_or(|(i, _, f)| i != image || f != fb) {
                     self.state.upload_pending(r);
                     let pixels = self.state.cursor_pixels(r, max);
                     if let Some((w, h, px)) = &pixels {
                         d.set_cursor_image(*w, *h, px);
                     }
-                    self.cursor_image = Some((image, pixels.is_some()));
+                    self.cursor_image = Some((image, pixels.is_some(), fb));
                     self.state.cursor_image_dirty = false;
                     self.state.cursor_changed = true;
                 }
-                hw = self.cursor_image.is_some_and(|(_, fits)| fits);
+                hw = self.cursor_image.is_some_and(|(_, fits, _)| fits);
             }
         }
         if hw != self.state.hw_cursor {

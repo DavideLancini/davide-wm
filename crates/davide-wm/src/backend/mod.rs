@@ -255,6 +255,10 @@ impl Drm {
         self.kms.cursor_size(0)
     }
 
+    pub fn cursor_fb(&self) -> Option<u32> {
+        self.kms.cursor_fb(0)
+    }
+
     pub fn set_cursor_image(&mut self, w: u32, h: u32, argb: &[u8]) {
         self.kms.set_cursor_image(0, w, h, argb);
     }
