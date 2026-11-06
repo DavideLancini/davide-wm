@@ -202,6 +202,8 @@ fn apply_children(s: &mut State, key: SKey) {
 
 fn apply(s: &mut State, key: SKey, mut p: Pending) {
     let Some(sf) = s.surfaces.get_mut(&key) else { return };
+    let before = (sf.size, sf.xdg.as_ref().and_then(|x| x.geometry));
+    let changed = p.damage.clone();
     if let Some(b) = p.buffer.take() {
         match b.and_then(|id| s.buffers.get(&SKey { client: key.client, id }).map(|buf| (id, buf))) {
             Some((id, buf)) => {
@@ -238,7 +240,9 @@ fn apply(s: &mut State, key: SKey, mut p: Pending) {
             x.geometry = Some(g);
         }
     }
-    s.damage_surface(key);
+    let sf = s.surfaces.get_mut(&key).unwrap();
+    let same = (sf.size, sf.xdg.as_ref().and_then(|x| x.geometry)) == before;
+    s.damage_committed(key, if same { &changed } else { &[] });
     xdg::commit(s, key);
 }
 

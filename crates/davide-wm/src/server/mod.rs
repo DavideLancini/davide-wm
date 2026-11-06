@@ -1198,6 +1198,31 @@ impl State {
         }
     }
 
+    /// A surface committed with these damaged areas (empty: unknown). In
+    /// a tiled window only those areas are redrawn; anything else gets its
+    /// whole window redrawn.
+    pub fn damage_committed(&mut self, key: SKey, areas: &[Rect]) {
+        // Subsurface offsets up to the window's surface.
+        let (mut root, mut dx, mut dy) = (key, 0, 0);
+        while let Some(Role::Subsurface { parent, x, y, .. }) = self.surfaces.get(&root).map(|s| &s.role) {
+            (dx, dy) = (dx + x, dy + y);
+            root.id = *parent;
+        }
+        let xdg = self.surfaces.get(&root).is_some_and(|s| matches!(s.role, Role::Xdg));
+        let tile = self.layout.iter().find(|(k, _)| *k == root).map(|(_, r)| *r);
+        let (Some(r), true) = (tile, xdg && !areas.is_empty() && areas.len() <= 16) else {
+            self.damage_surface(key);
+            return;
+        };
+        let (ox, oy) = self.surface_origin(root, (r.x, r.y));
+        let (ox, oy) = (ox + dx, oy + dy);
+        for d in areas {
+            let (x0, y0) = ((ox + d.x).max(r.x), (oy + d.y).max(r.y));
+            let (x1, y1) = (ox.saturating_add(d.x).saturating_add(d.w).min(r.x + r.w), oy.saturating_add(d.y).saturating_add(d.h).min(r.y + r.h));
+            self.damage(Rect::new(x0, y0, x1 - x0, y1 - y0));
+        }
+    }
+
     /// A surface committed: the area of its window (or popup) on screen
     /// needs drawing; nothing when it is not shown.
     pub fn damage_surface(&mut self, key: SKey) {

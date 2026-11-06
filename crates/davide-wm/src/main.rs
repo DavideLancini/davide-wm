@@ -1187,7 +1187,15 @@ impl App {
                     s.shot.is_some(),
                 );
                 for (k, r) in &s.layout {
-                    out += &format!("tile {} {:?} float {}\n", name(*k), r, s.is_floating(*k));
+                    let sf = s.surfaces.get(k);
+                    out += &format!(
+                        "tile {} {:?} float {} subsurfaces {} pending damage {:?}\n",
+                        name(*k),
+                        r,
+                        s.is_floating(*k),
+                        sf.map_or(0, |f| f.above.len() + f.below.len()),
+                        sf.and_then(|f| f.damage.as_ref().map(Vec::len)),
+                    );
                 }
                 for k in &s.popups {
                     out += &format!("popup {} origin {:?}\n", name(*k), s.window_origin(*k));
@@ -1208,6 +1216,7 @@ impl App {
                     mib(heap.uordblks + heap.hblkhd),
                     mib(heap.fordblks),
                 );
+                out += &format!("frames: {:?}\n", self.damage_log.iter().map(|(_, r)| r.map(|r| (r.x, r.y, r.w, r.h))).collect::<Vec<_>>());
                 return out;
             }
             ipc::Command::Blank => self.blank(),
