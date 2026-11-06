@@ -7,7 +7,11 @@ pub type GLsizei = i32;
 pub type GLfloat = f32;
 pub type GLbitfield = u32;
 
+pub const TRIANGLES: GLenum = 0x0004;
 pub const TRIANGLE_STRIP: GLenum = 0x0005;
+pub const RED: GLenum = 0x1903;
+pub const R8: GLenum = 0x8229;
+pub const NEAREST: GLint = 0x2600;
 pub const ONE: GLenum = 1;
 pub const ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 pub const BLEND: GLenum = 0x0BE2;
@@ -86,6 +90,7 @@ extern "C" {
     pub fn glUniform4f(loc: GLint, a: GLfloat, b: GLfloat, c: GLfloat, d: GLfloat);
     pub fn glVertexAttribPointer(index: GLuint, size: GLint, kind: GLenum, norm: u8, stride: GLsizei, ptr: *const c_void);
     pub fn glEnableVertexAttribArray(index: GLuint);
+    pub fn glDisableVertexAttribArray(index: GLuint);
     pub fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei);
 
     pub fn glGenTextures(n: GLsizei, ids: *mut GLuint);

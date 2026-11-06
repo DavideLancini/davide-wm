@@ -79,6 +79,51 @@ pub struct Quad {
     pub h: f32,
 }
 
+/// One vertex of a batch: position in output pixels, texture coordinate in
+/// the atlas (negative: solid) and premultiplied colour.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct BatchVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+    color: [f32; 4],
+}
+
+/// Rectangles drawn in one call: solid fills and glyphs from an atlas
+/// (alpha-only texture) tinted with their colour.
+#[derive(Default)]
+pub struct Batch {
+    vertices: Vec<BatchVertex>,
+}
+
+impl Batch {
+    pub fn clear(&mut self) {
+        self.vertices.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty()
+    }
+
+    fn quad(&mut self, q: Quad, uv: [f32; 4], color: [f32; 4]) {
+        let (x0, y0, x1, y1) = (q.x, q.y, q.x + q.w, q.y + q.h);
+        let (u0, v0, u1, v1) = (uv[0], uv[1], uv[2], uv[3]);
+        let v = |x, y, u, w| BatchVertex { pos: [x, y], uv: [u, w], color };
+        self.vertices.extend_from_slice(&[v(x0, y0, u0, v0), v(x1, y0, u1, v0), v(x0, y1, u0, v1), v(x1, y0, u1, v0), v(x1, y1, u1, v1), v(x0, y1, u0, v1)]);
+    }
+
+    /// `color` is premultiplied RGBA.
+    pub fn fill(&mut self, q: Quad, color: [f32; 4]) {
+        self.quad(q, [-1.0; 4], color);
+    }
+
+    /// Draws the atlas area `src` (texels) at `q`, tinted with `color`.
+    pub fn glyph(&mut self, atlas: &Texture, src: Quad, q: Quad, color: [f32; 4]) {
+        let (w, h) = (atlas.width as f32, atlas.height as f32);
+        self.quad(q, [src.x / w, src.y / h, (src.x + src.w) / w, (src.y + src.h) / h], color);
+    }
+}
+
 struct Program {
     id: gl::GLuint,
     rect: gl::GLint,
@@ -101,6 +146,7 @@ pub struct Renderer {
     query_modifiers: Option<egl::PFNEGLQUERYDMABUFMODIFIERSEXT>,
     solid: Program,
     textured: Program,
+    batch: Program,
     viewport: (i32, i32),
     /// The damaged area of this frame: drawing never leaves it.
     region: Option<Quad>,
@@ -136,6 +182,31 @@ void main() {
 }
 ";
 
+const BATCH_VERTEX: &str = "#version 100
+attribute vec2 bpos;
+attribute vec2 buv;
+attribute vec4 bcolor;
+uniform vec4 viewport;
+varying vec2 uv;
+varying vec4 color;
+void main() {
+    uv = buv;
+    color = bcolor;
+    gl_Position = vec4(bpos / viewport.xy * 2.0 - 1.0, 0.0, 1.0);
+}
+";
+
+const BATCH: &str = "#version 100
+precision mediump float;
+uniform sampler2D tex;
+varying vec2 uv;
+varying vec4 color;
+void main() {
+    float a = uv.x < 0.0 ? 1.0 : texture2D(tex, uv).r;
+    gl_FragColor = color * a;
+}
+";
+
 const PACK_ALIGNMENT: gl::GLenum = 0x0D05;
 
 const UNIT_SQUARE: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
@@ -157,12 +228,19 @@ unsafe fn compile(kind: gl::GLenum, src: &str) -> Result<gl::GLuint, Error> {
 }
 
 unsafe fn program(fragment: &str) -> Result<Program, Error> {
-    let vs = compile(gl::VERTEX_SHADER, VERTEX)?;
+    program_with(VERTEX, fragment)
+}
+
+unsafe fn program_with(vertex: &str, fragment: &str) -> Result<Program, Error> {
+    let vs = compile(gl::VERTEX_SHADER, vertex)?;
     let fs = compile(gl::FRAGMENT_SHADER, fragment)?;
     let p = gl::glCreateProgram();
     gl::glAttachShader(p, vs);
     gl::glAttachShader(p, fs);
     gl::glBindAttribLocation(p, 0, c"pos".as_ptr());
+    gl::glBindAttribLocation(p, 1, c"bpos".as_ptr());
+    gl::glBindAttribLocation(p, 2, c"buv".as_ptr());
+    gl::glBindAttribLocation(p, 3, c"bcolor".as_ptr());
     gl::glLinkProgram(p);
     gl::glDeleteShader(vs);
     gl::glDeleteShader(fs);
@@ -227,6 +305,7 @@ impl Renderer {
             let query_modifiers = egl::proc_address(b"eglQueryDmaBufModifiersEXT\0");
             let solid = program(SOLID)?;
             let textured = program(TEXTURED)?;
+            let batch = program_with(BATCH_VERTEX, BATCH)?;
             gl::glEnableVertexAttribArray(0);
             gl::glVertexAttribPointer(0, 2, gl::FLOAT, 0, 0, UNIT_SQUARE.as_ptr().cast());
             gl::glEnable(gl::BLEND);
@@ -244,6 +323,7 @@ impl Renderer {
                 query_modifiers,
                 solid,
                 textured,
+                batch,
                 viewport: (1, 1),
                 region: None,
             })
@@ -369,6 +449,11 @@ impl Renderer {
     /// Waits for the GPU so the buffer can be handed out.
     pub fn finish(&mut self) {
         unsafe { gl::glFinish() };
+    }
+
+    /// The area this frame redraws; None: all of it.
+    pub fn region(&self) -> Option<Quad> {
+        self.region
     }
 
     /// Restricts drawing to `clip` until the next call; `None` removes it.
@@ -617,6 +702,60 @@ impl Renderer {
             gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
             gl::glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA as i32, width, height, 0, gl::RGBA, gl::UNSIGNED_BYTE, rgba.as_ptr().cast());
             Texture { id, width, height }
+        }
+    }
+
+    /// An alpha-only texture for glyphs, cleared.
+    pub fn create_atlas(&mut self, width: i32, height: i32) -> Texture {
+        let zero = vec![0u8; (width * height) as usize];
+        unsafe {
+            let mut id = 0;
+            gl::glGenTextures(1, &mut id);
+            gl::glBindTexture(gl::TEXTURE_2D, id);
+            for (p, v) in [(gl::TEXTURE_MIN_FILTER, gl::NEAREST), (gl::TEXTURE_MAG_FILTER, gl::NEAREST), (gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE), (gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE)] {
+                gl::glTexParameteri(gl::TEXTURE_2D, p, v);
+            }
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            gl::glTexImage2D(gl::TEXTURE_2D, 0, gl::R8 as i32, width, height, 0, gl::RED, gl::UNSIGNED_BYTE, zero.as_ptr().cast());
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
+            Texture { id, width, height }
+        }
+    }
+
+    /// Writes coverage values (one byte per texel) into an atlas.
+    pub fn atlas_put(&mut self, atlas: &Texture, x: i32, y: i32, w: i32, h: i32, alpha: &[u8]) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        unsafe {
+            gl::glBindTexture(gl::TEXTURE_2D, atlas.id);
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            gl::glTexSubImage2D(gl::TEXTURE_2D, 0, x, y, w, h, gl::RED, gl::UNSIGNED_BYTE, alpha.as_ptr().cast());
+            gl::glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
+        }
+    }
+
+    /// Draws a batch, its glyphs from `atlas`.
+    pub fn draw_batch(&mut self, atlas: &Texture, b: &Batch) {
+        if b.vertices.is_empty() {
+            return;
+        }
+        let stride = std::mem::size_of::<BatchVertex>() as i32;
+        let base = b.vertices.as_ptr() as *const u8;
+        unsafe {
+            gl::glUseProgram(self.batch.id);
+            gl::glUniform4f(self.batch.viewport, self.viewport.0 as f32, self.viewport.1 as f32, 0.0, 0.0);
+            gl::glActiveTexture(gl::TEXTURE0);
+            gl::glBindTexture(gl::TEXTURE_2D, atlas.id);
+            gl::glUniform1i(self.batch.tex, 0);
+            for (loc, size, offset) in [(1, 2, 0), (2, 2, 8), (3, 4, 16)] {
+                gl::glEnableVertexAttribArray(loc);
+                gl::glVertexAttribPointer(loc, size, gl::FLOAT, 0, stride, base.add(offset).cast());
+            }
+            gl::glDrawArrays(gl::TRIANGLES, 0, b.vertices.len() as i32);
+            for loc in 1..=3 {
+                gl::glDisableVertexAttribArray(loc);
+            }
         }
     }
 

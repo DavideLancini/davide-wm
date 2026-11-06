@@ -100,6 +100,8 @@ pub enum Action {
     Media(Media),
     /// The audio output list.
     AudioOutputs,
+    /// A window of the built-in terminal.
+    Terminal,
     Exit,
 }
 
@@ -120,6 +122,7 @@ pub fn binds() -> Vec<Bind> {
     let b = |mods, key, action| Bind { mods, key, action };
     let mut v = vec![
         b(MAIN, keys::T, Action::Spawn(TERMINAL)),
+        b(MAIN | SHIFT, keys::T, Action::Terminal),
         b(MAIN, keys::B, Action::Spawn(BROWSER)),
         b(MAIN, keys::C, Action::Spawn("code")),
         b(MAIN, keys::F, Action::Spawn("thunar")),
@@ -209,6 +212,27 @@ pub const KEY_REMAP: &[KeyRemap] = &[
     // Caps Lock becomes F19, which toggles the bar.
     (None, &[(58, 189)]),
 ];
+/// The built-in terminal: fonts in fallback order (the first is the main
+/// one), its bold face, size in points, padding, scrollback and colours.
+pub const TERM_FONTS: &[&str] = &[
+    "/usr/share/fonts/noto/NotoSansMono-ExtraCondensed.ttf",
+    "/usr/share/fonts/TTF/FiraCodeNerdFont-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+];
+pub const TERM_FONT_BOLD: &str = "/usr/share/fonts/noto/NotoSansMono-ExtraCondensedBold.ttf";
+pub const TERM_FONT_PT: f32 = 18.0;
+pub const TERM_PAD: i32 = 8;
+pub const TERM_SCROLLBACK: usize = 10_000;
+/// Lines per wheel step.
+pub const TERM_SCROLL_LINES: i32 = 3;
+pub const TERM_FG: u32 = 0xffffff;
+pub const TERM_BG: u32 = 0x000000;
+pub const TERM_APP_ID: &str = "davide-term";
+pub const TERM_ENV: &[(&str, &str)] = &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "davide-term")];
+
 pub const REPEAT_RATE: i32 = 25;
 pub const REPEAT_DELAY: i32 = 600;
 

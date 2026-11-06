@@ -169,6 +169,8 @@ pub enum Content {
     Shm(Texture),
     /// A dmabuf, held until another buffer replaces it.
     Dmabuf(u32),
+    /// A window of the built-in terminal, drawn from its cells.
+    Term,
 }
 
 pub struct Surface {
@@ -482,6 +484,8 @@ pub struct State {
     /// A surface committed a buffer not uploaded yet: hidden windows too,
     /// whose clients wait for the buffer back.
     pub uploads_pending: bool,
+    /// The built-in terminal, once a window of it was asked for.
+    pub terms: Option<crate::terminal::Terms>,
     /// Windows being cast: they keep drawing even when not on screen.
     pub cast_windows: Vec<SKey>,
     /// Areas to draw again when `needs_redraw` is not set.
@@ -549,6 +553,7 @@ impl State {
             start: Instant::now(),
             needs_redraw: true,
             uploads_pending: false,
+            terms: None,
             cast_windows: Vec::new(),
             damage: Vec::new(),
             cursor_changed: false,
@@ -1471,7 +1476,7 @@ impl State {
 
     fn texture(&self, key: SKey) -> Option<&Texture> {
         match &self.surfaces.get(&key)?.content {
-            Content::None => None,
+            Content::None | Content::Term => None,
             Content::Shm(t) => Some(t),
             Content::Dmabuf(id) => match self.buffers.get(&SKey { client: key.client, id: *id })? {
                 Buffer::Dmabuf { tex, .. } => tex.as_ref(),
@@ -1494,6 +1499,8 @@ impl State {
         }
         if let Some(t) = self.texture(key) {
             r.draw(t, Quad { x: x as f32, y: y as f32, w: s.size.0 as f32, h: s.size.1 as f32 }, s.opaque);
+        } else if let (Content::Term, Some(terms)) = (&s.content, &self.terms) {
+            terms.draw(r, key.id, x, y, self.focus == Some(key));
         }
         for (k, o) in s.above.iter().filter_map(child) {
             self.draw_tree(r, k, o);

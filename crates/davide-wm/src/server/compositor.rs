@@ -223,7 +223,7 @@ fn apply(s: &mut State, key: SKey, mut p: Pending) {
                 match std::mem::replace(&mut sf.content, Content::None) {
                     Content::Shm(t) => s.dead_textures.push(t),
                     Content::Dmabuf(old) => s.send(key.client, Msg::new(old, wl_buffer::evt::RELEASE)),
-                    Content::None => {}
+                    Content::None | Content::Term => {}
                 }
             }
         }

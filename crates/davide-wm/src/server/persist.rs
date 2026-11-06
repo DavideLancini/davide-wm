@@ -316,6 +316,7 @@ fn save_surface(sf: &Surface, e: &mut Enc, r: &mut Renderer) {
             2u8.save(e);
             id.save(e);
         }
+        Content::Term => 3u8.save(e),
     }
     (*size, *opaque).save(e);
     frames.save(e);
@@ -333,6 +334,7 @@ fn load_surface(d: &mut Dec, r: &mut Renderer) -> Result<Surface> {
         0 => Content::None,
         1 => Content::Shm(load_texture(d, r, false)?),
         2 => Content::Dmabuf(Persist::load(d)?),
+        3 => Content::Term,
         _ => return bad("surface content"),
     };
     let (size, opaque) = Persist::load(d)?;
@@ -394,6 +396,7 @@ impl State {
             start,
             needs_redraw: _,
             uploads_pending: _,
+            terms,
             cast_windows: _,
             damage: _,
             cursor_changed: _,
@@ -436,6 +439,7 @@ impl State {
         xwm.save(e);
         serial.save(e);
         (start.elapsed().as_millis() as u64).save(e);
+        terms.save(e);
     }
 
     pub fn restore(d: &mut Dec, keyboard: Keyboard, dmabuf_formats: Vec<(u32, u64)>, r: &mut Renderer) -> Result<State> {
@@ -477,6 +481,9 @@ impl State {
         s.serial = Persist::load(d)?;
         let elapsed = u64::load(d)?;
         s.start = Instant::now().checked_sub(Duration::from_millis(elapsed)).unwrap_or_else(Instant::now);
+        if FORMAT.load(std::sync::atomic::Ordering::Relaxed) >= 11 {
+            s.terms = Persist::load(d)?;
+        }
         s.relayout();
         // Keys held during the upgrade are forgotten: clear the client's modifiers.
         if let Some(f) = s.focus {

@@ -1,0 +1,10 @@
+[package]
+name = "term"
+description = "Terminal emulation engine: VT parser, screen and compressed scrollback, input encoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+state.workspace = true
+unicode-width.workspace = true

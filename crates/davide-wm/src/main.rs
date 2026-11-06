@@ -20,11 +20,13 @@ mod services;
 mod server;
 mod wifi;
 mod worker;
+mod terminal;
 mod xwayland;
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -58,6 +60,12 @@ const TOKEN_OSD: u64 = 19;
 const TOKEN_AGENTS: u64 = 20;
 const TOKEN_BATTERY: u64 = 21;
 const TOKEN_XWAYLAND_LISTEN: u64 = 22;
+const TOKEN_TERM: u64 = 23;
+const TOKEN_TERM_TIMER: u64 = 24;
+/// Plus the terminal window's surface id.
+const TOKEN_PTY: u64 = 1 << 40;
+/// Plus the pipe's fd.
+const TOKEN_PASTE: u64 = 1 << 41;
 const TOKEN_CLIENT: u64 = 1 << 32;
 
 static WALLPAPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.jpg"));
@@ -237,6 +245,10 @@ struct App {
     cursor_moved: bool,
     /// The audio mixer while it is open; it has the keyboard.
     mixer: Option<mixer::MixerUi>,
+    /// Terminal windows asked for: working directory.
+    term_open: Vec<Option<String>>,
+    /// Terminal fds in the epoll set, with their tokens.
+    term_watched: HashMap<RawFd, u64>,
 }
 
 type Job = Box<dyn FnOnce() -> Result<worker::Done, String> + Send>;
@@ -352,6 +364,10 @@ impl App {
             self.swallowed.remove(i);
             return;
         }
+        if let Some(f) = self.state.focus.filter(|f| self.state.terms.as_ref().is_some_and(|t| t.is_ours(*f))) {
+            self.with_terms(|t, s| t.key(s, f.id, keycode, pressed));
+            return;
+        }
         seat::key(&mut self.state, keycode, pressed, changed);
     }
 
@@ -396,6 +412,10 @@ impl App {
             }
             Action::Media(key) => self.jobs.push(Box::new(move || services::media(key).map(|_| worker::Done::Saved))),
             Action::AudioOutputs => self.open_mixer(true),
+            Action::Terminal => {
+                let cwd = self.state.focus.and_then(|f| self.state.terms.as_ref().filter(|t| t.is_ours(f)).and_then(|t| t.cwd_of(f.id)));
+                self.term_open.push(cwd);
+            }
             Action::Exit => self.running = false,
         }
     }
@@ -1881,6 +1901,8 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         cursor_image: None,
         cursor_moved: false,
         mixer: None,
+        term_open: Vec::new(),
+        term_watched: HashMap::new(),
     }
 }
 
@@ -1993,6 +2015,66 @@ impl App {
         } else {
             p.idle = true;
         }
+    }
+
+    /// Runs `f` on the terminals, which live in the state they also change.
+    fn with_terms<T: Default>(&mut self, f: impl FnOnce(&mut terminal::Terms, &mut server::State) -> T) -> T {
+        let Some(mut t) = self.state.terms.take() else { return T::default() };
+        let out = f(&mut t, &mut self.state);
+        self.state.terms = Some(t);
+        out
+    }
+
+    /// Opens the terminal windows asked for and keeps the epoll set in step
+    /// with the terminals' fds.
+    fn terminals(&mut self, ep: &Epoll) -> io::Result<()> {
+        if !self.term_open.is_empty() && self.state.terms.is_none() {
+            match terminal::Terms::start(&mut self.state) {
+                Ok(t) => {
+                    let id = t.client;
+                    ep.add(self.state.clients[&id].conn.raw_fd(), TOKEN_CLIENT + id as u64)?;
+                    self.state.terms = Some(t);
+                }
+                Err(e) => {
+                    log!("terminal: {e}");
+                    self.term_open.clear();
+                }
+            }
+        }
+        for cwd in std::mem::take(&mut self.term_open) {
+            self.with_terms(|t, _| t.open(cwd));
+        }
+        let wanted: HashMap<RawFd, u64> = match &self.state.terms {
+            Some(t) => t
+                .fds()
+                .into_iter()
+                .map(|(fd, kind)| {
+                    let token = match kind {
+                        terminal::Fd::Client => TOKEN_TERM,
+                        terminal::Fd::Timer => TOKEN_TERM_TIMER,
+                        terminal::Fd::Pty(surface) => TOKEN_PTY + surface as u64,
+                        terminal::Fd::Paste => TOKEN_PASTE + fd as u64,
+                    };
+                    (fd, token)
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+        for (fd, token) in &self.term_watched {
+            if wanted.get(fd) != Some(token) {
+                ep.delete(*fd);
+            }
+        }
+        for (fd, token) in &wanted {
+            if self.term_watched.get(fd) != Some(token) {
+                ep.add(*fd, *token)?;
+            }
+        }
+        self.term_watched = wanted;
+        if let Some(t) = &mut self.state.terms {
+            t.graveyard.clear();
+        }
+        Ok(())
     }
 
     /// Xwayland quit, idle or crashed: listen again for the next client,
@@ -2121,6 +2203,7 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
         ep.add(fd, TOKEN_CLIENT + id as u64)?;
     }
     app.watch_xwayland(&ep)?;
+    app.terminals(&ep)?;
     app.take_sleep_inhibitor();
     let agents_wanted = matches!(app.backend, Backend::Drm(_)) || std::env::var_os("DAVIDE_WM_AGENTS").is_some();
     if agents_wanted && app.agents.is_none() {
@@ -2194,7 +2277,7 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
 
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 10;
+const BLOB_FORMAT: u32 = 11;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -2533,6 +2616,14 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                         }
                     }
                 },
+                TOKEN_TERM => {
+                    if let Some(Err(e)) = app.with_terms(|t, s| Some(t.dispatch(s))) {
+                        log!("terminal: {e}");
+                    }
+                }
+                TOKEN_TERM_TIMER => app.with_terms(|t, s| t.timer_fired(s)),
+                t if t >= TOKEN_PASTE => app.with_terms(|term, _| term.paste_ready((t - TOKEN_PASTE) as RawFd)),
+                t if t >= TOKEN_PTY => app.with_terms(|term, s| term.pty_ready(s, (t - TOKEN_PTY) as u32)),
                 t => {
                     let id = (t - TOKEN_CLIENT) as ClientId;
                     if events & READABLE != 0 {
@@ -2642,6 +2733,7 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
             log!("X connection lost: {e}");
             app.xwm_stop(ep);
         }
+        app.terminals(ep)?;
         app.update_bar();
         app.render(renderer)?;
         if std::mem::take(&mut app.sleep_after_frame) {
