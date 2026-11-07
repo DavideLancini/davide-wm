@@ -66,6 +66,8 @@ struct Mouse {
     /// Where a selection being dragged started.
     anchor: Option<(Point, SelectionMode)>,
     buttons: u32,
+    /// Scrolling not yet worth a whole step.
+    wheel: f64,
 }
 
 pub struct Terms {
@@ -705,11 +707,17 @@ impl Terms {
 
     fn wheel(&mut self, s: &mut State, value: f64) {
         let Some(i) = self.mouse_window() else { return };
-        // The server sends 15 per wheel detent.
-        let steps = (value / 15.0).round() as i32;
+        // The server sends 15 per wheel detent; high-resolution wheels and
+        // touchpads send fractions of it, which add up.
+        if self.mouse.wheel.signum() != value.signum() {
+            self.mouse.wheel = 0.0;
+        }
+        self.mouse.wheel += value;
+        let steps = (self.mouse.wheel / 15.0).trunc() as i32;
         if steps == 0 {
             return;
         }
+        self.mouse.wheel -= steps as f64 * 15.0;
         let (x, y) = self.cell_at(i);
         if self.reporting(s, i) {
             let mods = mods_of(s.keyboard.bind_mods());
