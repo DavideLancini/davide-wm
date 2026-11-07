@@ -177,7 +177,8 @@ impl Display {
         let left = |total: u64, since: Instant| Duration::from_secs(total).saturating_sub(since.elapsed());
         match (self.blanked, self.powered_down) {
             (false, _) if self.screensaver.enabled => Some((Idle::Blank, left(self.screensaver.timeout as u64, self.last_input))),
-            (true, false) => Some((Idle::PowerDown, left(self.screensaver.power_off_after(), self.blanked_at))),
+            // Screensaver off: kept on by choice, black included.
+            (true, false) if self.screensaver.enabled => Some((Idle::PowerDown, left(self.screensaver.power_off_after(), self.blanked_at))),
             _ => None,
         }
     }
