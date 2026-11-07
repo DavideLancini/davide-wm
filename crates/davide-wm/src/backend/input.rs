@@ -137,7 +137,7 @@ impl Input {
                                 let mut v = li::libinput_event_pointer_get_scroll_value(p, axis);
                                 if kind == li::EVENT_POINTER_SCROLL_WHEEL {
                                     // 120 units per detent; clients expect about 15 per detent.
-                                    v = v / 120.0 * 15.0;
+                                    v = v / 120.0 * 15.0 * config::WHEEL_SPEED;
                                 }
                                 out.push(Event::PointerAxis(wl_axis, v));
                             }

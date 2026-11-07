@@ -294,6 +294,10 @@ pub const BATTERY_THRESHOLDS: (u32, u32, u32) = (15, 5, 3);
 /// swipe needs to switch workspace.
 pub const SWIPE_DISTANCE: f64 = 60.0;
 
+/// Mouse wheel scrolling multiplier (touchpads are left alone): the
+/// receiver's wheel scrolled far too slowly at 1.
+pub const WHEEL_SPEED: f64 = 5.0;
+
 pub const VOLUME_STEP: i32 = 5;
 pub const BRIGHTNESS_STEP: i32 = 5;
 /// How long the volume/brightness indicator stays.
