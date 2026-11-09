@@ -173,17 +173,6 @@ pub fn human_time(mtime: i64, now: i64) -> String {
     }
 }
 
-/// "12 nov 2024, 14:03".
-pub fn full_time(mtime: i64) -> String {
-    let t = crate::local_time(mtime);
-    format!("{} {} {}, {:02}:{:02}", t.tm_mday, MONTHS[t.tm_mon.clamp(0, 11) as usize], t.tm_year + 1900, t.tm_hour, t.tm_min)
-}
-
-/// "rwxr-xr-x".
-pub fn permissions(mode: u32) -> String {
-    (0..9).map(|k| if mode & (0o400 >> k) != 0 { ['r', 'w', 'x'][k % 3] } else { '-' }).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,12 +188,6 @@ mod tests {
         let mut v = ["b10", "b9", "a", "B1"];
         v.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(v, ["a", "B1", "b9", "b10"]);
-    }
-
-    #[test]
-    fn perms() {
-        assert_eq!(permissions(0o100755), "rwxr-xr-x");
-        assert_eq!(permissions(0o640), "rw-r-----");
     }
 
     #[test]

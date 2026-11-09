@@ -9,12 +9,10 @@ use unicode_width::UnicodeWidthChar;
 
 use super::super::glyphs::Glyphs;
 use super::super::Terms;
-use super::{textual, Hit, Item, Prompt, SideTarget, KEPT};
+use super::{Hit, Item, Prompt, SideTarget, KEPT, ZOOM};
 
-const THUMB: i32 = files::thumb::NORMAL as i32;
-/// Size of the preview pane's image, and how many such images stay loaded.
-const PREVIEW: u32 = 512;
-const PREVIEWS_KEPT: usize = 4;
+/// Large thumbnails (for the biggest icons) kept.
+const LARGE_KEPT: usize = 64;
 
 /// Thumbnails to draw this frame and where.
 type Wanted = Vec<(super::ThumbKey, (i32, i32, i32, i32))>;
@@ -47,12 +45,10 @@ pub(in super::super) struct Layout {
     pub rh: i32,
     pub w: i32,
     pub h: i32,
-    /// Sidebar width (0: none), the left and right edges of the entries
-    /// and the preview pane's left edge (0: none).
+    /// Sidebar width (0: none) and the left and right edges of the entries.
     pub side: i32,
     pub x0: i32,
     pub right: i32,
-    pub pane: i32,
     /// A line at the bottom for a question, a message or progress, and
     /// where the content above it ends.
     pub strip: bool,
@@ -63,6 +59,8 @@ pub(in super::super) struct Layout {
     pub cols: usize,
     pub tile: (i32, i32),
     pub grid: bool,
+    /// Icon size in the grid.
+    pub icon: i32,
     /// Width in cells of the size and date columns (0: hidden).
     pub size_cols: i32,
     pub date_cols: i32,
@@ -89,10 +87,7 @@ impl Terms {
         let total = (width - 2 * pad) / cw;
         let side = if total >= 70 { 22 * cw } else { 0 };
         let x0 = pad + if side > 0 { side + 2 * cw } else { 0 };
-        let room = width - pad - x0;
-        let pane_w = if !self.fm.no_preview && room / cw >= 56 { (room * 2 / 5).clamp(26 * cw, 64 * cw) } else { 0 };
-        let right = width - pad - if pane_w > 0 { pane_w + 2 * cw } else { 0 };
-        let pane = if pane_w > 0 { right + cw } else { 0 };
+        let right = width - pad;
         let main = (right - x0) / cw;
         let date_cols = if main >= 50 { 12 } else { 0 };
         let size_cols = if main >= 34 { 9 } else { 0 };
@@ -101,10 +96,14 @@ impl Terms {
         let base = if strip { height - pad - ch - 6 } else { height - pad };
         let chooser_rows = w.chooser.as_ref().map_or(0, |c| 1 + c.save as i32);
         let bottom = base - chooser_rows * (rh + 4);
-        let top = if w.grid { pad + ch + 14 } else { pad + 2 * ch + 18 };
-        let tile = ((THUMB + 16).max(14 * cw), THUMB + 12 + 2 * ch);
-        let cols = ((right - x0) / tile.0).max(1) as usize;
-        Layout { cw, ch, rh, w: width, h: height, side, x0, right, pane, strip, base, top, bottom, cols, tile, grid: w.grid, size_cols, date_cols }
+        let grid = w.grid();
+        let top = if grid { pad + ch + 14 } else { pad + 2 * ch + 18 };
+        let icon = ZOOM[(w.zoom.max(1) as usize - 1).min(ZOOM.len() - 1)];
+        let tile = ((icon + 24).max(icon * 5 / 4).max(10 * cw), icon + 16 + 2 * ch);
+        // Tiles share out the spare width so the grid fills the row.
+        let cols = ((right - x0) / tile.0).max(1);
+        let tile = (tile.0.max((right - x0) / cols), tile.1);
+        Layout { cw, ch, rh, w: width, h: height, side, x0, right, strip, base, top, bottom, cols: cols as usize, tile, grid, icon, size_cols, date_cols }
     }
 
     /// The path bar: each part's x, width and target.
@@ -212,9 +211,6 @@ impl Terms {
             return Hit::None;
         }
         let pad = config::TERM_PAD;
-        if l.pane > 0 && x >= l.pane {
-            return Hit::None;
-        }
         if y >= pad && y < pad + l.ch + 4 {
             return self.crumbs(i, &l).into_iter().find(|(cx, cw, ..)| x >= *cx && x < cx + cw).map_or(Hit::None, |(.., p)| Hit::Crumb(p));
         }
@@ -408,13 +404,15 @@ impl Terms {
                 if k == w.cursor && focused {
                     p.outline(tx + 2, ty + 2, l.tile.0 - 4, l.tile.1 - 4, LINE);
                 }
-                let (ix, iy) = (tx + (l.tile.0 - THUMB) / 2, ty + 6);
+                let (ix, iy) = (tx + (l.tile.0 - l.icon) / 2, ty + 8);
                 let visual = it.mime.starts_with("image/") || it.mime.starts_with("video/");
-                if visual {
-                    thumbs.push(((w.dir.join(&e.name), files::thumb::NORMAL), (ix, iy, THUMB, THUMB)));
+                let size = if l.icon > files::thumb::NORMAL as i32 { files::thumb::LARGE } else { files::thumb::NORMAL };
+                let key = (w.dir.join(&e.name), size);
+                if visual && !self.fm.thumbs.borrow().failed.contains(&key) {
+                    thumbs.push((key, (ix, iy, l.icon, l.icon)));
+                } else {
+                    p.big_icon(ix, iy, it.icon, l.icon, color);
                 }
-                p.fill(ix + THUMB / 2 - 2 * l.cw, iy + THUMB / 2 - l.ch, 4 * l.cw, 2 * l.ch, PANEL);
-                p.icon(ix + THUMB / 2 - l.cw, iy + THUMB / 2 - l.ch / 2, it.icon, color);
                 let room = l.tile.0 / l.cw - 1;
                 let (a, b) = split_name(&name, room);
                 for (row, part) in [a, b].iter().enumerate() {
@@ -422,7 +420,7 @@ impl Terms {
                         continue;
                     }
                     let px = tx + (l.tile.0 - cells(part).min(room) * l.cw) / 2;
-                    p.text(px, iy + THUMB + 4 + row as i32 * l.ch, part, room, color, false);
+                    p.text(px, iy + l.icon + 6 + row as i32 * l.ch, part, room, color, false);
                 }
             } else {
                 let ry = l.top + (k - first) as i32 * l.rh;
@@ -477,8 +475,6 @@ impl Terms {
                 p.text(bx + 2 * l.cw, ry + 4, s, cells(s), FG, k == 0);
             }
         }
-
-        self.draw_preview(&mut p, i, &l, &mut thumbs);
 
         // Bottom line, only while there is a question, a message or an operation.
         if l.strip {
@@ -554,7 +550,7 @@ impl Terms {
                     }
                 }
             }
-            for (large, kept) in [(false, KEPT), (true, PREVIEWS_KEPT)] {
+            for (large, kept) in [(false, KEPT), (true, LARGE_KEPT)] {
                 let mut by_age: Vec<(u64, super::ThumbKey)> = th.textures.iter().filter(|(k, v)| (k.1 > files::thumb::NORMAL) == large && v.2 != frame).map(|(k, v)| (v.2, k.clone())).collect();
                 let n = th.textures.keys().filter(|k| (k.1 > files::thumb::NORMAL) == large).count();
                 if n > kept {
@@ -585,103 +581,6 @@ impl Terms {
                 p.text(mx + l.cw, my + mh + 4, hint, 40, DIM, false);
             }
             flush(&mut p);
-        }
-    }
-}
-
-impl Terms {
-    /// The pane on the right: the entry under the cursor (an image, its
-    /// details and its first lines or entries), or the selection's totals.
-    fn draw_preview(&self, p: &mut Paint, i: usize, l: &Layout, thumbs: &mut Wanted) {
-        if l.pane == 0 {
-            return;
-        }
-        let w = &self.fm.windows[i];
-        let pad = config::TERM_PAD;
-        p.fill(l.pane, 0, l.w - l.pane, l.h, PANEL);
-        let px = l.pane + 2 * l.cw;
-        let width = l.w - pad - l.cw - px;
-        let room = width / l.cw;
-        let end = if l.strip { l.status_y() - 4 } else { l.h - pad };
-        let mut y = pad + l.ch + 14;
-        let row = |p: &mut Paint, y: &mut i32, label: &str, value: &str| {
-            p.text(px, *y, label, 12, DIM, false);
-            p.text(px + 13 * l.cw, *y, value, room - 13, FG, false);
-            *y += l.ch + 4;
-        };
-        if w.selected.len() > 1 {
-            let picked: Vec<&Item> = w.items.iter().filter(|it| w.selected.contains(&it.entry.name)).collect();
-            let dirs = picked.iter().filter(|it| it.entry.is_dir()).count();
-            let size: u64 = picked.iter().filter(|it| !it.entry.is_dir()).map(|it| it.entry.size).sum();
-            p.text(px, y, &format!("{} elementi selezionati", picked.len()), room, FG, true);
-            y += l.ch + 12;
-            row(p, &mut y, "Cartelle", &dirs.to_string());
-            row(p, &mut y, "File", &(picked.len() - dirs).to_string());
-            row(p, &mut y, "Dimensione", &files::dir::human_size(size));
-            return;
-        }
-        let Some(it) = w.current() else { return };
-        let e = &it.entry;
-        let path = w.dir.join(&e.name);
-        if matches!(it.mime.as_str(), "image/png" | "image/jpeg") {
-            let side = width.min(PREVIEW as i32).min((end - y) / 2);
-            thumbs.push(((path.clone(), PREVIEW), (px, y, width, side)));
-            y += side + 12;
-        }
-        let name = e.display();
-        p.icon(px, y, it.icon, color_of(it));
-        let (a, b) = split_name(&name, room - 3);
-        p.text(px + 3 * l.cw, y, &a, room - 3, FG, true);
-        y += l.ch;
-        if !b.is_empty() {
-            p.text(px + 3 * l.cw, y, &b, room - 3, FG, true);
-            y += l.ch;
-        }
-        y += 12;
-
-        let mut peek = self.fm.peek.borrow_mut();
-        let lines = match &peek.shown {
-            Some((at, mtime, lines)) if *at == path && *mtime == e.mtime => Some(lines),
-            _ => None,
-        };
-        let wants = e.is_dir() || (textual(&it.mime) && e.size > 0);
-        row(p, &mut y, "Tipo", &it.mime);
-        if e.is_dir() {
-            let count = lines.map_or("…".into(), |v| format!("{} elementi", v.len()));
-            row(p, &mut y, "Contenuto", &count);
-        } else {
-            row(p, &mut y, "Dimensione", &files::dir::human_size(e.size));
-        }
-        row(p, &mut y, "Modificato", &files::dir::full_time(e.mtime));
-        row(p, &mut y, "Permessi", &files::dir::permissions(e.mode));
-        if e.link {
-            let to = std::fs::read_link(&path).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
-            row(p, &mut y, "Collegamento", &to);
-        }
-        if !wants {
-            return;
-        }
-        y += 8;
-        p.fill(px, y, width, 1, LINE);
-        y += 12;
-        match lines {
-            Some(lines) => {
-                for (text, dir) in lines {
-                    if y + l.ch > end {
-                        break;
-                    }
-                    let shown = if *dir { format!("{text}/") } else { text.clone() };
-                    p.text(px, y, &shown, room, if *dir { DIR } else { FG }, false);
-                    y += l.ch;
-                }
-            }
-            None => {
-                let key = (path.clone(), e.mtime);
-                if peek.asked.as_ref() != Some(&key) {
-                    peek.asked = Some(key);
-                    peek.wanted = Some((path, e.mtime, e.is_dir()));
-                }
-            }
         }
     }
 }
@@ -755,6 +654,16 @@ impl Paint<'_> {
 
     fn glyph(&mut self, x: i32, y: i32, c: char, color: [f32; 4], bold: bool, wide: bool) {
         if let Some(slot) = self.g.get(self.r, c, bold, wide) {
+            if let Some(atlas) = self.g.atlas() {
+                let q = Quad { x: (self.ox + x) as f32 + slot.dx, y: (self.oy + y) as f32 + slot.dy, w: slot.src.w, h: slot.src.h };
+                self.b.glyph(atlas, slot.src, q, color);
+            }
+        }
+    }
+
+    /// An icon scaled to a `size`×`size` box.
+    fn big_icon(&mut self, x: i32, y: i32, c: char, size: i32, color: [f32; 4]) {
+        if let Some(slot) = self.g.icon(self.r, c, size) {
             if let Some(atlas) = self.g.atlas() {
                 let q = Quad { x: (self.ox + x) as f32 + slot.dx, y: (self.oy + y) as f32 + slot.dy, w: slot.src.w, h: slot.src.h };
                 self.b.glyph(atlas, slot.src, q, color);

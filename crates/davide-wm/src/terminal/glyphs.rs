@@ -62,6 +62,8 @@ pub struct Glyphs {
     /// Shelf packing: current x, shelf top, shelf height.
     shelf: (i32, i32, i32),
     cache: HashMap<(char, bool, bool), Option<Slot>>,
+    /// Glyphs drawn as icons of a given size, centred in their box.
+    icons: HashMap<(char, i32), Option<Slot>>,
 }
 
 impl Glyphs {
@@ -81,6 +83,7 @@ impl Glyphs {
             atlas: None,
             shelf: (0, 0, 0),
             cache: HashMap::new(),
+            icons: HashMap::new(),
         })
     }
 
@@ -96,6 +99,7 @@ impl Glyphs {
     pub fn forget_atlas(&mut self) {
         self.atlas = None;
         self.cache.clear();
+        self.icons.clear();
         self.shelf = (0, 0, 0);
     }
 
@@ -108,6 +112,38 @@ impl Glyphs {
         let slot = self.rasterize(r, c, bold, wide);
         self.cache.insert((c, bold, wide), slot);
         slot
+    }
+
+    /// `c` scaled to fit a `size`×`size` box, rasterised on first use.
+    pub fn icon(&mut self, r: &mut Renderer, c: char, size: i32) -> Option<Slot> {
+        if let Some(s) = self.icons.get(&(c, size)) {
+            return *s;
+        }
+        let slot = self.rasterize_icon(r, c, size);
+        self.icons.insert((c, size), slot);
+        slot
+    }
+
+    fn rasterize_icon(&mut self, r: &mut Renderer, c: char, size: i32) -> Option<Slot> {
+        let (face, id) = self.face_for(c, false)?;
+        let probe = face.font.outline_glyph(id.with_scale(PxScale::from(size as f32)))?.px_bounds();
+        let k = size as f32 / probe.width().max(probe.height()).max(1.0);
+        let outline = face.font.outline_glyph(id.with_scale(PxScale::from(size as f32 * k)))?;
+        let b = outline.px_bounds();
+        let (w, h) = (b.width().ceil() as i32, b.height().ceil() as i32);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let mut px = vec![0u8; (w * h) as usize];
+        outline.draw(|x, y, v| {
+            if let Some(p) = px.get_mut((y as i32 * w + x as i32) as usize) {
+                *p = (v.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        });
+        let (x, y) = self.place(r, w, h)?;
+        let atlas = self.atlas.as_ref()?;
+        r.atlas_put(atlas, x, y, w, h, &px);
+        Some(Slot { src: Quad { x: x as f32, y: y as f32, w: w as f32, h: h as f32 }, dx: ((size - w) / 2) as f32, dy: ((size - h) / 2) as f32 })
     }
 
     fn face_for(&self, c: char, bold: bool) -> Option<(&Face, GlyphId)> {

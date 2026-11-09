@@ -31,6 +31,9 @@ const COPY: u32 = 1;
 const MOVE: u32 = 2;
 /// Pointer travel that turns a press on an entry into a drag.
 const DRAG_START: f64 = 8.0;
+/// Icon sizes of the grid, and the one Ctrl+2 picks.
+pub const ZOOM: [i32; 6] = [48, 64, 96, 128, 192, 256];
+const ZOOM_GRID: u8 = 3;
 /// Thumbnail textures kept; the ones drawn longest ago go first.
 const THUMBS_KEPT: usize = 256;
 /// How often a running file operation redraws its progress.
@@ -51,7 +54,6 @@ pub enum Done {
     OpenWith { surface: u32, apps: Arc<Apps>, paths: Vec<PathBuf>, mime: String, choices: Vec<(String, String)> },
     Op { id: u32, result: Result<Vec<PathBuf>, String> },
     Thumbs(Vec<(ThumbKey, Option<files::png::Image>)>),
-    Peek { path: PathBuf, mtime: i64, lines: Lines },
     Volumes(Vec<Volume>),
     Mounted { surface: u32, result: Result<PathBuf, String> },
     Unmounted(Result<String, String>),
@@ -179,7 +181,8 @@ pub struct Window {
     hidden: bool,
     sort: Sort,
     reverse: bool,
-    grid: bool,
+    /// 0: list; else the icon size, `ZOOM[zoom - 1]`.
+    zoom: u8,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
     prompt: Option<Prompt>,
@@ -224,17 +227,6 @@ struct Thumbs {
     frame: u64,
 }
 
-/// A file's first lines or a folder's entries (name, is a folder).
-type Lines = Vec<(String, bool)>;
-
-/// The preview pane's text, for the path and mtime it was read at.
-#[derive(Default)]
-struct Peek {
-    shown: Option<(PathBuf, i64, Lines)>,
-    asked: Option<(PathBuf, i64)>,
-    wanted: Option<(PathBuf, i64, bool)>,
-}
-
 #[derive(Default)]
 pub struct Files {
     pub windows: Vec<Window>,
@@ -255,9 +247,6 @@ pub struct Files {
     inotify: Option<OwnedFd>,
     watches: HashMap<i32, PathBuf>,
     thumbs: RefCell<Thumbs>,
-    peek: RefCell<Peek>,
-    /// F3 hides the preview pane in every window.
-    no_preview: bool,
     pub chosen: Vec<Chosen>,
 }
 
@@ -335,35 +324,6 @@ fn home() -> PathBuf {
 
 use super::shell_quote as quote;
 
-/// Lines a preview shows at most.
-const PEEK_LINES: usize = 200;
-
-/// The first lines of a text file; nothing for a binary one.
-fn peek_file(path: &Path) -> Lines {
-    use std::io::Read;
-    let mut buf = Vec::new();
-    if std::fs::File::open(path).and_then(|f| f.take(16 * 1024).read_to_end(&mut buf)).is_err() || buf.contains(&0) {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&buf).lines().take(PEEK_LINES).map(|l| (l.replace('\t', "    "), false)).collect()
-}
-
-/// A folder's visible entries, folders first.
-fn peek_dir(path: &Path) -> Lines {
-    let Ok(entries) = files::dir::list(path) else { return Vec::new() };
-    let mut v: Lines = entries.iter().filter(|e| !e.hidden).map(|e| (e.display().into_owned(), e.is_dir())).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| files::dir::natural_cmp(&a.0, &b.0)));
-    v
-}
-
-/// Whether a type reads as text in the preview.
-fn textual(mime: &str) -> bool {
-    mime.starts_with("text/")
-        || mime.ends_with("+xml")
-        || mime.ends_with("+json")
-        || ["application/json", "application/xml", "application/javascript", "application/toml", "application/x-shellscript", "application/x-yaml", "application/yaml", "application/x-desktop", "application/sql", "inode/x-empty"].contains(&mime)
-}
-
 fn is_trash(dir: &Path) -> bool {
     dir == files::ops::trash_dir()
 }
@@ -417,7 +377,7 @@ impl Window {
             hidden: false,
             sort: Sort::Name,
             reverse: false,
-            grid: false,
+            zoom: 0,
             back: Vec::new(),
             forward: Vec::new(),
             prompt: None,
@@ -433,6 +393,10 @@ impl Window {
 
     fn item(&self, shown: usize) -> Option<&Item> {
         self.shown.get(shown).and_then(|i| self.items.get(*i))
+    }
+
+    fn grid(&self) -> bool {
+        self.zoom > 0
     }
 
     fn current(&self) -> Option<&Item> {
@@ -609,7 +573,6 @@ impl Terms {
             th.failed.clear();
             th.ready.clear();
             th.wanted.clear();
-            *self.fm.peek.borrow_mut() = Peek::default();
         }
     }
 
@@ -693,12 +656,6 @@ impl Terms {
                     ((p, size), t)
                 });
                 Ok(crate::worker::Done::Files(Done::Thumbs(thumbs.collect())))
-            }));
-        }
-        if let Some((path, mtime, dir)) = self.fm.peek.borrow_mut().wanted.take() {
-            self.fm.jobs.push(Box::new(move || {
-                let lines = if dir { peek_dir(&path) } else { peek_file(&path) };
-                Ok(crate::worker::Done::Files(Done::Peek { path, mtime, lines }))
             }));
         }
         std::mem::take(&mut self.fm.jobs)
@@ -826,15 +783,6 @@ impl Terms {
                     }
                 }
                 drop(th);
-                self.fm_damage_all(s);
-            }
-            Done::Peek { path, mtime, lines } => {
-                let mut peek = self.fm.peek.borrow_mut();
-                if peek.asked.as_ref().is_some_and(|(p, m)| *p == path && *m == mtime) {
-                    peek.asked = None;
-                }
-                peek.shown = Some((path, mtime, lines));
-                drop(peek);
                 self.fm_damage_all(s);
             }
             Done::Volumes(v) => {
@@ -1406,7 +1354,7 @@ impl Terms {
             }
         };
         let c = w.cursor as isize;
-        let grid = w.grid;
+        let grid = w.grid();
         match (sym, ctrl, alt) {
             (0xff52 | 0xff97, _, true) => self.parent(s, i),
             (0xff51 | 0xff96, _, true) => self.history(s, i, false),
@@ -1462,10 +1410,6 @@ impl Terms {
                 let cwd = Some(self.fm.windows[i].dir.to_string_lossy().into_owned());
                 self.open(Open { cwd, ..Default::default() })
             }
-            (0xffc0, ..) => {
-                self.fm.no_preview = !self.fm.no_preview;
-                self.fm_damage_all(s);
-            }
             (0xffc2, ..) => {
                 w.stale = true;
                 self.fm.places = files::places::places();
@@ -1506,8 +1450,15 @@ impl Terms {
                 }
                 (0x77, _) => self.fm_close(s, i),
                 (0x64, _) => self.bookmark(i, true),
-                (0x31, _) => w.grid = false,
-                (0x32, _) => w.grid = true,
+                (0x31 | 0x32 | 0x2b | 0x3d | 0xffab | 0x2d | 0xffad, _) => {
+                    w.zoom = match base {
+                        0x31 => 0,
+                        0x32 => ZOOM_GRID,
+                        0x2d | 0xffad => w.zoom.saturating_sub(1),
+                        _ => (w.zoom + 1).min(ZOOM.len() as u8),
+                    };
+                    w.top = 0;
+                }
                 (0x72, _) if is_trash(&w.dir) => self.restore(i),
                 (0x6d, _) if alt || shift => w.prompt = Some(Prompt::NewFile(Text::new("Nuovo file"))),
                 _ => {}
@@ -1938,11 +1889,19 @@ impl Terms {
     }
 
     pub(super) fn fm_wheel(&mut self, s: &mut State, i: usize, steps: i32) {
+        if s.keyboard.bind_mods() & config::mods::CTRL != 0 {
+            let w = &mut self.fm.windows[i];
+            w.zoom = (w.zoom as i32 - steps.signum()).clamp(0, ZOOM.len() as i32) as u8;
+            w.top = 0;
+            self.fm_scroll_to_cursor(i);
+            self.fm_damage(s, i);
+            return;
+        }
         let page = self.fm_layout(i).page();
         let w = &mut self.fm.windows[i];
-        let rows = if w.grid { w.shown.len().div_ceil(self.fm_layout(i).cols.max(1)) } else { w.shown.len() };
+        let rows = if w.grid() { w.shown.len().div_ceil(self.fm_layout(i).cols.max(1)) } else { w.shown.len() };
         let w = &mut self.fm.windows[i];
-        let lines = if w.grid { steps } else { steps * config::TERM_SCROLL_LINES };
+        let lines = if w.grid() { steps } else { steps * config::TERM_SCROLL_LINES };
         let max = rows.saturating_sub(page) as isize;
         w.top = (w.top as isize + lines as isize).clamp(0, max.max(0)) as usize;
         self.fm_damage(s, i);
@@ -1952,7 +1911,7 @@ impl Terms {
         let l = self.fm_layout(i);
         let w = &mut self.fm.windows[i];
         let rows = l.page().max(1);
-        let row = if w.grid { w.cursor / l.cols.max(1) } else { w.cursor };
+        let row = if w.grid() { w.cursor / l.cols.max(1) } else { w.cursor };
         if row < w.top {
             w.top = row;
         } else if row >= w.top + rows {
@@ -2077,10 +2036,10 @@ impl Terms {
     fn fm_cursor_pos(&self, i: usize) -> (i32, i32) {
         let l = self.fm_layout(i);
         let w = &self.fm.windows[i];
-        let row = if w.grid { w.cursor / l.cols.max(1) } else { w.cursor };
-        let col = if w.grid { w.cursor % l.cols.max(1) } else { 0 };
+        let row = if w.grid() { w.cursor / l.cols.max(1) } else { w.cursor };
+        let col = if w.grid() { w.cursor % l.cols.max(1) } else { 0 };
         let r = row.saturating_sub(w.top) as i32;
-        if w.grid {
+        if w.grid() {
             (l.x0 + col as i32 * l.tile.0 + l.tile.0 / 2, l.top + r * l.tile.1 + l.tile.1 / 2)
         } else {
             (l.x0 + 4 * l.cw, l.top + r * l.rh + l.rh)
@@ -2093,7 +2052,8 @@ impl state::Persist for Window {
         (self.surface, self.xdg, self.toplevel).save(e);
         (self.size, self.pending).save(e);
         self.dir.to_string_lossy().into_owned().save(e);
-        (self.hidden, self.grid, self.reverse, self.sort as u8).save(e);
+        // The zoom rides in the sort byte's high bits, keeping the format.
+        (self.hidden, self.zoom > 0, self.reverse, self.sort as u8 | self.zoom << 4).save(e);
         let paths = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>();
         (paths(&self.back), paths(&self.forward)).save(e);
         self.current().map(|it| it.entry.display().into_owned()).save(e);
@@ -2107,8 +2067,12 @@ impl state::Persist for Window {
         let (back, forward): (Vec<String>, Vec<String>) = Persist::load(d)?;
         let current: Option<String> = Persist::load(d)?;
         let mut w = Window::new(surface, xdg, toplevel, PathBuf::from(dir));
-        (w.size, w.pending, w.hidden, w.grid, w.reverse) = (size, pending, hidden, grid, reverse);
-        w.sort = match sort {
+        (w.size, w.pending, w.hidden, w.reverse) = (size, pending, hidden, reverse);
+        w.zoom = match sort >> 4 {
+            0 if grid => ZOOM_GRID,
+            z => z.min(ZOOM.len() as u8),
+        };
+        w.sort = match sort & 0xf {
             1 => Sort::Size,
             2 => Sort::Modified,
             3 => Sort::Type,
