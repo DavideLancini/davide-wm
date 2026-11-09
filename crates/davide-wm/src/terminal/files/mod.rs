@@ -50,7 +50,8 @@ pub enum Done {
     Launch { apps: Arc<Apps>, launches: Vec<Launch>, errors: Vec<String> },
     OpenWith { surface: u32, apps: Arc<Apps>, paths: Vec<PathBuf>, mime: String, choices: Vec<(String, String)> },
     Op { id: u32, result: Result<Vec<PathBuf>, String> },
-    Thumbs(Vec<(PathBuf, Option<files::png::Image>)>),
+    Thumbs(Vec<(ThumbKey, Option<files::png::Image>)>),
+    Peek { path: PathBuf, mtime: i64, lines: Lines },
     Volumes(Vec<Volume>),
     Mounted { surface: u32, result: Result<PathBuf, String> },
     Unmounted(Result<String, String>),
@@ -210,14 +211,28 @@ struct Drop {
     target: Option<PathBuf>,
 }
 
+/// A file and the thumbnail size asked for.
+pub type ThumbKey = (PathBuf, u32);
+
 #[derive(Default)]
 struct Thumbs {
-    textures: HashMap<PathBuf, (render::Texture, (u32, u32), u64)>,
-    asked: HashSet<PathBuf>,
-    failed: HashSet<PathBuf>,
-    ready: Vec<(PathBuf, files::png::Image)>,
-    wanted: Vec<(PathBuf, i64, String)>,
+    textures: HashMap<ThumbKey, (render::Texture, (u32, u32), u64)>,
+    asked: HashSet<ThumbKey>,
+    failed: HashSet<ThumbKey>,
+    ready: Vec<(ThumbKey, files::png::Image)>,
+    wanted: Vec<(ThumbKey, i64, String)>,
     frame: u64,
+}
+
+/// A file's first lines or a folder's entries (name, is a folder).
+type Lines = Vec<(String, bool)>;
+
+/// The preview pane's text, for the path and mtime it was read at.
+#[derive(Default)]
+struct Peek {
+    shown: Option<(PathBuf, i64, Lines)>,
+    asked: Option<(PathBuf, i64)>,
+    wanted: Option<(PathBuf, i64, bool)>,
 }
 
 #[derive(Default)]
@@ -240,6 +255,9 @@ pub struct Files {
     inotify: Option<OwnedFd>,
     watches: HashMap<i32, PathBuf>,
     thumbs: RefCell<Thumbs>,
+    peek: RefCell<Peek>,
+    /// F3 hides the preview pane in every window.
+    no_preview: bool,
     pub chosen: Vec<Chosen>,
 }
 
@@ -316,6 +334,35 @@ fn home() -> PathBuf {
 }
 
 use super::shell_quote as quote;
+
+/// Lines a preview shows at most.
+const PEEK_LINES: usize = 200;
+
+/// The first lines of a text file; nothing for a binary one.
+fn peek_file(path: &Path) -> Lines {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if std::fs::File::open(path).and_then(|f| f.take(16 * 1024).read_to_end(&mut buf)).is_err() || buf.contains(&0) {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&buf).lines().take(PEEK_LINES).map(|l| (l.replace('\t', "    "), false)).collect()
+}
+
+/// A folder's visible entries, folders first.
+fn peek_dir(path: &Path) -> Lines {
+    let Ok(entries) = files::dir::list(path) else { return Vec::new() };
+    let mut v: Lines = entries.iter().filter(|e| !e.hidden).map(|e| (e.display().into_owned(), e.is_dir())).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| files::dir::natural_cmp(&a.0, &b.0)));
+    v
+}
+
+/// Whether a type reads as text in the preview.
+fn textual(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime.ends_with("+xml")
+        || mime.ends_with("+json")
+        || ["application/json", "application/xml", "application/javascript", "application/toml", "application/x-shellscript", "application/x-yaml", "application/yaml", "application/x-desktop", "application/sql", "inode/x-empty"].contains(&mime)
+}
 
 fn is_trash(dir: &Path) -> bool {
     dir == files::ops::trash_dir()
@@ -562,6 +609,7 @@ impl Terms {
             th.failed.clear();
             th.ready.clear();
             th.wanted.clear();
+            *self.fm.peek.borrow_mut() = Peek::default();
         }
     }
 
@@ -640,11 +688,17 @@ impl Terms {
         let wanted = std::mem::take(&mut self.fm.thumbs.borrow_mut().wanted);
         if !wanted.is_empty() {
             self.fm.jobs.push(Box::new(move || {
-                let thumbs = wanted.into_iter().map(|(p, mtime, mime)| {
-                    let t = files::thumb::get(&p, mtime, &mime, files::thumb::NORMAL);
-                    (p, t)
+                let thumbs = wanted.into_iter().map(|((p, size), mtime, mime)| {
+                    let t = files::thumb::get(&p, mtime, &mime, size);
+                    ((p, size), t)
                 });
                 Ok(crate::worker::Done::Files(Done::Thumbs(thumbs.collect())))
+            }));
+        }
+        if let Some((path, mtime, dir)) = self.fm.peek.borrow_mut().wanted.take() {
+            self.fm.jobs.push(Box::new(move || {
+                let lines = if dir { peek_dir(&path) } else { peek_file(&path) };
+                Ok(crate::worker::Done::Files(Done::Peek { path, mtime, lines }))
             }));
         }
         std::mem::take(&mut self.fm.jobs)
@@ -772,11 +826,16 @@ impl Terms {
                     }
                 }
                 drop(th);
-                for i in 0..self.fm.windows.len() {
-                    if self.fm.windows[i].grid {
-                        self.fm_damage(s, i);
-                    }
+                self.fm_damage_all(s);
+            }
+            Done::Peek { path, mtime, lines } => {
+                let mut peek = self.fm.peek.borrow_mut();
+                if peek.asked.as_ref().is_some_and(|(p, m)| *p == path && *m == mtime) {
+                    peek.asked = None;
                 }
+                peek.shown = Some((path, mtime, lines));
+                drop(peek);
+                self.fm_damage_all(s);
             }
             Done::Volumes(v) => {
                 self.fm.volumes = v;
@@ -1403,6 +1462,10 @@ impl Terms {
                 let cwd = Some(self.fm.windows[i].dir.to_string_lossy().into_owned());
                 self.open(Open { cwd, ..Default::default() })
             }
+            (0xffc0, ..) => {
+                self.fm.no_preview = !self.fm.no_preview;
+                self.fm_damage_all(s);
+            }
             (0xffc2, ..) => {
                 w.stale = true;
                 self.fm.places = files::places::places();
@@ -1899,12 +1962,7 @@ impl Terms {
 
     pub(super) fn fm_progress(&mut self, s: &mut State) {
         for i in 0..self.fm.windows.len() {
-            let w = &self.fm.windows[i];
-            if w.prompt.is_none() && w.status.is_none() {
-                let ch = self.cell().1;
-                let y = w.size.1 - config::TERM_PAD - ch - 4;
-                s.damage_committed(SKey { client: self.client, id: w.surface }, &[wm::Rect::new(0, y, w.size.0, w.size.1 - y)]);
-            }
+            self.fm_damage(s, i);
         }
     }
 }
