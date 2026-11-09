@@ -1,15 +1,20 @@
 //! The xdg-desktop-portal backend (`org.freedesktop.impl.portal.desktop.davidewm`):
-//! ScreenCast and Screenshot. xdg-desktop-portal forwards the apps' requests
-//! here; the source is chosen in the launcher box and streamed by `cast.rs`.
+//! ScreenCast, Screenshot and FileChooser. xdg-desktop-portal forwards the
+//! apps' requests here; a cast source is chosen in the launcher box and
+//! streamed by `cast.rs`, files are chosen in a file manager window. The
+//! same connection owns `org.freedesktop.FileManager1` ("show in folder").
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
+use std::path::PathBuf;
 
 use dbus::{Bus, Message, Value};
 
 const NAME: &str = "org.freedesktop.impl.portal.desktop.davidewm";
 const SCREENCAST: &str = "org.freedesktop.impl.portal.ScreenCast";
 const SCREENSHOT: &str = "org.freedesktop.impl.portal.Screenshot";
+const FILECHOOSER: &str = "org.freedesktop.impl.portal.FileChooser";
+const FILEMANAGER: &str = "org.freedesktop.FileManager1";
 const SESSION: &str = "org.freedesktop.impl.portal.Session";
 const REQUEST: &str = "org.freedesktop.impl.portal.Request";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
@@ -45,6 +50,24 @@ enum Pending {
     /// ScreenCast.Start: waits for a pick, then for the stream's node.
     Start { call: Message, handle: String, session: String, cast: Option<u32>, source_type: u32, choice: String },
     Shot { call: Message, handle: String },
+    /// A file chooser: the app's filters (to name the one in use) and, for
+    /// SaveFiles, the names to save in the chosen folder.
+    Choose { call: Message, handle: String, filters: Vec<Value>, names: Option<Vec<String>> },
+}
+
+/// A file chooser request, as the file manager needs it.
+pub struct ChooseFiles {
+    pub request: u32,
+    pub title: String,
+    pub save: bool,
+    pub multiple: bool,
+    pub directory: bool,
+    pub folder: Option<PathBuf>,
+    pub name: String,
+    /// Filter names and patterns: globs, or `mime:` and a MIME type.
+    pub filters: Vec<(String, Vec<String>)>,
+    pub current: Option<usize>,
+    pub accept: String,
 }
 
 /// What the compositor has to do for the portal.
@@ -55,6 +78,9 @@ pub enum Action {
     CancelPick { request: u32 },
     StopCast(u32),
     Screenshot { request: u32, interactive: bool },
+    Choose(Box<ChooseFiles>),
+    /// FileManager1: folders to show, or items to show selected.
+    ShowFiles { paths: Vec<PathBuf>, items: bool },
 }
 
 pub struct Portal {
@@ -81,6 +107,48 @@ fn option<'a>(opts: Option<&'a Value>, key: &str) -> Option<&'a Value> {
     })
 }
 
+/// A NUL-terminated `ay` path.
+fn byte_path(v: Option<&Value>) -> Option<PathBuf> {
+    let mut b = v?.bytes()?;
+    while b.last() == Some(&0) {
+        b.pop();
+    }
+    (!b.is_empty()).then(|| PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(b)))
+}
+
+fn strings(v: Option<&Value>) -> Vec<String> {
+    match v.map(Value::unwrap_variant) {
+        Some(Value::Array(_, items)) => items.iter().filter_map(|s| s.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `a(sa(us))` filters: names and patterns.
+fn filters(v: Option<&Value>) -> (Vec<Value>, Vec<(String, Vec<String>)>) {
+    let Some(Value::Array(_, list)) = v.map(Value::unwrap_variant) else { return (Vec::new(), Vec::new()) };
+    let parsed = list
+        .iter()
+        .filter_map(|f| {
+            let Value::Struct(fields) = f else { return None };
+            let name = fields.first()?.as_str()?.to_string();
+            let Some(Value::Array(_, pats)) = fields.get(1) else { return None };
+            let pats = pats
+                .iter()
+                .filter_map(|p| match p {
+                    Value::Struct(pf) => match (pf.first().and_then(Value::as_u32), pf.get(1).and_then(Value::as_str)) {
+                        (Some(0), Some(g)) => Some(g.to_lowercase()),
+                        (Some(1), Some(m)) => Some(format!("mime:{}", m.to_lowercase())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            Some((name, pats))
+        })
+        .collect();
+    (list.clone(), parsed)
+}
+
 fn path(v: Option<&Value>) -> String {
     match v {
         Some(Value::Path(p) | Value::Str(p)) => p.clone(),
@@ -103,6 +171,17 @@ const INTROSPECTION: &str = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS 
   <method name="PickColor"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/><arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
   <property name="version" type="u" access="read"/>
  </interface>
+ <interface name="org.freedesktop.impl.portal.FileChooser">
+  <method name="OpenFile"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/><arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
+  <method name="SaveFile"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/><arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
+  <method name="SaveFiles"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/><arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
+  <property name="version" type="u" access="read"/>
+ </interface>
+ <interface name="org.freedesktop.FileManager1">
+  <method name="ShowFolders"><arg type="as" direction="in"/><arg type="s" direction="in"/></method>
+  <method name="ShowItems"><arg type="as" direction="in"/><arg type="s" direction="in"/></method>
+  <method name="ShowItemProperties"><arg type="as" direction="in"/><arg type="s" direction="in"/></method>
+ </interface>
 </node>"#;
 
 impl Portal {
@@ -111,7 +190,15 @@ impl Portal {
     pub fn start() -> Portal {
         let bus = match Bus::session() {
             Ok(mut bus) => match bus.request_name(NAME, 4) {
-                Ok(true) => Some(bus),
+                Ok(true) => {
+                    // Taken from another file manager if it allows that.
+                    match bus.request_name(FILEMANAGER, 2 | 4) {
+                        Ok(true) => {}
+                        Ok(false) => log!("portal: {FILEMANAGER} is taken"),
+                        Err(e) => log!("portal: {FILEMANAGER}: {e}"),
+                    }
+                    Some(bus)
+                }
                 Ok(false) => {
                     log!("portal: {NAME} is taken");
                     None
@@ -144,6 +231,7 @@ impl Portal {
         match iface {
             SCREENCAST => vec![("AvailableSourceTypes", Value::U32(MONITOR | WINDOW)), ("AvailableCursorModes", Value::U32(EMBEDDED)), ("version", Value::U32(5))],
             SCREENSHOT => vec![("version", Value::U32(2))],
+            FILECHOOSER => vec![("version", Value::U32(4))],
             _ => Vec::new(),
         }
     }
@@ -216,6 +304,40 @@ impl Portal {
             let handle = path(b.first());
             self.pending.insert(request, Pending::Shot { call: m, handle });
             actions.push(Action::Screenshot { request, interactive });
+        } else if m.is_call(FILECHOOSER, "OpenFile") || m.is_call(FILECHOOSER, "SaveFile") || m.is_call(FILECHOOSER, "SaveFiles") {
+            let member = m.member.clone().unwrap_or_default();
+            let opts = b.get(4);
+            let save = member != "OpenFile";
+            let many = member == "SaveFiles";
+            let (raw, parsed) = filters(option(opts, "filters"));
+            let current = option(opts, "current_filter").and_then(|c| raw.iter().position(|f| f == c.unwrap_variant()));
+            let file = byte_path(option(opts, "current_file"));
+            let names = many.then(|| {
+                let Some(Value::Array(_, list)) = option(opts, "files") else { return Vec::new() };
+                list.iter().filter_map(|v| byte_path(Some(v))).map(|p| p.to_string_lossy().into_owned()).collect()
+            });
+            self.next += 1;
+            let request = self.next;
+            let c = ChooseFiles {
+                request,
+                title: b.get(3).and_then(Value::as_str).unwrap_or("").to_string(),
+                save: save && !many,
+                multiple: option(opts, "multiple").and_then(Value::as_bool).unwrap_or(false),
+                directory: many || option(opts, "directory").and_then(Value::as_bool).unwrap_or(false),
+                folder: byte_path(option(opts, "current_folder")).or_else(|| file.as_ref().and_then(|f| f.parent().map(|p| p.to_path_buf()))),
+                name: option(opts, "current_name").and_then(Value::as_str).map(str::to_string).or_else(|| file.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned())).unwrap_or_default(),
+                filters: parsed,
+                current,
+                accept: option(opts, "accept_label").and_then(Value::as_str).unwrap_or("").replace('_', ""),
+            };
+            let handle = path(b.first());
+            self.pending.insert(request, Pending::Choose { call: m, handle, filters: raw, names });
+            actions.push(Action::Choose(Box::new(c)));
+        } else if m.is_call(FILEMANAGER, "ShowFolders") || m.is_call(FILEMANAGER, "ShowItems") || m.is_call(FILEMANAGER, "ShowItemProperties") {
+            let items = m.member.as_deref() != Some("ShowFolders");
+            let paths = strings(b.first()).iter().filter_map(|u| files::uri::from_uri(u).or_else(|| u.starts_with('/').then(|| PathBuf::from(u)))).collect();
+            actions.push(Action::ShowFiles { paths, items });
+            self.send(m.reply(Vec::new()));
         } else if m.is_call(SCREENSHOT, "PickColor") {
             self.send(m.reply(vec![Value::U32(FAILED), empty()]));
         } else if m.is_call(SESSION, "Close") {
@@ -226,7 +348,7 @@ impl Portal {
             self.send(m.reply(Vec::new()));
         } else if m.is_call(REQUEST, "Close") {
             let p = m.path.clone().unwrap_or_default();
-            let found = self.pending.iter().find(|(_, v)| matches!(v, Pending::Start { handle, .. } | Pending::Shot { handle, .. } if *handle == p)).map(|(k, _)| *k);
+            let found = self.pending.iter().find(|(_, v)| matches!(v, Pending::Start { handle, .. } | Pending::Shot { handle, .. } | Pending::Choose { handle, .. } if *handle == p)).map(|(k, _)| *k);
             if let Some(request) = found {
                 actions.push(Action::CancelPick { request });
                 self.finish(request, CANCELLED, Vec::new());
@@ -241,7 +363,7 @@ impl Portal {
     fn finish(&mut self, request: u32, response: u32, results: Vec<(&str, Value)>) {
         let Some(p) = self.pending.remove(&request) else { return };
         let call = match p {
-            Pending::Start { call, .. } | Pending::Shot { call, .. } => call,
+            Pending::Start { call, .. } | Pending::Shot { call, .. } | Pending::Choose { call, .. } => call,
         };
         self.send(call.reply(vec![Value::U32(response), dict(results)]));
     }
@@ -301,6 +423,21 @@ impl Portal {
             self.sessions.remove(&p);
             self.send(Message::signal(&p, SESSION, "Closed", Vec::new()));
         }
+    }
+
+    /// The file chooser closed: the files picked, or None.
+    pub fn files_chosen(&mut self, request: u32, paths: Option<Vec<PathBuf>>, filter: Option<usize>) {
+        let Some(Pending::Choose { filters, names, .. }) = self.pending.get(&request) else { return };
+        let Some(mut paths) = paths else { return self.finish(request, CANCELLED, Vec::new()) };
+        if let (Some(names), Some(dir)) = (names, paths.first().cloned()) {
+            paths = names.iter().map(|n| dir.join(n)).collect();
+        }
+        let uris = Value::Array("s".into(), paths.iter().map(|p| Value::Str(files::uri::to_uri(p))).collect());
+        let mut results = vec![("uris", uris)];
+        if let Some(f) = filter.and_then(|k| filters.get(k)).cloned() {
+            results.push(("current_filter", f));
+        }
+        self.finish(request, SUCCESS, results);
     }
 
     pub fn screenshot_done(&mut self, request: u32, file: Option<&str>) {

@@ -102,6 +102,8 @@ pub enum Action {
     AudioOutputs,
     /// A window of the built-in terminal.
     Terminal,
+    /// A window of the built-in file manager.
+    Files,
     Exit,
 }
 
@@ -122,7 +124,7 @@ pub fn binds() -> Vec<Bind> {
         b(MAIN, keys::T, Action::Terminal),
         b(MAIN, keys::B, Action::Spawn(BROWSER)),
         b(MAIN, keys::C, Action::Spawn("code")),
-        b(MAIN, keys::F, Action::Spawn("thunar")),
+        b(MAIN, keys::F, Action::Files),
         b(MAIN, keys::W, Action::Wifi),
         b(MAIN, keys::N, Action::Notifications),
         b(MAIN, keys::P, Action::ClipboardHistory),
@@ -228,6 +230,9 @@ pub const TERM_SCROLL_LINES: i32 = 3;
 pub const TERM_FG: u32 = 0xffffff;
 pub const TERM_BG: u32 = 0x000000;
 pub const TERM_APP_ID: &str = "davide-term";
+pub const FILES_APP_ID: &str = "davide-files";
+/// Size of the file chooser dialog (it floats at this size).
+pub const FILES_CHOOSER_SIZE: (i32, i32) = (1100, 700);
 pub const TERM_ENV: &[(&str, &str)] = &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "davide-term")];
 
 pub const REPEAT_RATE: i32 = 25;
