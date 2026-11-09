@@ -90,7 +90,7 @@ impl Terms {
         let side = if total >= 70 { 22 * cw } else { 0 };
         let x0 = pad + if side > 0 { side + 2 * cw } else { 0 };
         let room = width - pad - x0;
-        let pane_w = if !self.fm.no_preview && room / cw >= 80 { (room * 2 / 5).clamp(30 * cw, 64 * cw) } else { 0 };
+        let pane_w = if !self.fm.no_preview && room / cw >= 56 { (room * 2 / 5).clamp(26 * cw, 64 * cw) } else { 0 };
         let right = width - pad - if pane_w > 0 { pane_w + 2 * cw } else { 0 };
         let pane = if pane_w > 0 { right + cw } else { 0 };
         let main = (right - x0) / cw;

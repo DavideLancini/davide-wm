@@ -2128,8 +2128,13 @@ impl state::Persist for Files {
         self.windows.save(e);
     }
     fn load(d: &mut state::Dec) -> state::Result<Self> {
-        let windows = state::Persist::load(d)?;
-        Ok(Files { windows, ..Default::default() })
+        let windows: Vec<Window> = state::Persist::load(d)?;
+        let mut f = Files { windows, ..Default::default() };
+        if !f.windows.is_empty() {
+            f.places = files::places::places();
+            f.jobs.push(Box::new(|| files::udisks::volumes().map(|v| crate::worker::Done::Files(Done::Volumes(v)))));
+        }
+        Ok(f)
     }
 }
 
