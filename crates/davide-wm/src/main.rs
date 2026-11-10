@@ -62,7 +62,6 @@ const TOKEN_BATTERY: u64 = 21;
 const TOKEN_XWAYLAND_LISTEN: u64 = 22;
 const TOKEN_TERM: u64 = 23;
 const TOKEN_TERM_TIMER: u64 = 24;
-const TOKEN_FILES_INOTIFY: u64 = 25;
 /// Plus the terminal window's surface id.
 const TOKEN_PTY: u64 = 1 << 40;
 /// Plus the pipe's fd.
@@ -249,7 +248,6 @@ struct App {
     mixer: Option<mixer::MixerUi>,
     /// Terminal windows asked for: working directory.
     term_open: Vec<terminal::Open>,
-    files_open: Vec<terminal::files::Request>,
     /// Terminal fds in the epoll set, with their tokens.
     term_watched: HashMap<RawFd, u64>,
 }
@@ -424,8 +422,9 @@ impl App {
                 self.term_open.push(terminal::Open { cwd, ..Default::default() });
             }
             Action::Files => {
-                let dir = self.state.focus.and_then(|f| self.state.terms.as_ref().filter(|t| t.is_ours(f)).and_then(|t| t.cwd_of(f.id)));
-                self.files_open.push(terminal::files::Request::Show(dir.map_or_else(home_dir, PathBuf::from), None));
+                let cwd = self.state.focus.and_then(|f| self.state.terms.as_ref().filter(|t| t.is_ours(f)).and_then(|t| t.cwd_of(f.id)));
+                let dir = cwd.or_else(|| std::env::var("HOME").ok()).unwrap_or_else(|| "/".into());
+                self.spawn(&format!("davide-apps files {}", terminal::shell_quote(&dir)));
             }
             Action::Exit => self.running = false,
         }
@@ -1027,32 +1026,9 @@ impl App {
                     self.state.close_shot();
                 }
                 self.state.abandoned.clear();
-                self.with_terms(|t, s| t.cancel_chooser(s, request));
             }
             portal::Action::StopCast(id) => self.casts.stop(id),
             portal::Action::Screenshot { request, interactive } => self.shot_request = Some((request, interactive)),
-            portal::Action::Choose(c) => {
-                let dir = c.folder.clone().unwrap_or_else(home_dir);
-                let title = (!c.title.is_empty()).then(|| c.title.clone());
-                self.files_open.push(terminal::files::Request::Choose(dir, Box::new(terminal::files::Chooser::from_portal(&c)), title));
-            }
-            portal::Action::ShowFiles { paths, items } => self.show_files(paths, items),
-        }
-    }
-
-    /// File manager windows on folders, or on the folders of items with
-    /// those selected (a file is always shown that way).
-    fn show_files(&mut self, paths: Vec<PathBuf>, items: bool) {
-        if paths.is_empty() {
-            self.files_open.push(terminal::files::Request::Show(home_dir(), None));
-        }
-        for p in paths {
-            let p = p.to_str().and_then(files::uri::from_uri).unwrap_or(p);
-            let r = match (p.parent(), p.file_name()) {
-                (Some(dir), Some(name)) if items || !p.is_dir() => terminal::files::Request::Show(dir.to_path_buf(), Some(name.to_os_string())),
-                _ => terminal::files::Request::Show(p, None),
-            };
-            self.files_open.push(r);
         }
     }
 
@@ -1272,12 +1248,6 @@ impl App {
                     mib(heap.fordblks),
                 );
                 if let Some(t) = &s.terms {
-                    let (windows, entries) = t.fm.usage();
-                    if windows > 0 {
-                        out += &format!("files: {windows} windows {entries} entries thumbnails {}\n", t.fm.thumbs_kept());
-                    }
-                }
-                if let Some(t) = &s.terms {
                     let (windows, glyphs) = t.usage();
                     out += &format!(
                         "terms: {} windows {:.1} MiB glyphs {} (atlas {:.1} MiB) {}\n",
@@ -1359,7 +1329,6 @@ impl App {
             }
             ipc::Command::Term(cwd) => self.term_open.push(terminal::Open { cwd, ..Default::default() }),
             ipc::Command::TermRun(cmd) => self.term_open.push(terminal::Open { cwd: None, cmd: Some(cmd), hold: false }),
-            ipc::Command::Files(target) => self.show_files(target.map(PathBuf::from).into_iter().collect(), false),
             ipc::Command::ClipboardImport(path) => {
                 let older = match std::fs::read(&path) {
                     Ok(b) => clipboard::decode_v1(&b),
@@ -1968,7 +1937,6 @@ fn new_app(backend: Backend, state: State, socket: Socket, ipc: ipc::Ipc, main_m
         cursor_moved: false,
         mixer: None,
         term_open: Vec::new(),
-        files_open: Vec::new(),
         term_watched: HashMap::new(),
     }
 }
@@ -2095,7 +2063,7 @@ impl App {
     /// Opens the terminal windows asked for and keeps the epoll set in step
     /// with the terminals' fds.
     fn terminals(&mut self, ep: &Epoll) -> io::Result<()> {
-        if (!self.term_open.is_empty() || !self.files_open.is_empty()) && self.state.terms.is_none() {
+        if !self.term_open.is_empty() && self.state.terms.is_none() {
             match terminal::Terms::start(&mut self.state) {
                 Ok(t) => {
                     let id = t.client;
@@ -2105,22 +2073,11 @@ impl App {
                 Err(e) => {
                     log!("terminal: {e}");
                     self.term_open.clear();
-                    self.files_open.clear();
                 }
             }
         }
         for o in std::mem::take(&mut self.term_open) {
             self.with_terms(|t, _| t.open(o));
-        }
-        for r in std::mem::take(&mut self.files_open) {
-            self.with_terms(|t, _| t.request(r));
-        }
-        let spawns = self.with_terms(|t, _| t.take_spawns());
-        for line in spawns {
-            self.spawn(&line);
-        }
-        for (request, paths, filter) in self.with_terms(|t, _| t.take_chosen()) {
-            self.portal.files_chosen(request, paths, filter);
         }
         let wanted: HashMap<RawFd, u64> = match &self.state.terms {
             Some(t) => t
@@ -2132,7 +2089,6 @@ impl App {
                         terminal::Fd::Timer => TOKEN_TERM_TIMER,
                         terminal::Fd::Pty(surface) => TOKEN_PTY + surface as u64,
                         terminal::Fd::Paste => TOKEN_PASTE + fd as u64,
-                        terminal::Fd::Inotify => TOKEN_FILES_INOTIFY,
                     };
                     (fd, token)
                 })
@@ -2354,13 +2310,9 @@ fn fresh(nested: bool, session: bool) -> io::Result<Ctx> {
     finish(app, renderer, exe)
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
-}
-
 /// Bumped when the blob layout changes incompatibly; an older blob is then
 /// handed back to the previous binary.
-const BLOB_FORMAT: u32 = 12;
+const BLOB_FORMAT: u32 = 13;
 
 /// Per instance: a nested test instance must not replace the copy kept by
 /// the session on the TTY. The pid survives the execs of an upgrade.
@@ -2607,7 +2559,6 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                                 }
                                 r => app.portal.screenshot_done(r, path.ok().as_deref()),
                             },
-                            Ok(worker::Done::Files(d)) => app.with_terms(|t, s| t.files_done(s, d)),
                             Ok(worker::Done::XSelection { request, data }) => xwm::selection::answer(&mut app.state, request, data),
                             Ok(worker::Done::LinkCheck { name, failed }) => {
                                 let lit = app.backend.heads().iter().any(|h| h.name == name);
@@ -2706,7 +2657,6 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
                     }
                 }
                 TOKEN_TERM_TIMER => app.with_terms(|t, s| t.timer_fired(s)),
-                TOKEN_FILES_INOTIFY => app.with_terms(|t, s| t.inotify_ready(s)),
                 t if t >= TOKEN_PASTE => app.with_terms(|term, _| term.paste_ready((t - TOKEN_PASTE) as RawFd)),
                 t if t >= TOKEN_PTY => app.with_terms(|term, s| term.pty_ready(s, (t - TOKEN_PTY) as u32)),
                 t => {
@@ -2821,12 +2771,6 @@ fn run_loop(ctx: &mut Ctx) -> io::Result<()> {
         app.terminals(ep)?;
         app.update_bar();
         app.render(renderer)?;
-        // Listings asked for this pass and thumbnails the frame wanted.
-        if let Some(t) = &mut app.state.terms {
-            for job in t.take_jobs() {
-                worker.run(job);
-            }
-        }
         if std::mem::take(&mut app.sleep_after_frame) {
             app.sleep_inhibitor = None;
         }

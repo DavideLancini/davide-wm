@@ -29,7 +29,6 @@ pub enum Done {
     WifiConnect(Result<String, String>),
     /// A Wayland selection read for an X client.
     XSelection { request: crate::server::xwm::selection::Request, data: Result<Vec<u8>, String> },
-    Files(crate::terminal::files::Done),
 }
 
 pub struct Worker {

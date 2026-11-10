@@ -22,8 +22,6 @@ jpeg.workspace = true
 # Parses fonts in place (mapped files); fontdue would expand every glyph up front.
 ab_glyph = "0.2"
 term.workspace = true
-files.workspace = true
-unicode-width.workspace = true
 
 [build-dependencies]
 config.workspace = true

@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=File
-GenericName=File manager
-Comment=The file manager built into davide-wm
-Exec=davide-wm msg files %u
-Terminal=false
-MimeType=inode/directory;
-Categories=System;FileManager;

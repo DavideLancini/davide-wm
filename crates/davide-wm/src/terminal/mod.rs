@@ -9,7 +9,6 @@
 //! Keys are handed over directly by the key handler (the compositor's own
 //! keymap state), pointer and selection events arrive over the wire.
 
-pub mod files;
 pub mod glyphs;
 pub mod pty;
 
@@ -18,7 +17,6 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use render::{Batch, Quad, Renderer};
@@ -58,25 +56,6 @@ pub struct Window {
     out: Vec<u8>,
 }
 
-/// Data being read from the clipboard or a drop, and what it is for.
-pub struct Paste {
-    fd: OwnedFd,
-    surface: u32,
-    data: Vec<u8>,
-    kind: PasteKind,
-}
-
-pub enum PasteKind {
-    /// Text into a terminal.
-    Text,
-    /// Files from the clipboard, as this type.
-    Files(String),
-    /// Files dropped on a file manager window.
-    Drop { dest: PathBuf, action: u32, offer: u32 },
-    /// Files dropped on a terminal: their paths are typed.
-    Uris(u32),
-}
-
 /// The mouse over a terminal: position in cells, buttons, last click (for
 /// double and triple clicks) and a selection being dragged.
 #[derive(Default)]
@@ -109,11 +88,13 @@ pub struct Terms {
     pub windows: Vec<Window>,
     /// Windows asked for before the globals were bound: working directory.
     queued: Vec<Open>,
-    /// File manager windows asked for before the globals were bound.
-    fm_queued: Vec<files::Request>,
-    pub fm: files::Files,
     mouse: Mouse,
-    pastes: Vec<Paste>,
+    /// Pastes being read: pipe, window.
+    /// Pastes being read: pipe, window, data so far, and the offer when
+    /// it is a drop of files (their paths are typed).
+    pastes: Vec<(OwnedFd, u32, Vec<u8>, Option<u32>)>,
+    /// A drag of files over a terminal: offer and window.
+    drop: Option<(u32, u32)>,
     /// Key repeat: key code, next time.
     repeat: Option<(u32, Instant)>,
     pub timer: OwnedFd,
@@ -131,7 +112,6 @@ pub enum Fd {
     Pty(u32),
     Paste,
     Timer,
-    Inotify,
 }
 
 impl Terms {
@@ -158,10 +138,9 @@ impl Terms {
             clipboard: None,
             windows: Vec::new(),
             queued: Vec::new(),
-            fm_queued: Vec::new(),
-            fm: files::Files::default(),
             mouse: Mouse::default(),
             pastes: Vec::new(),
+            drop: None,
             repeat: None,
             timer: crate::event_loop::timer_fd()?,
             graveyard: Vec::new(),
@@ -193,10 +172,7 @@ impl Terms {
     pub fn fds(&self) -> Vec<(RawFd, Fd)> {
         let mut v = vec![(self.conn.raw_fd(), Fd::Client), (self.timer.as_raw_fd(), Fd::Timer)];
         v.extend(self.windows.iter().map(|w| (w.pty.master.as_raw_fd(), Fd::Pty(w.surface))));
-        v.extend(self.pastes.iter().map(|p| (p.fd.as_raw_fd(), Fd::Paste)));
-        if let Some(fd) = self.fm.inotify_fd() {
-            v.push((fd, Fd::Inotify));
-        }
+        v.extend(self.pastes.iter().map(|(fd, ..)| (fd.as_raw_fd(), Fd::Paste)));
         v
     }
 
@@ -208,7 +184,7 @@ impl Terms {
     }
 
     pub fn is_ours(&self, key: SKey) -> bool {
-        key.client == self.client && (self.windows.iter().any(|w| w.surface == key.id) || self.is_files(key.id))
+        key.client == self.client && self.windows.iter().any(|w| w.surface == key.id)
     }
 
     fn cell(&self) -> (i32, i32) {
@@ -256,12 +232,8 @@ impl Terms {
         self.flush();
     }
 
-    /// The working directory of a terminal, or the folder a file manager
-    /// window shows, for a new terminal.
+    /// The working directory of the focused terminal, for a new one.
     pub fn cwd_of(&self, surface: u32) -> Option<String> {
-        if let Some(d) = self.files_dir(surface) {
-            return Some(d.to_string_lossy().into_owned());
-        }
         self.windows.iter().find(|w| w.surface == surface).and_then(|w| pty::cwd(w.pty.pid))
     }
 
@@ -292,7 +264,7 @@ impl Terms {
         Ok(())
     }
 
-    fn event(&mut self, s: &mut State, id: u32, iface: &'static Interface, op: u16, mut args: Args) {
+    fn event(&mut self, s: &mut State, id: u32, iface: &'static Interface, op: u16, args: Args) {
         match (iface.name, op) {
             ("wl_display", wl_display::evt::ERROR) => log!("terminal: protocol error on {}: {}", args.obj(0), args.str(2).unwrap_or("")),
             ("wl_display", wl_display::evt::DELETE_ID) => {
@@ -328,9 +300,6 @@ impl Terms {
                         for o in std::mem::take(&mut self.queued) {
                             self.open(o);
                         }
-                        for r in std::mem::take(&mut self.fm_queued) {
-                            self.request(r);
-                        }
                     }
                 }
             }
@@ -338,22 +307,15 @@ impl Terms {
             ("xdg_toplevel", xdg_toplevel::evt::CONFIGURE) => {
                 if let Some(w) = self.windows.iter_mut().find(|w| w.toplevel == id) {
                     w.pending = (args.int(0), args.int(1));
-                } else {
-                    self.fm.set_pending(id, (args.int(0), args.int(1)));
                 }
             }
             ("xdg_toplevel", xdg_toplevel::evt::CLOSE) => {
                 if let Some(w) = self.windows.iter().find(|w| w.toplevel == id) {
                     pty::hang_up(w.pty.pid);
-                } else if let Some(i) = self.fm.by_toplevel(id) {
-                    self.fm_close(s, i);
                 }
             }
             ("xdg_surface", xdg_surface::evt::CONFIGURE) => {
                 let serial = args.uint(0);
-                if let Some(i) = self.fm.by_xdg(id) {
-                    return self.fm_configure(s, i, serial);
-                }
                 let Some(i) = self.windows.iter().position(|w| w.xdg == id) else { return };
                 let (mut w, mut h) = self.windows[i].pending;
                 if w <= 0 || h <= 0 {
@@ -380,7 +342,6 @@ impl Terms {
             ("wl_pointer", wl_pointer::evt::LEAVE) => {
                 self.mouse.surface = 0;
                 self.mouse.buttons = 0;
-                self.fm.pointer_left();
             }
             ("wl_pointer", wl_pointer::evt::MOTION) => {
                 self.mouse.pos = (args.fixed(1), args.fixed(2));
@@ -406,19 +367,31 @@ impl Terms {
                 }
             }
             ("wl_data_device", wl_data_device::evt::ENTER) => {
-                let (serial, surface, pos, offer) = (args.uint(0), args.obj(1), (args.fixed(2), args.fixed(3)), args.obj(4));
-                self.drag_enter(s, serial, surface, pos, offer);
+                let (serial, surface, offer) = (args.uint(0), args.obj(1), args.obj(4));
+                let uris = self.offers.get(&offer).is_some_and(|m| m.iter().any(|x| x == "text/uri-list"));
+                let ours = self.windows.iter().any(|w| w.surface == surface);
+                self.send(Msg::new(offer, wl_data_offer::req::ACCEPT).uint(serial).opt_str((uris && ours).then_some("text/uri-list")));
+                if uris && ours {
+                    self.send(Msg::new(offer, wl_data_offer::req::SET_ACTIONS).uint(DND_COPY).uint(DND_COPY));
+                }
+                self.drop = Some((offer, surface));
             }
-            ("wl_data_device", wl_data_device::evt::MOTION) => self.drag_motion(s, (args.fixed(1), args.fixed(2))),
-            ("wl_data_device", wl_data_device::evt::LEAVE) => self.drag_leave(s),
-            ("wl_data_device", wl_data_device::evt::DROP) => self.drag_drop(s),
-            ("wl_data_source", wl_data_source::evt::SEND) => {
-                let mime = args.str(0).unwrap_or("").to_string();
-                let fd = args.take_fd(1);
-                self.source_send(id, &mime, fd);
+            ("wl_data_device", wl_data_device::evt::LEAVE) => {
+                if let Some((offer, _)) = self.drop.take() {
+                    self.offers.remove(&offer);
+                    self.send(Msg::new(offer, wl_data_offer::req::DESTROY));
+                }
             }
-            ("wl_data_source", wl_data_source::evt::ACTION) => self.source_action(id, args.uint(0)),
-            ("wl_data_source", wl_data_source::evt::CANCELLED | wl_data_source::evt::DND_FINISHED) => self.source_done(s, id, op),
+            ("wl_data_device", wl_data_device::evt::DROP) => {
+                if let Some((offer, surface)) = self.drop.take() {
+                    self.offers.remove(&offer);
+                    if self.windows.iter().any(|w| w.surface == surface) {
+                        self.receive(offer, "text/uri-list", surface, Some(offer));
+                    } else {
+                        self.send(Msg::new(offer, wl_data_offer::req::DESTROY));
+                    }
+                }
+            }
             ("wl_data_device", wl_data_device::evt::SELECTION) => {
                 let offer = args.obj(0);
                 if let Some(old) = self.clipboard.take().filter(|o| *o != offer) {
@@ -538,12 +511,12 @@ impl Terms {
     }
 
     pub fn paste_ready(&mut self, fd: RawFd) {
-        let Some(i) = self.pastes.iter().position(|p| p.fd.as_raw_fd() == fd) else { return };
+        let Some(i) = self.pastes.iter().position(|(p, ..)| p.as_raw_fd() == fd) else { return };
         let mut buf = [0u8; 16 << 10];
         loop {
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                self.pastes[i].data.extend_from_slice(&buf[..n as usize]);
+                self.pastes[i].2.extend_from_slice(&buf[..n as usize]);
                 continue;
             }
             if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
@@ -551,19 +524,15 @@ impl Terms {
             }
             break;
         }
-        let Paste { fd: pipe, surface, data, kind } = self.pastes.remove(i);
+        let (pipe, surface, data, dropped) = self.pastes.remove(i);
         self.graveyard.push(pipe);
-        let text = match kind {
-            PasteKind::Text => String::from_utf8_lossy(&data).into_owned(),
-            PasteKind::Uris(offer) => {
-                self.send(Msg::new(offer, wl_data_offer::req::FINISH));
-                self.send(Msg::new(offer, wl_data_offer::req::DESTROY));
-                self.flush();
-                let paths = ::files::uri::parse_uri_list(&String::from_utf8_lossy(&data));
-                paths.iter().map(|p| shell_quote(&p.to_string_lossy())).collect::<Vec<_>>().join(" ") + " "
-            }
-            kind => return self.pasted_files(surface, kind, &data),
-        };
+        let mut text = String::from_utf8_lossy(&data).into_owned();
+        if let Some(offer) = dropped {
+            self.send(Msg::new(offer, wl_data_offer::req::FINISH));
+            self.send(Msg::new(offer, wl_data_offer::req::DESTROY));
+            self.flush();
+            text = uri_paths(&text).iter().map(|p| shell_quote(p)).collect::<Vec<_>>().join(" ") + " ";
+        }
         if let Some(w) = self.windows.iter_mut().find(|w| w.surface == surface) {
             let bytes = w.engine.encode_paste(&text);
             w.out.extend_from_slice(&bytes);
@@ -579,9 +548,6 @@ impl Terms {
                 self.redraw(s, i);
             }
         }
-        if self.fm.ops_running() {
-            self.fm_progress(s);
-        }
         if let Some((code, at)) = self.repeat {
             if Instant::now() >= at {
                 if let Some(f) = s.focus.filter(|f| self.is_ours(*f)) {
@@ -595,9 +561,6 @@ impl Terms {
 
     fn arm(&self) {
         let mut next: Option<Instant> = self.repeat.map(|(_, t)| t);
-        if self.fm.ops_running() {
-            next = Some(Instant::now() + files::PROGRESS_EVERY);
-        }
         for w in &self.windows {
             if let Some(h) = w.held {
                 let t = h + SYNC_TIMEOUT;
@@ -631,9 +594,6 @@ impl Terms {
     }
 
     fn key_press(&mut self, s: &mut State, surface: u32, code: u32) {
-        if self.is_files(surface) {
-            return self.fm_key(s, surface, code);
-        }
         let Some(i) = self.windows.iter().position(|w| w.surface == surface) else { return };
         let sym = s.keyboard.sym(code);
         let text = s.keyboard.text(code);
@@ -683,6 +643,11 @@ impl Terms {
         let Some(offer) = self.clipboard else { return };
         let mimes = self.offers.get(&offer).cloned().unwrap_or_default();
         let Some(mime) = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING"].into_iter().find(|m| mimes.iter().any(|x| x == m)) else { return };
+        self.receive(offer, mime, self.windows[i].surface, None);
+    }
+
+    /// Reads an offer through a pipe; `paste_ready` gets the data.
+    fn receive(&mut self, offer: u32, mime: &str, surface: u32, dropped: Option<u32>) {
         let mut fds = [0; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
             return;
@@ -690,7 +655,7 @@ impl Terms {
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         self.send(Msg::new(offer, wl_data_offer::req::RECEIVE).str(mime).fd(write));
         self.flush();
-        self.pastes.push(Paste { fd: read, surface: self.windows[i].surface, data: Vec::new(), kind: PasteKind::Text });
+        self.pastes.push((read, surface, Vec::new(), dropped));
     }
 
     // ---- pointer ---------------------------------------------------------
@@ -713,17 +678,14 @@ impl Terms {
     }
 
     fn pointer_button(&mut self, s: &mut State, button: u32, pressed: bool) {
+        let Some(i) = self.mouse_window() else { return };
+        let (x, y) = self.cell_at(i);
         let bit = 1 << button.saturating_sub(0x110).min(31);
         if pressed {
             self.mouse.buttons |= bit;
         } else {
             self.mouse.buttons &= !bit;
         }
-        if let Some(i) = self.fm.windows.iter().position(|w| w.surface == self.mouse.surface) {
-            return self.fm_button(s, i, button, pressed);
-        }
-        let Some(i) = self.mouse_window() else { return };
-        let (x, y) = self.cell_at(i);
         if self.reporting(s, i) {
             let b = mouse_button(button);
             let action = if pressed { MouseAction::Press(b) } else { MouseAction::Release(b) };
@@ -764,9 +726,6 @@ impl Terms {
     }
 
     fn pointer_motion(&mut self, s: &mut State) {
-        if let Some(i) = self.fm.windows.iter().position(|w| w.surface == self.mouse.surface) {
-            return self.fm_motion(s, i);
-        }
         let Some(i) = self.mouse_window() else { return };
         let (x, y) = self.cell_at(i);
         if self.reporting(s, i) {
@@ -789,10 +748,7 @@ impl Terms {
     }
 
     fn wheel(&mut self, s: &mut State, value: f64) {
-        let files = self.fm.windows.iter().position(|w| w.surface == self.mouse.surface);
-        if files.is_none() && self.mouse_window().is_none() {
-            return;
-        }
+        let Some(i) = self.mouse_window() else { return };
         // The server sends 15 per wheel detent; high-resolution wheels and
         // touchpads send fractions of it, which add up.
         if self.mouse.wheel.signum() != value.signum() {
@@ -804,10 +760,6 @@ impl Terms {
             return;
         }
         self.mouse.wheel -= steps as f64 * 15.0;
-        if let Some(i) = files {
-            return self.fm_wheel(s, i, steps);
-        }
-        let Some(i) = self.mouse_window() else { return };
         let (x, y) = self.cell_at(i);
         if self.reporting(s, i) {
             let mods = mods_of(s.keyboard.bind_mods());
@@ -846,9 +798,6 @@ impl Terms {
     /// Draws a terminal window with its top-left corner at `(x, y)`;
     /// rows outside the frame's region are skipped.
     pub fn draw(&self, r: &mut Renderer, surface: u32, x: i32, y: i32, focused: bool) {
-        if self.is_files(surface) {
-            return self.draw_files(r, surface, x, y, focused);
-        }
         let Some(w) = self.windows.iter().find(|w| w.surface == surface) else { return };
         let mut g = self.glyphs.borrow_mut();
         if g.is_none() {
@@ -945,6 +894,45 @@ impl Terms {
 
 }
 
+/// `wl_data_device_manager` copy action.
+const DND_COPY: u32 = 1;
+
+/// The local paths of a `text/uri-list`.
+fn uri_paths(list: &str) -> Vec<String> {
+    let decode = |s: &str| {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match (b[i], s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+                (b'%', Some(v)) => {
+                    out.push(v);
+                    i += 3;
+                }
+                (c, _) => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    list.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.strip_prefix("file://"))
+        .map(|rest| decode(&rest[rest.find('/').unwrap_or(0)..]))
+        .collect()
+}
+
+/// A word for the shell, quoted when it needs to be.
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c)) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn write_out(w: &mut Window) {
     while !w.out.is_empty() {
         let n = unsafe { libc::write(w.pty.master.as_raw_fd(), w.out.as_ptr().cast(), w.out.len()) };
@@ -953,13 +941,6 @@ fn write_out(w: &mut Window) {
         }
         w.out.drain(..n as usize);
     }
-}
-
-pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c)) {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn hex(c: u32) -> Rgb {
@@ -1067,7 +1048,6 @@ impl state::Persist for Terms {
         self.windows.save(e);
         // Only where they open: a command waiting across an upgrade is lost.
         self.queued.iter().map(|o| o.cwd.clone()).collect::<Vec<_>>().save(e);
-        self.fm.save(e);
     }
     fn load(d: &mut state::Dec) -> state::Result<Self> {
         use state::Persist;
@@ -1081,8 +1061,16 @@ impl state::Persist for Terms {
         let windows = Persist::load(d)?;
         let cwds: Vec<Option<String>> = Persist::load(d)?;
         let queued = cwds.into_iter().map(|cwd| Open { cwd, ..Default::default() }).collect();
-        let fm = if crate::server::persist::FORMAT.load(std::sync::atomic::Ordering::Relaxed) >= 12 { Persist::load(d)? } else { files::Files::default() };
-        Ok(Terms {
+        // Format 12 had file manager windows on this client (now davide-apps):
+        // their surface, xdg_surface and toplevel go, the rest is skipped.
+        let stale: Vec<(u32, u32, u32)> = if crate::server::persist::FORMAT.load(std::sync::atomic::Ordering::Relaxed) == 12 {
+            type OldWindow = (((u32, u32, u32), ((i32, i32), (i32, i32)), String), ((bool, bool, bool, u8), (Vec<String>, Vec<String>), Option<String>));
+            let old: Vec<OldWindow> = Persist::load(d)?;
+            old.into_iter().map(|((ids, ..), _)| ids).collect()
+        } else {
+            Vec::new()
+        };
+        let mut t = Terms {
             conn,
             client,
             objects,
@@ -1097,16 +1085,21 @@ impl state::Persist for Terms {
             clipboard,
             windows,
             queued,
-            fm_queued: Vec::new(),
-            fm,
             mouse: Mouse::default(),
             pastes: Vec::new(),
+            drop: None,
             repeat: None,
             timer: crate::event_loop::timer_fd().map_err(|e| state::Error(e.to_string()))?,
             graveyard: Vec::new(),
             glyphs: RefCell::new(None),
             batch: RefCell::new(Batch::default()),
             row: RefCell::new(Vec::new()),
-        })
+        };
+        for (surface, xdg, toplevel) in stale {
+            t.send(Msg::new(toplevel, xdg_toplevel::req::DESTROY));
+            t.send(Msg::new(xdg, xdg_surface::req::DESTROY));
+            t.send(Msg::new(surface, wl_surface::req::DESTROY));
+        }
+        Ok(t)
     }
 }
