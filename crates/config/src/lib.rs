@@ -326,10 +326,14 @@ pub const BLANK_POWER_OFF: &[(u32, u32)] = &[(60, 600), (300, 1800), (1800, 2700
 /// for it (and its release) does not wake the screen straight away.
 pub const BLANK_GRACE_MS: u64 = 700;
 
+/// Environment for every program of the session: no accessibility bus
+/// (at-spi) and no gvfs daemons, which nothing here uses.
+pub const SESSION_ENV: &[(&str, &str)] = &[("NO_AT_BRIDGE", "1"), ("GTK_A11Y", "none"), ("GIO_USE_VFS", "local")];
+
 /// Programs started once with `--session`, to make the session known
 /// to systemd and D-Bus activated services.
 pub const SESSION_AUTOSTART: &[&str] = &[
-    "dbus-update-activation-environment --systemd WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP DAVIDE_WM_SOCKET XDG_SESSION_TYPE && systemctl --user start davide-wm-session.target",
+    "dbus-update-activation-environment --systemd WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP DAVIDE_WM_SOCKET XDG_SESSION_TYPE NO_AT_BRIDGE GTK_A11Y GIO_USE_VFS && systemctl --user start davide-wm-session.target",
 ];
 
 /// DRM render node used by the nested backend.

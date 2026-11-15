@@ -1,6 +1,9 @@
 //! The xdg-desktop-portal backend (`org.freedesktop.impl.portal.desktop.davidewm`):
-//! ScreenCast and Screenshot. xdg-desktop-portal forwards the apps' requests
-//! here; the source is chosen in the launcher box and streamed by `cast.rs`.
+//! ScreenCast, Screenshot, Settings, Inhibit and Notification.
+//! xdg-desktop-portal forwards the apps' requests here; a cast source is
+//! chosen in the launcher box and streamed by `cast.rs`, settings are fixed
+//! (dark theme), inhibitors keep the screen on, notifications go to the
+//! compositor's own list. The file chooser is davide-apps'.
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
@@ -10,6 +13,9 @@ use dbus::{Bus, Message, Value};
 const NAME: &str = "org.freedesktop.impl.portal.desktop.davidewm";
 const SCREENCAST: &str = "org.freedesktop.impl.portal.ScreenCast";
 const SCREENSHOT: &str = "org.freedesktop.impl.portal.Screenshot";
+const SETTINGS: &str = "org.freedesktop.impl.portal.Settings";
+const INHIBIT: &str = "org.freedesktop.impl.portal.Inhibit";
+const NOTIFICATION: &str = "org.freedesktop.impl.portal.Notification";
 const SESSION: &str = "org.freedesktop.impl.portal.Session";
 const REQUEST: &str = "org.freedesktop.impl.portal.Request";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
@@ -55,6 +61,40 @@ pub enum Action {
     CancelPick { request: u32 },
     StopCast(u32),
     Screenshot { request: u32, interactive: bool },
+    /// A notification from a sandboxed app.
+    Notify { app: String, summary: String, body: String, urgent: bool },
+}
+
+/// Inhibit flag: keep the session from going idle.
+const INHIBIT_IDLE: u32 = 8;
+
+/// What Settings reports: a dark session, the fonts and themes in use.
+fn settings() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
+    let s = |v: &str| Value::Str(v.into());
+    vec![
+        ("org.freedesktop.appearance", vec![("color-scheme", Value::U32(1)), ("contrast", Value::U32(0))]),
+        (
+            "org.gnome.desktop.interface",
+            vec![
+                ("color-scheme", s("prefer-dark")),
+                ("gtk-theme", s("Adwaita")),
+                ("icon-theme", s("breeze-dark")),
+                ("cursor-theme", s("default")),
+                ("cursor-size", Value::I32(24)),
+                ("font-name", s("Noto Sans 10")),
+                ("document-font-name", s("Adwaita Sans 12")),
+                ("monospace-font-name", s("Adwaita Mono 11")),
+                ("text-scaling-factor", Value::Double(1.0)),
+                ("enable-animations", Value::Bool(false)),
+            ],
+        ),
+    ]
+}
+
+/// Namespace patterns of `ReadAll`: exact, or a prefix ending in `*`;
+/// none (or an empty one) means all.
+fn wanted(ns: &str, patterns: &[String]) -> bool {
+    patterns.is_empty() || patterns.iter().any(|p| p.is_empty() || p == ns || p.strip_suffix('*').is_some_and(|pre| ns.starts_with(pre)))
 }
 
 pub struct Portal {
@@ -64,6 +104,8 @@ pub struct Portal {
     sessions: HashMap<String, Session>,
     pending: HashMap<u32, Pending>,
     next: u32,
+    /// Inhibit requests in force: handle and flags.
+    inhibits: HashMap<String, u32>,
 }
 
 fn dict(entries: Vec<(&str, Value)>) -> Value {
@@ -103,6 +145,27 @@ const INTROSPECTION: &str = r#"<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS 
   <method name="PickColor"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/><arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
   <property name="version" type="u" access="read"/>
  </interface>
+ <interface name="org.freedesktop.impl.portal.Settings">
+  <method name="ReadAll"><arg type="as" direction="in"/><arg type="a{sa{sv}}" direction="out"/></method>
+  <method name="Read"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+  <method name="ReadOne"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+  <signal name="SettingChanged"><arg type="s"/><arg type="s"/><arg type="v"/></signal>
+  <property name="version" type="u" access="read"/>
+ </interface>
+ <interface name="org.freedesktop.impl.portal.Inhibit">
+  <method name="Inhibit"><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="u" direction="in"/><arg type="a{sv}" direction="in"/></method>
+  <method name="CreateMonitor"><arg type="o" direction="in"/><arg type="o" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="u" direction="out"/></method>
+  <method name="QueryEndResponse"><arg type="o" direction="in"/></method>
+  <signal name="StateChanged"><arg type="o"/><arg type="a{sv}"/></signal>
+  <property name="version" type="u" access="read"/>
+ </interface>
+ <interface name="org.freedesktop.impl.portal.Notification">
+  <method name="AddNotification"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="a{sv}" direction="in"/></method>
+  <method name="RemoveNotification"><arg type="s" direction="in"/><arg type="s" direction="in"/></method>
+  <signal name="ActionInvoked"><arg type="s"/><arg type="s"/><arg type="s"/><arg type="av"/></signal>
+  <property name="SupportedOptions" type="a{sv}" access="read"/>
+  <property name="version" type="u" access="read"/>
+ </interface>
 </node>"#;
 
 impl Portal {
@@ -126,7 +189,7 @@ impl Portal {
                 None
             }
         };
-        Portal { last: None, bus, sessions: HashMap::new(), pending: HashMap::new(), next: 0 }
+        Portal { last: None, bus, sessions: HashMap::new(), pending: HashMap::new(), next: 0, inhibits: HashMap::new() }
     }
 
     pub fn bus_fd(&self) -> Option<RawFd> {
@@ -144,6 +207,9 @@ impl Portal {
         match iface {
             SCREENCAST => vec![("AvailableSourceTypes", Value::U32(MONITOR | WINDOW)), ("AvailableCursorModes", Value::U32(EMBEDDED)), ("version", Value::U32(5))],
             SCREENSHOT => vec![("version", Value::U32(2))],
+            SETTINGS => vec![("version", Value::U32(2))],
+            INHIBIT => vec![("version", Value::U32(3))],
+            NOTIFICATION => vec![("version", Value::U32(2)), ("SupportedOptions", dict(Vec::new()))],
             _ => Vec::new(),
         }
     }
@@ -224,8 +290,45 @@ impl Portal {
                 actions.push(Action::StopCast(cast));
             }
             self.send(m.reply(Vec::new()));
+        } else if m.is_call(SETTINGS, "ReadAll") {
+            let patterns: Vec<String> = match b.first() {
+                Some(Value::Array(_, v)) => v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                _ => Vec::new(),
+            };
+            let all = settings()
+                .into_iter()
+                .filter(|(ns, _)| wanted(ns, &patterns))
+                .map(|(ns, keys)| Value::DictEntry(Box::new(Value::Str(ns.into())), Box::new(dict(keys))))
+                .collect();
+            self.send(m.reply(vec![Value::Array("{sa{sv}}".into(), all)]));
+        } else if m.is_call(SETTINGS, "Read") || m.is_call(SETTINGS, "ReadOne") {
+            let (ns, key) = (b.first().and_then(Value::as_str).unwrap_or(""), b.get(1).and_then(Value::as_str).unwrap_or(""));
+            let found = settings().into_iter().find(|(n, _)| *n == ns).and_then(|(_, keys)| keys.into_iter().find(|(k, _)| *k == key)).map(|(_, v)| v);
+            let reply = match found {
+                Some(v) => m.reply(vec![Value::Variant(Box::new(v))]),
+                None => m.error_reply("org.freedesktop.portal.Error.NotFound", "no such setting"),
+            };
+            self.send(reply);
+        } else if m.is_call(INHIBIT, "Inhibit") {
+            let flags = b.get(3).and_then(Value::as_u32).unwrap_or(0);
+            self.inhibits.insert(path(b.first()), flags);
+            self.send(m.reply(Vec::new()));
+        } else if m.is_call(INHIBIT, "CreateMonitor") {
+            self.send(m.reply(vec![Value::U32(SUCCESS)]));
+        } else if m.is_call(INHIBIT, "QueryEndResponse") {
+            self.send(m.reply(Vec::new()));
+        } else if m.is_call(NOTIFICATION, "AddNotification") {
+            let app = b.first().and_then(Value::as_str).unwrap_or("").to_string();
+            let n = b.get(2);
+            let text = |k: &str| option(n, k).and_then(Value::as_str).unwrap_or("").to_string();
+            let urgent = matches!(text("priority").as_str(), "urgent");
+            actions.push(Action::Notify { app, summary: text("title"), body: text("body"), urgent });
+            self.send(m.reply(Vec::new()));
+        } else if m.is_call(NOTIFICATION, "RemoveNotification") {
+            self.send(m.reply(Vec::new()));
         } else if m.is_call(REQUEST, "Close") {
             let p = m.path.clone().unwrap_or_default();
+            self.inhibits.remove(&p);
             let found = self.pending.iter().find(|(_, v)| matches!(v, Pending::Start { handle, .. } | Pending::Shot { handle, .. } if *handle == p)).map(|(k, _)| *k);
             if let Some(request) = found {
                 actions.push(Action::CancelPick { request });
@@ -235,6 +338,11 @@ impl Portal {
         } else if m.kind == 1 && !m.no_reply() {
             self.send(m.error_reply("org.freedesktop.DBus.Error.UnknownMethod", "unknown method"));
         }
+    }
+
+    /// An app asked the session not to go idle.
+    pub fn idle_inhibited(&self) -> bool {
+        self.inhibits.values().any(|f| f & INHIBIT_IDLE != 0)
     }
 
     /// Answers a pending request.

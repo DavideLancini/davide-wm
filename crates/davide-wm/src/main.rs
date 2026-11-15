@@ -1029,6 +1029,10 @@ impl App {
             }
             portal::Action::StopCast(id) => self.casts.stop(id),
             portal::Action::Screenshot { request, interactive } => self.shot_request = Some((request, interactive)),
+            portal::Action::Notify { app, summary, body, urgent } => {
+                self.notifier.local(&app, &summary, &body, urgent);
+                self.sync_notices();
+            }
         }
     }
 
@@ -1506,7 +1510,7 @@ impl App {
     fn idle(&mut self) {
         match self.display.timer_fired() {
             None => {}
-            Some(display::Idle::Blank) if self.state.idle_inhibited() => self.display.activity(),
+            Some(display::Idle::Blank) if self.state.idle_inhibited() || self.portal.idle_inhibited() => self.display.activity(),
             Some(display::Idle::Blank) => {
                 log!("idle for {}s", self.display.screensaver.timeout);
                 self.blank();
@@ -2202,6 +2206,9 @@ fn finish(mut app: App, renderer: Renderer, exe: PathBuf) -> io::Result<Ctx> {
     std::env::set_var("WAYLAND_DISPLAY", &app.socket.name);
     std::env::set_var(ipc::ENV, &app.ipc.path);
     std::env::set_var("XDG_CURRENT_DESKTOP", "davide-wm");
+    for (k, v) in config::SESSION_ENV {
+        std::env::set_var(k, v);
+    }
     std::env::remove_var("WAYLAND_SOCKET");
     match &app.xwayland {
         Some(x) => std::env::set_var("DISPLAY", format!(":{}", x.display)),
